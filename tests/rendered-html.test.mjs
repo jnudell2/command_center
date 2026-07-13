@@ -35,8 +35,12 @@ test("defines the inbox, workbench, notes, and review-only contracts", async () 
   assert.match(page, /Learning &(?:amp;)? sources/i);
   for (const endpoint of ["/api/bootstrap", "/api/work-items", "/api/calendar", "/api/calendar/refresh", "/api/mail", "/api/notes", "/api/agent-runs", "/api/delegation-preview", "/api/source-refresh", "/api/approvals", "/api/feedback-events", "/api/policies", "/api/search"]) assert.match(runner, new RegExp(endpoint.replaceAll("/", "\\/")));
   const calendar = await readFile(new URL("../app/calendar-workspace.tsx", import.meta.url), "utf8");
-  for (const label of ["Day ahead", "Meetings", "Work blocks", "Add to plan"]) assert.match(calendar, new RegExp(label, "i"));
+  for (const label of ["Day ahead", "Meetings", "Work blocks", "Day timeline", "Unscheduled work", "Add to plan", "Drag a card"]) assert.match(calendar, new RegExp(label, "i"));
   assert.match(calendar, /does not create or move Outlook events/i);
+  assert.match(calendar, /draggable/);
+  assert.match(calendar, /dropOnTimeline/);
+  assert.match(calendar, /beginResize/);
+  assert.match(calendar, /15 minute increments/i);
   assert.match(runner, /DatabaseSync/);
   assert.match(runner, /read-only/);
   assert.match(runner, /zoom-transcript-router/);
@@ -79,5 +83,6 @@ test("defines the inbox, workbench, notes, and review-only contracts", async () 
   assert.match(styles, /\.note-page\s*\{[^}]*max-width:\s*860px/s);
   assert.match(styles, /\.codex-composer\s*\{[^}]*position:\s*sticky/s);
   assert.doesNotMatch(styles, /\.codex-composer\s*\{[^}]*position:\s*fixed/s);
+  for (const selector of ["calendar-planner", "day-timeline", "outlook-event-block", "local-work-block", "resize-handle"]) assert.match(styles, new RegExp(`\\.${selector}\\s*\\{`));
   assert.match(styles, /@media \(max-width:\s*1024px\)/);
 });
