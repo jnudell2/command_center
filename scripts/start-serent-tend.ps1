@@ -6,11 +6,20 @@ $appRoot = Split-Path -Parent $PSScriptRoot
 $runtimeDir = Join-Path $appRoot '.runtime'
 New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
 
-function Test-LocalEndpoint {
-    param([string]$Uri)
+function Test-RunnerEndpoint {
     try {
-        $response = Invoke-WebRequest -Uri $Uri -UseBasicParsing -TimeoutSec 2
-        return $response.StatusCode -ge 200 -and $response.StatusCode -lt 500
+        $payload = Invoke-RestMethod -Uri 'http://127.0.0.1:4318/api/health' -TimeoutSec 2
+        return $payload.status -eq 'ready' -and $payload.database -like "$appRoot*"
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-AppEndpoint {
+    try {
+        $response = Invoke-WebRequest -Uri 'http://localhost:3000/' -UseBasicParsing -TimeoutSec 2
+        return $response.StatusCode -eq 200 -and $response.Content -match '<title>Serent Command Center</title>'
     }
     catch {
         return $false
@@ -38,7 +47,7 @@ function Resolve-NodePath {
 $node = Resolve-NodePath
 $processes = @()
 
-if (-not (Test-LocalEndpoint -Uri 'http://127.0.0.1:4318/api/health')) {
+if (-not (Test-RunnerEndpoint)) {
     $runnerOut = Join-Path $runtimeDir 'runner.stdout.log'
     $runnerErr = Join-Path $runtimeDir 'runner.stderr.log'
     $runner = Start-Process -FilePath $node `
@@ -55,7 +64,7 @@ else {
     $processes += [ordered]@{ name = 'runner'; started = $false; status = 'already_ready' }
 }
 
-if (-not (Test-LocalEndpoint -Uri 'http://localhost:3000/')) {
+if (-not (Test-AppEndpoint)) {
     $vinextCli = Join-Path $appRoot 'node_modules\vinext\dist\cli.js'
     $serverOut = Join-Path $runtimeDir 'app.stdout.log'
     $serverErr = Join-Path $runtimeDir 'app.stderr.log'
@@ -78,8 +87,8 @@ else {
 
 $deadline = (Get-Date).AddSeconds(15)
 do {
-    $appReady = Test-LocalEndpoint -Uri 'http://localhost:3000/'
-    $runnerReady = Test-LocalEndpoint -Uri 'http://127.0.0.1:4318/api/health'
+    $appReady = Test-AppEndpoint
+    $runnerReady = Test-RunnerEndpoint
     if ($appReady -and $runnerReady) { break }
     Start-Sleep -Milliseconds 250
 } while ((Get-Date) -lt $deadline)

@@ -1,6 +1,8 @@
 @import "tailwindcss";
 
 :root {
+  --font-geist-sans: "Segoe UI";
+  --font-geist-mono: Consolas;
   --paper: #f5f1e8;
   --paper-deep: #ece6da;
   --sheet: #fbf9f4;
@@ -29,7 +31,7 @@ body {
   background:
     radial-gradient(circle at 72% -15%, rgba(255,255,255,.9), transparent 32rem),
     var(--paper);
-  font-family: var(--font-geist-sans), Arial, sans-serif;
+  font-family: "Segoe UI", Arial, sans-serif;
 }
 button, input, textarea, select { font: inherit; }
 button { color: inherit; }
@@ -319,7 +321,7 @@ kbd { background: var(--paper-deep); border: 1px solid var(--line); border-radiu
 .delegation-route { border-top: 1px solid var(--line); gap: 8px; margin-top: 7px; padding-top: 7px; }
 .delegation-route select { flex: 0 0 170px; }
 .delegation-route small { color: var(--faint); font-size: .52rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.document-path { color: var(--faint); display: block; font-family: var(--font-geist-mono), Consolas, monospace; font-size: .5rem; margin-top: 7px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.document-path { color: var(--faint); display: block; font-family: Consolas, "Courier New", monospace; font-size: .5rem; margin-top: 7px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .note-codex-composer { background: var(--paper); border: 1px solid var(--line); border-radius: 7px; display: grid; gap: 7px; margin-top: 14px; padding: 10px; }
 .note-codex-composer label { color: var(--blue); font-size: .6rem; font-weight: 650; text-transform: uppercase; }
 .note-codex-composer textarea { background: var(--sheet); border: 1px solid var(--line-dark); border-radius: 5px; font: inherit; font-size: .68rem; line-height: 1.45; min-height: 72px; padding: 8px; resize: vertical; }

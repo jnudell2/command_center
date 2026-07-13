@@ -46,7 +46,7 @@ async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(`${runnerUrl}${path}`, {
     cache: "no-store",
     ...options,
-    headers: options?.body ? { "Content-Type": "application/json", ...(options.headers || {}) } : options?.headers,
+    headers: { "X-Serent-Command-Center": "1", ...(options?.body ? { "Content-Type": "application/json" } : {}), ...(options?.headers || {}) },
   });
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.error || "Command Center could not complete the mail request.");
@@ -67,7 +67,7 @@ function tomorrowMorning() {
   return date.toISOString();
 }
 
-export default function MailWorkspace({ companies, onNotice, onPromoted }: { companies: Company[]; onNotice: (message: string) => void; onPromoted: () => void }) {
+export default function MailWorkspace({ companies, selectedMessageId, onNotice, onPromoted }: { companies: Company[]; selectedMessageId?: string; onNotice: (message: string) => void; onPromoted: () => void }) {
   const [view, setView] = useState("needs_reply");
   const [mail, setMail] = useState<MailResponse>({ items: [], counts: {}, receipt: null });
   const [selectedId, setSelectedId] = useState("");
@@ -79,6 +79,7 @@ export default function MailWorkspace({ companies, onNotice, onPromoted }: { com
   const [busy, setBusy] = useState(false);
   const [mobileDetailOpen, setMobileDetailOpen] = useState(false);
   const loadedDraftId = useRef("");
+  const draftSaveVersion = useRef(0);
 
   const loadList = useCallback(async (quiet = false) => {
     try {
@@ -139,16 +140,45 @@ export default function MailWorkspace({ companies, onNotice, onPromoted }: { com
   const detailId = detail?.id || "";
   const detailDraftId = detail?.draft?.id || "";
 
+  const saveDraftSnapshot = useCallback(async (mailId: string, body: string, version: number) => {
+    const next = await api<Mail>(`/api/mail/${mailId}/draft`, { method: "PATCH", body: JSON.stringify({ body }) });
+    setDetail((current) => current?.id === next.id ? next : current);
+    if (version === draftSaveVersion.current) setDraftDirty(false);
+    return next;
+  }, []);
+
   useEffect(() => {
     if (!draftDirty || !detailId || !detailDraftId) return;
+    const version = ++draftSaveVersion.current;
+    const body = draft;
     const timer = window.setTimeout(async () => {
       try {
-        const next = await api<Mail>(`/api/mail/${detailId}/draft`, { method: "PATCH", body: JSON.stringify({ body: draft }) });
-        setDetail(next); setDraftDirty(false);
+        await saveDraftSnapshot(detailId, body, version);
       } catch (error) { onNotice(error instanceof Error ? error.message : "Draft autosave failed."); }
     }, 700);
     return () => window.clearTimeout(timer);
-  }, [detailDraftId, detailId, draft, draftDirty, onNotice]);
+  }, [detailDraftId, detailId, draft, draftDirty, onNotice, saveDraftSnapshot]);
+
+  const selectMessage = async (id: string) => {
+    if (draftDirty && detailId && detailDraftId) {
+      const version = ++draftSaveVersion.current;
+      try { await saveDraftSnapshot(detailId, draft, version); }
+      catch (error) { onNotice(error instanceof Error ? error.message : "The current draft could not be saved."); return; }
+    }
+    setSelectedId(id);
+    setMobileDetailOpen(true);
+  };
+
+  useEffect(() => {
+    if (!selectedMessageId) return;
+    const timer = window.setTimeout(() => {
+      setView("all");
+      setAppliedSearch("");
+      setSelectedId(selectedMessageId);
+      setMobileDetailOpen(true);
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [selectedMessageId]);
 
   const patchMail = async (body: Record<string, unknown>) => {
     if (!detail) return;
@@ -173,6 +203,10 @@ export default function MailWorkspace({ companies, onNotice, onPromoted }: { com
 
   const copyDraft = async () => {
     if (!detail?.draft || !draft.trim()) return;
+    if (draftDirty) {
+      const version = ++draftSaveVersion.current;
+      await saveDraftSnapshot(detail.id, draft, version);
+    }
     await navigator.clipboard.writeText(draft);
     await api("/api/feedback-events", { method: "POST", body: JSON.stringify({ eventType: "draft_copied", mailMessageId: detail.id, companySlug: detail.companySlug, skillId: "draft-executive-email", detail: "Jake copied the reviewed reply for use in Outlook." }) });
     onNotice("Reply copied. Any material edits are waiting in Learning & Sources for your review.");
@@ -200,7 +234,7 @@ export default function MailWorkspace({ companies, onNotice, onPromoted }: { com
         <form className="mail-search" onSubmit={(event) => { event.preventDefault(); setAppliedSearch(search.trim()); }}><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search active mail…" aria-label="Search mail" /><button type="submit">Search</button></form>
         <div className="mail-list">
           {mail.items.length ? mail.items.map((item) => (
-            <button className={item.id === selectedId ? "mail-row active" : "mail-row"} type="button" key={item.id} onClick={() => { setSelectedId(item.id); setMobileDetailOpen(true); }}>
+            <button className={item.id === selectedId ? "mail-row active" : "mail-row"} type="button" key={item.id} onClick={() => void selectMessage(item.id)}>
               <div><span className={item.replyState === "needs_reply" ? "reply-dot needs" : "reply-dot"} /><strong>{item.senderName || item.senderEmail}</strong><time>{mailDate(item.receivedAt)}</time></div>
               <h3>{item.subject}</h3><p>{item.preview}</p>
               <footer><span>{item.companySlug ? companies.find((company) => company.slug === item.companySlug)?.displayName : "Unfiled"}</span><span>{item.draftState !== "none" ? `Draft ${item.draftState}` : item.replyState.replace("_", " ")}</span></footer>

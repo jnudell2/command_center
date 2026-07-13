@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import MailWorkspace from "./mail-workspace";
 import CalendarWorkspace from "./calendar-workspace";
 
@@ -202,9 +202,11 @@ async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(`${runnerUrl}${path}`, {
     cache: "no-store",
     ...options,
-    headers: options?.body
-      ? { "Content-Type": "application/json", ...(options.headers || {}) }
-      : options?.headers,
+    headers: {
+      "X-Serent-Command-Center": "1",
+      ...(options?.body ? { "Content-Type": "application/json" } : {}),
+      ...(options?.headers || {}),
+    },
   });
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.error || "The local runner could not complete the request.");
@@ -324,9 +326,11 @@ export default function Home() {
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [policies, setPolicies] = useState<PreferenceRule[]>([]);
   const [delegation, setDelegation] = useState<DelegationPreview | null>(null);
-  const [skillSelection, setSkillSelection] = useState({ itemId: "", skillId: "" });
+  const [skillSelection] = useState({ itemId: "", skillId: "" });
+  const [mailTargetId, setMailTargetId] = useState("");
   const quickRef = useRef<HTMLInputElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
+  const noteSaveVersion = useRef(0);
 
   const load = async (quiet = false) => {
     try {
@@ -380,7 +384,7 @@ export default function Home() {
       } catch {
         // Keep the last cached view visible while the runner reconnects.
       }
-    }, 5000);
+    }, 10000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
@@ -393,22 +397,44 @@ export default function Home() {
 
   const activeNote = notes.find((note) => note.id === activeNoteId) || data?.dailyNote || null;
 
+  const saveNoteSnapshot = useCallback(async (id: string, title: string, body: string, version: number) => {
+    const saved = await api<Note>(`/api/notes/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ title, body }),
+    });
+    setNotes((current) => current.map((note) => (note.id === saved.id ? saved : note)));
+    if (version === noteSaveVersion.current) setNoteDirty(false);
+    return saved;
+  }, []);
+
   useEffect(() => {
     if (!noteDirty || !activeNoteId) return;
+    const version = ++noteSaveVersion.current;
+    const id = activeNoteId;
+    const title = noteTitle;
+    const body = noteDraft;
     const timer = window.setTimeout(async () => {
       try {
-        const saved = await api<Note>(`/api/notes/${encodeURIComponent(activeNoteId)}`, {
-          method: "PATCH",
-          body: JSON.stringify({ title: noteTitle, body: noteDraft }),
-        });
-        setNotes((current) => current.map((note) => (note.id === saved.id ? saved : note)));
-        setNoteDirty(false);
+        await saveNoteSnapshot(id, title, body, version);
       } catch (error) {
         setNotice(error instanceof Error ? error.message : "The note could not be saved.");
       }
     }, 650);
     return () => window.clearTimeout(timer);
-  }, [noteDirty, noteTitle, noteDraft, activeNoteId]);
+  }, [noteDirty, noteTitle, noteDraft, activeNoteId, saveNoteSnapshot]);
+
+  const selectNote = async (note: Note) => {
+    if (noteDirty && activeNoteId) {
+      const version = ++noteSaveVersion.current;
+      try { await saveNoteSnapshot(activeNoteId, noteTitle, noteDraft, version); }
+      catch (error) { setNotice(error instanceof Error ? error.message : "The current note could not be saved."); return; }
+    }
+    setActiveNoteId(note.id);
+    setNoteTitle(note.title);
+    setNoteDraft(note.body);
+    setNoteEditId(note.id);
+    setNoteDirty(false);
+  };
 
   const items = useMemo(() => data?.items || [], [data?.items]);
   const filteredItems = items.filter((item) => {
@@ -528,28 +554,6 @@ export default function Home() {
     }
   };
 
-  const recordApproval = async () => {
-    if (!selected) return;
-    setBusy(true);
-    try {
-      await api("/api/approvals", {
-        method: "POST",
-        body: JSON.stringify({
-          workItemId: selected.id,
-          actionType: selected.type,
-          destination: "Explicit Codex task",
-          payloadSummary: visibleDraft || selected.suggestedAction,
-        }),
-      });
-      setNotice("Approval recorded locally. No external action was executed.");
-      await load(true);
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : "The approval could not be recorded.");
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const completeInClickUp = async () => {
     if (!selected) return;
     setBusy(true);
@@ -650,16 +654,24 @@ export default function Home() {
 
   const openResult = (result: SearchResult) => {
     if (result.kind === "mail") {
+      setMailTargetId(result.id);
       setView("mail");
       return;
     }
     if (result.kind === "work_item" || result.workItemId) {
-      setSelectedId(result.kind === "work_item" ? result.id : result.workItemId || "");
+      const targetId = result.kind === "work_item" ? result.id : result.workItemId || "";
+      const target = items.find((item) => item.id === targetId);
+      setCompanyFilter("all");
+      setSourceFilter("all");
+      setTypeFilter("all");
+      setPriorityFilter("all");
+      if (target) setStatusFilter(workViewFor(target));
+      setSelectedId(targetId);
       setView("inbox");
       if (window.innerWidth <= 860) setMobileWorkbenchOpen(true);
     } else if (result.kind === "note") {
-      setActiveNoteId(result.id);
-      setView("notes");
+      const note = notes.find((item) => item.id === result.id);
+      if (note) void selectNote(note).then(() => setView("notes"));
     }
   };
 
@@ -676,7 +688,8 @@ export default function Home() {
     return (
       <main className="loading-shell" role="status">
         <div className="loading-mark">SERENT COMMAND CENTER</div>
-        <p>Opening your cached work home…</p>
+        <p>{notice || "Opening your cached work home…"}</p>
+        {notice ? <button type="button" onClick={() => void load()}>Retry</button> : null}
       </main>
     );
   }
@@ -757,7 +770,7 @@ export default function Home() {
           />
         ) : null}
 
-        {view === "mail" ? <MailWorkspace companies={data.companies} onNotice={setNotice} onPromoted={() => void load(true)} /> : null}
+        {view === "mail" ? <MailWorkspace companies={data.companies} selectedMessageId={mailTargetId} onNotice={setNotice} onPromoted={() => void load(true)} /> : null}
         {view === "calendar" ? <CalendarWorkspace items={items} onNotice={setNotice} onUpdated={() => void load(true)} /> : null}
 
         {view === "companies" ? (
@@ -788,7 +801,7 @@ export default function Home() {
                 setNotes((current) => [note, ...current]); setActiveNoteId(note.id); setNoteTitle(note.title); setNoteDraft(note.body); setNoteEditId(note.id); setNoteDirty(false);
               }}>+ New note</button>
               {notes.map((note) => (
-                <button className={activeNoteId === note.id ? "note-row active" : "note-row"} key={note.id} onClick={() => { setActiveNoteId(note.id); setNoteTitle(note.title); setNoteDraft(note.body); setNoteEditId(note.id); setNoteDirty(false); }} type="button">
+                <button className={activeNoteId === note.id ? "note-row active" : "note-row"} key={note.id} onClick={() => void selectNote(note)} type="button">
                   <span className="note-type">{note.type}</span><strong>{note.title}</strong><small>{note.body.slice(0, 92) || "Empty note"}</small>
                 </button>
               ))}
@@ -902,7 +915,7 @@ export default function Home() {
 
             <details className="workbench-section">
               <summary>Linked notes {selected.notes.length ? `(${selected.notes.length})` : ""}</summary>
-              {selected.notes.map((note) => <button className="linked-note" key={note.id} type="button" onClick={() => { setActiveNoteId(note.id); setNoteTitle(note.title); setNoteDraft(note.body); setNoteEditId(note.id); setNoteDirty(false); setView("notes"); }}><strong>{note.title}</strong><span>{note.body.slice(0, 100) || "Empty note"}</span></button>)}
+              {selected.notes.map((note) => <button className="linked-note" key={note.id} type="button" onClick={() => void selectNote(note).then(() => setView("notes"))}><strong>{note.title}</strong><span>{note.body.slice(0, 100) || "Empty note"}</span></button>)}
               <button className="text-action" type="button" onClick={() => void createContextNote()}>+ Add contextual note</button>
             </details>
 

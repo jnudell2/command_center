@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -170,6 +170,7 @@ const schemaStatements = [
     importance TEXT NOT NULL DEFAULT 'normal',
     company_slug TEXT REFERENCES companies(slug),
     reply_state TEXT NOT NULL DEFAULT 'informational',
+    reply_override TEXT NOT NULL DEFAULT '',
     reply_confidence REAL NOT NULL DEFAULT 0.5,
     reply_reason TEXT NOT NULL DEFAULT '',
     review_state TEXT NOT NULL DEFAULT 'unreviewed',
@@ -207,6 +208,7 @@ const schemaStatements = [
     generated_body TEXT NOT NULL DEFAULT '',
     current_body TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'queued',
+    origin_mode TEXT NOT NULL DEFAULT 'manual',
     skill_id TEXT NOT NULL DEFAULT 'draft-executive-email',
     source_basis TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
@@ -322,6 +324,8 @@ ensureColumn("notes", "file_path", "TEXT NOT NULL DEFAULT ''");
 ensureColumn("work_items", "decision_state", "TEXT NOT NULL DEFAULT 'proposed'");
 ensureColumn("work_items", "planned_at", "TEXT");
 ensureColumn("work_items", "planned_minutes", "INTEGER NOT NULL DEFAULT 0");
+ensureColumn("mail_messages", "reply_override", "TEXT NOT NULL DEFAULT ''");
+ensureColumn("mail_drafts", "origin_mode", "TEXT NOT NULL DEFAULT 'manual'");
 db.prepare("UPDATE work_items SET decision_state='committed' WHERE source_provider='clickup' AND decision_state='proposed'").run();
 db.prepare("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(3,datetime('now'))").run();
 
@@ -515,10 +519,11 @@ recoverInterruptedRuns();
 function responseJson(response, status, payload) {
   response.writeHead(status, {
     "Access-Control-Allow-Origin": allowedOrigin,
-    "Access-Control-Allow-Headers": "content-type",
+    "Access-Control-Allow-Headers": "content-type,x-serent-command-center",
     "Access-Control-Allow-Methods": "GET,POST,PATCH,OPTIONS",
     "Cache-Control": "no-store",
     "Content-Type": "application/json; charset=utf-8",
+    "Vary": "Origin",
   });
   response.end(JSON.stringify(payload));
 }
@@ -553,7 +558,9 @@ async function persistNoteFile(row) {
   }
   const absolute = path.join(documentsDir, relative);
   await mkdir(path.dirname(absolute), { recursive: true });
-  await writeFile(absolute, `# ${row.title}\n\n${row.body || ""}\n`, "utf8");
+  const temporary = `${absolute}.${randomUUID()}.tmp`;
+  await writeFile(temporary, `# ${row.title}\n\n${row.body || ""}\n`, "utf8");
+  await rename(temporary, absolute);
   return absolute;
 }
 
@@ -565,13 +572,13 @@ function ensureDailyNote() {
   const day = localDateKey();
   const id = `daily-${day}`;
   const existing = db.prepare("SELECT * FROM notes WHERE id = ?").get(id);
-  if (existing) { void persistNoteFile(existing); return mapNote(existing); }
+  if (existing) return mapNote(existing);
   const now = nowIso();
   db.prepare(`INSERT INTO notes(id, title, body, type, origin, state, created_at, updated_at)
     VALUES (?, ?, '', 'daily', 'manual', 'active', ?, ?)`).run(id, `Daily note · ${day}`, now, now);
   const created = db.prepare("SELECT * FROM notes WHERE id = ?").get(id);
   void persistNoteFile(created);
-  return mapNote(created);
+  return mapNote(db.prepare("SELECT * FROM notes WHERE id = ?").get(id));
 }
 
 function mapCompany(row) {
@@ -887,7 +894,7 @@ function dismissAutomaticMailAction(mailId) {
 
 function discardUnneededAutomaticDraft(mailId) {
   const draft = db.prepare("SELECT * FROM mail_drafts WHERE mail_message_id=?").get(mailId);
-  if (!draft || draft.current_body !== draft.generated_body) return;
+  if (!draft || draft.origin_mode !== "automatic" || draft.current_body !== draft.generated_body) return;
   const manual = db.prepare("SELECT id FROM mail_draft_revisions WHERE mail_draft_id=? AND origin='manual' LIMIT 1").get(draft.id);
   if (manual) return;
   db.prepare("DELETE FROM mail_drafts WHERE id=?").run(draft.id);
@@ -911,6 +918,13 @@ function ensureMailAction(mailId, classification) {
     eventFor(id, "created", "Promoted from Mail because the reply obligation is urgent or consequential.");
     db.prepare(`INSERT INTO source_references(id,work_item_id,provider,label,source_id,source_url,retrieved_at,freshness)
       VALUES(?,?, 'outlook', ?, ?, ?, ?, 'live')`).run(randomUUID(), id, mail.subject, mail.graph_id, mail.web_link, now);
+  }
+  const snoozed = mail.snoozed_until && Date.parse(mail.snoozed_until) > Date.now();
+  const currentStatus = db.prepare("SELECT status FROM work_items WHERE id=?").get(id)?.status;
+  if (snoozed && !["done", "dismissed"].includes(currentStatus)) {
+    db.prepare("UPDATE work_items SET status='waiting_external',updated_at=? WHERE id=?").run(now, id);
+  } else if (!snoozed && currentStatus === "waiting_external") {
+    db.prepare("UPDATE work_items SET status='to_review',updated_at=? WHERE id=?").run(now, id);
   }
   db.prepare("UPDATE mail_messages SET action_work_item_id=?,updated_at=? WHERE id=?").run(id, now, mailId);
   return id;
@@ -957,7 +971,8 @@ async function syncMail() {
       ON CONFLICT(graph_id) DO UPDATE SET conversation_id=excluded.conversation_id,internet_message_id=excluded.internet_message_id,subject=excluded.subject,
       sender_name=excluded.sender_name,sender_email=excluded.sender_email,recipients_json=excluded.recipients_json,cc_json=excluded.cc_json,
       received_at=excluded.received_at,preview=excluded.preview,web_link=excluded.web_link,is_read=excluded.is_read,has_attachments=excluded.has_attachments,
-      importance=excluded.importance,company_slug=COALESCE(mail_messages.company_slug,excluded.company_slug),reply_state=excluded.reply_state,
+       importance=excluded.importance,company_slug=COALESCE(mail_messages.company_slug,excluded.company_slug),
+       reply_state=CASE WHEN mail_messages.reply_override<>'' THEN mail_messages.reply_override ELSE excluded.reply_state END,
       reply_confidence=excluded.reply_confidence,reply_reason=excluded.reply_reason,freshness='live',last_synced_at=excluded.last_synced_at,updated_at=excluded.updated_at`);
     const draftCandidates = [];
     for (const message of payload.inbox) {
@@ -968,12 +983,15 @@ async function syncMail() {
       const now = nowIso();
       const sender = message.from?.emailAddress || {};
       upsert.run(id, message.id, message.conversationId || "", message.internetMessageId || "", message.subject || "(No subject)", sender.name || "", sender.address || "", JSON.stringify(addresses(message.toRecipients)), JSON.stringify(addresses(message.ccRecipients)), message.receivedDateTime || now, message.bodyPreview || "", message.webLink || "", message.isRead === null || message.isRead === undefined ? -1 : message.isRead ? 1 : 0, message.hasAttachments ? 1 : 0, message.importance || "normal", companySlug, classification.replyState, classification.confidence, classification.reason, now, now, now);
-      if (classification.highImpact) ensureMailAction(id, classification); else dismissAutomaticMailAction(id);
-      if (classification.replyState !== "needs_reply") discardUnneededAutomaticDraft(id);
+      const persisted = db.prepare("SELECT reply_state FROM mail_messages WHERE id=?").get(id);
+      const effectiveNeedsReply = persisted?.reply_state === "needs_reply";
+      if (classification.highImpact && effectiveNeedsReply) ensureMailAction(id, classification); else dismissAutomaticMailAction(id);
+      if (!effectiveNeedsReply) discardUnneededAutomaticDraft(id);
       const hasDraft = db.prepare("SELECT id FROM mail_drafts WHERE mail_message_id=?").get(id);
-      if (classification.replyState === "needs_reply" && !hasDraft) draftCandidates.push(id);
+      if (effectiveNeedsReply && !hasDraft) draftCandidates.push(id);
     }
-    db.prepare("UPDATE mail_messages SET freshness='cached' WHERE last_synced_at < ?").run(started);
+     db.prepare("UPDATE mail_messages SET freshness='cached' WHERE last_synced_at < ?").run(started);
+     for (const stale of db.prepare("SELECT id FROM mail_messages WHERE freshness='cached' AND action_work_item_id IS NOT NULL").all()) dismissAutomaticMailAction(stale.id);
     db.prepare("UPDATE mail_messages SET body_text='',body_cached_at=NULL WHERE body_cached_at IS NOT NULL AND body_cached_at < datetime('now','-30 days')").run();
     const coverage = payload.coverage.complete ? "complete" : "partial";
     const detail = `${payload.inbox.length} active messages synchronized across ${payload.coverage.pages} page${payload.coverage.pages === 1 ? "" : "s"}; coverage ${coverage}.`;
@@ -1031,7 +1049,7 @@ async function syncCalendar() {
     for (const event of events) {
       const startAt = calendarIso(event.start); const endAt = calendarIso(event.end);
       const duration = Date.parse(endAt) - Date.parse(startAt);
-      const isAllDay = startAt.endsWith("T00:00:00.000Z") && endAt.endsWith("T00:00:00.000Z") && duration >= 86400000;
+      const isAllDay = Boolean(event.is_all_day ?? event.isAllDay) || (startAt.endsWith("T00:00:00.000Z") && endAt.endsWith("T00:00:00.000Z") && duration >= 86400000);
       const existing = db.prepare("SELECT id FROM calendar_events WHERE graph_id=?").get(event.id);
       const id = existing?.id || randomUUID();
       upsert.run(id,event.id,String(event.subject||"(No title)").slice(0,500),startAt,endAt,isAllDay?1:0,String(event.organizer?.name||""),String(event.organizer?.email||""),JSON.stringify(event.attendees||[]),String(event.location?.display_name||event.location?.address||""),String(event.web_link||""),now,now,now);
@@ -1050,15 +1068,15 @@ async function syncCalendar() {
 function queryCalendar(filters = {}) {
   const start = calendarIso(filters.start || new Date().toISOString());
   const end = calendarIso(filters.end || new Date(Date.now()+7*86400000).toISOString());
-  return db.prepare("SELECT * FROM calendar_events WHERE end_at>? AND start_at<? ORDER BY start_at").all(start,end).map(mapCalendarEvent);
+  return db.prepare("SELECT * FROM calendar_events WHERE freshness='live' AND end_at>? AND start_at<? ORDER BY start_at").all(start,end).map(mapCalendarEvent);
 }
 
 function queryMail(filters = {}) {
   const clauses = ["1=1"];
   const params = [];
   const view = filters.view || "needs_reply";
-  if (view === "needs_reply") clauses.push("m.reply_state='needs_reply' AND (m.snoozed_until IS NULL OR datetime(m.snoozed_until) <= datetime('now'))");
-  if (view === "unread") clauses.push("m.is_read=0");
+  if (view === "needs_reply") clauses.push("m.freshness='live' AND m.reply_state='needs_reply' AND (m.snoozed_until IS NULL OR datetime(m.snoozed_until) <= datetime('now'))");
+  if (view === "unread") clauses.push("m.freshness='live' AND m.is_read=0");
   if (view === "drafts") clauses.push("d.id IS NOT NULL");
   if (view === "snoozed") clauses.push("datetime(m.snoozed_until) > datetime('now')");
   if (filters.company && filters.company !== "all") { clauses.push("m.company_slug=?"); params.push(filters.company); }
@@ -1081,7 +1099,7 @@ async function mailDetail(id) {
     const full = await fetchMailBody(row.graph_id);
     const attachments = await fetchMailAttachments(row.graph_id).catch(() => []);
     const body = full.body?.contentType?.toLowerCase() === "html" ? htmlToText(full.body.content) : String(full.body?.content || "");
-    db.prepare("UPDATE mail_messages SET body_text=?,body_cached_at=?,attachments_json=?,freshness='live',last_synced_at=?,updated_at=? WHERE id=?").run(body.slice(0, 150000), nowIso(), JSON.stringify(attachments.map((item) => ({ id: item.id, name: item.name, contentType: item.contentType, size: item.size, isInline: Boolean(item.isInline) }))), nowIso(), nowIso(), id);
+    db.prepare("UPDATE mail_messages SET body_text=?,body_cached_at=?,attachments_json=?,has_attachments=?,freshness='live',last_synced_at=?,updated_at=? WHERE id=?").run(body.slice(0, 150000), nowIso(), JSON.stringify(attachments.map((item) => ({ id: item.id, name: item.name, contentType: item.contentType, size: item.size, isInline: Boolean(item.isInline) }))), attachments.length ? 1 : 0, nowIso(), nowIso(), id);
     row = db.prepare(`${mailSelect} WHERE m.id=?`).get(id);
   }
   return mapMail(row, true);
@@ -1109,8 +1127,8 @@ function bootstrapPayload(filters = {}) {
   );
   const mailCounts = {
     all: db.prepare("SELECT COUNT(*) AS count FROM mail_messages").get().count,
-    needs_reply: db.prepare("SELECT COUNT(*) AS count FROM mail_messages WHERE reply_state='needs_reply' AND (snoozed_until IS NULL OR datetime(snoozed_until) <= datetime('now'))").get().count,
-    unread: db.prepare("SELECT COUNT(*) AS count FROM mail_messages WHERE is_read=0").get().count,
+    needs_reply: db.prepare("SELECT COUNT(*) AS count FROM mail_messages WHERE freshness='live' AND reply_state='needs_reply' AND (snoozed_until IS NULL OR datetime(snoozed_until) <= datetime('now'))").get().count,
+    unread: db.prepare("SELECT COUNT(*) AS count FROM mail_messages WHERE freshness='live' AND is_read=0").get().count,
     drafts: db.prepare("SELECT COUNT(*) AS count FROM mail_drafts").get().count,
     snoozed: db.prepare("SELECT COUNT(*) AS count FROM mail_messages WHERE datetime(snoozed_until) > datetime('now')").get().count,
   };
@@ -1145,7 +1163,9 @@ const sourcePrompts = {
 };
 
 function sourceOutputContract(source) {
-  return `${sourcePrompts[source]} Return one JSON object only with this shape: {"summary":"coverage note","items":[{"sourceKey":"stable source id","companySlug":"one of avionte, stockiq, govworx, firm or null","type":"email|meeting|task|decision|follow_up|research|artifact","title":"short action-oriented title","summary":"what happened","whyNow":"why it matters now","priority":"urgent|high|normal|low","confidence":0.0,"suggestedAction":"next action","sourceLabel":"human-readable evidence","sourcePath":"optional local path","sourceUrl":"optional source link"}]}. Use an empty items array when nothing consequential changed. Read only. Do not send, create, update, move, or delete anything.`;
+  const existingKeys = db.prepare("SELECT source_key FROM work_items WHERE source_provider=? AND status NOT IN ('done','dismissed') AND source_key<>'' LIMIT 100").all(source).map((row) => row.source_key);
+  const reconciliation = existingKeys.length ? ` Re-check these currently active local source keys and return any that are now complete or no longer active with resolutionState=resolved: ${existingKeys.join(", ")}.` : "";
+  return `${sourcePrompts[source]}${reconciliation} Return one JSON object only with this shape: {"summary":"coverage note","items":[{"sourceKey":"stable source id","resolutionState":"active|resolved","companySlug":"one of avionte, stockiq, govworx, firm or null","type":"email|meeting|task|decision|follow_up|research|artifact","title":"short action-oriented title","summary":"what happened","whyNow":"why it matters now","priority":"urgent|high|normal|low","confidence":0.0,"suggestedAction":"next action","sourceLabel":"human-readable evidence","sourcePath":"optional local path","sourceUrl":"optional source link"}]}. Use an empty items array when nothing consequential changed. Read only. Do not send, create, update, move, or delete anything.`;
 }
 
 function parseAgentJson(text) {
@@ -1165,24 +1185,43 @@ function upsertNormalizedItems(source, payload) {
   let changed = 0;
   for (const item of payload.items.slice(0, 30)) {
     if (!item?.sourceKey || !item?.title || !item?.summary) continue;
-    const existing = db.prepare("SELECT id FROM work_items WHERE source_provider = ? AND source_key = ?").get(source, String(item.sourceKey));
+    const existing = db.prepare("SELECT * FROM work_items WHERE source_provider = ? AND source_key = ?").get(source, String(item.sourceKey));
     const id = existing?.id || randomUUID();
     const now = nowIso();
+    if (item.resolutionState === "resolved" && existing) {
+      if (!["done","dismissed"].includes(existing.status)) {
+        db.prepare("UPDATE work_items SET status='done',resolution=?,resolved_at=?,updated_at=? WHERE id=?").run(`Resolved in ${source} and verified during source refresh.`,now,now,id);
+        eventFor(id,"source_resolved",`The ${source} source now reports this item resolved.`);
+        changed += 1;
+      }
+      continue;
+    }
     const company = item.companySlug && db.prepare("SELECT slug FROM companies WHERE slug = ?").get(item.companySlug) ? item.companySlug : null;
+    const next = {
+      type: String(item.type || "follow_up").slice(0,120),
+      title: String(item.title).slice(0,240),
+      summary: String(item.summary).slice(0,1600),
+      whyNow: String(item.whyNow || "Changed source requires review.").slice(0,1200),
+      priority: ["urgent","high","normal","low"].includes(item.priority) ? item.priority : "normal",
+      confidence: Math.min(1,Math.max(0,Number(item.confidence ?? 0.7))),
+      suggestedAction: String(item.suggestedAction || "Review the source change.").slice(0,1200),
+    };
     if (existing) {
+      const materiallyChanged = existing.type !== next.type || existing.company_slug !== company || existing.title !== next.title || existing.summary !== next.summary || existing.why_now !== next.whyNow || existing.priority !== next.priority || Number(existing.confidence) !== next.confidence || existing.suggested_action !== next.suggestedAction;
       db.prepare(`UPDATE work_items SET type=?, company_slug=?, title=?, summary=?, why_now=?, priority=?, confidence=?,
-        suggested_action=?, updated_at=? WHERE id=?`).run(item.type || "follow_up", company, String(item.title).slice(0, 240), String(item.summary).slice(0, 1600), String(item.whyNow || "Changed source requires review.").slice(0, 1200), item.priority || "normal", Number(item.confidence || 0.7), String(item.suggestedAction || "Review the source change.").slice(0, 1200), now, id);
-      eventFor(id, "changed", `Updated by the ${source} pulse.`);
+        suggested_action=?,status=CASE WHEN ? AND status IN ('done','dismissed') THEN 'to_review' ELSE status END,
+        resolved_at=CASE WHEN ? AND status IN ('done','dismissed') THEN NULL ELSE resolved_at END,updated_at=? WHERE id=?`).run(next.type, company, next.title, next.summary, next.whyNow, next.priority, next.confidence, next.suggestedAction, materiallyChanged ? 1 : 0, materiallyChanged ? 1 : 0, now, id);
+      if (materiallyChanged) { eventFor(id, "changed", `Updated by the ${source} pulse.`); changed += 1; }
     } else {
       db.prepare(`INSERT INTO work_items(id,type,company_slug,title,summary,why_now,priority,confidence,status,suggested_action,source_provider,source_key,created_at,updated_at)
-        VALUES(?,?,?,?,?,?,?,?, 'to_review', ?,?,?,?,?)`).run(id, item.type || "follow_up", company, String(item.title).slice(0, 240), String(item.summary).slice(0, 1600), String(item.whyNow || "New source activity requires review.").slice(0, 1200), item.priority || "normal", Number(item.confidence || 0.7), String(item.suggestedAction || "Review the source activity.").slice(0, 1200), source, String(item.sourceKey), now, now);
+        VALUES(?,?,?,?,?,?,?,?, 'to_review', ?,?,?,?,?)`).run(id, next.type, company, next.title, next.summary, String(item.whyNow || "New source activity requires review.").slice(0,1200), next.priority, next.confidence, next.suggestedAction, source, String(item.sourceKey), now, now);
       eventFor(id, "created", `Created by the ${source} pulse.`);
+      changed += 1;
     }
     if (source === "clickup") db.prepare("UPDATE work_items SET decision_state='committed' WHERE id=?").run(id);
     db.prepare("DELETE FROM source_references WHERE work_item_id = ? AND provider = ?").run(id, source);
     db.prepare(`INSERT INTO source_references(id,work_item_id,provider,label,source_id,source_path,source_url,retrieved_at,freshness)
       VALUES(?,?,?,?,?,?,?,?, 'live')`).run(randomUUID(), id, source, String(item.sourceLabel || source), String(item.sourceKey), String(item.sourcePath || ""), String(item.sourceUrl || ""), now);
-    changed += 1;
   }
   return changed;
 }
@@ -1285,15 +1324,17 @@ async function launchClickUpCompletion(item) {
   child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
   child.stdout.on("data", (chunk) => { buffer += chunk; const lines=buffer.split(/\r?\n/); buffer=lines.pop()||""; for(const line of lines) try { const event=JSON.parse(line); if(event.type==="item.completed"&&event.item?.type==="agent_message") finalMessage=event.item.text||""; } catch {} });
   child.stderr.on("data", (chunk) => { stderr=`${stderr}${chunk}`.slice(-8000); });
-  child.stdin.end(`Jake explicitly clicked Done in ClickUp in Serent Command Center. Use the installed ClickUp connector to update only task ${targetId}. Set its status to complete. Do not change any other field or system. Then verify the task and return a one-sentence receipt naming the task ID and final status.`);
+  child.stdin.end(`Jake explicitly clicked Done in ClickUp in Serent Command Center. Use the installed ClickUp connector to update only task ${targetId}. Set its status to complete. Do not change any other field or system. Then read that exact task back from ClickUp. Return one JSON object only: {"verified":true,"taskId":"${targetId}","status":"complete","receipt":"one sentence receipt"}. If the update or readback fails, return {"verified":false,"taskId":"${targetId}","status":"unknown","error":"reason"}.`);
   child.on("close", (code) => {
     activeProcesses.delete(id); const finished=nowIso();
-    if(code===0 && finalMessage) {
-      db.prepare("UPDATE external_actions SET status='complete',receipt=?,updated_at=? WHERE id=?").run(finalMessage.slice(0,4000),finished,id);
-      db.prepare("UPDATE work_items SET status='done',resolution=?,resolved_at=?,updated_at=? WHERE id=?").run(`Completed in ClickUp: ${finalMessage}`.slice(0,4000),finished,finished,item.id);
-      eventFor(item.id,"completed_in_clickup",finalMessage.slice(0,1200));
+    const verified = parseAgentJson(finalMessage);
+    if(code===0 && verified?.verified === true && String(verified.taskId) === targetId && String(verified.status).toLowerCase() === "complete") {
+      const receipt=String(verified.receipt||`ClickUp task ${targetId} verified complete.`).slice(0,4000);
+      db.prepare("UPDATE external_actions SET status='complete',receipt=?,updated_at=? WHERE id=?").run(receipt,finished,id);
+      db.prepare("UPDATE work_items SET status='done',resolution=?,resolved_at=?,updated_at=? WHERE id=?").run(`Completed in ClickUp: ${receipt}`.slice(0,4000),finished,finished,item.id);
+      eventFor(item.id,"completed_in_clickup",receipt.slice(0,1200));
     } else {
-      const error=stderr.trim()||"ClickUp completion could not be verified.";
+      const error=String(verified?.error||stderr.trim()||"ClickUp completion could not be verified by readback.").slice(0,4000);
       db.prepare("UPDATE external_actions SET status='error',error=?,updated_at=? WHERE id=?").run(error,finished,id);
       eventFor(item.id,"external_action_error",error.slice(0,1200));
     }
@@ -1333,10 +1374,15 @@ async function readCodexThread(threadId) {
   return new Promise((resolve, reject) => {
     const child = spawn(cli,["app-server","--stdio"],{cwd:aiOsRoot,env:process.env,windowsHide:true});
     let buffer=""; let finished=false;
-    const stop=(error,value)=>{if(finished)return;finished=true;clearTimeout(timeout);if(!child.killed)child.kill();error?reject(error):resolve(value);};
-    const send=(message)=>child.stdin.write(`${JSON.stringify(message)}\n`);
+    const stop=(error,value)=>{if(finished)return;finished=true;clearTimeout(timeout);if(!child.killed)child.kill();if(error)reject(error);else resolve(value);};
+    const send=(message)=>{
+      if(finished||child.killed||!child.stdin.writable)return false;
+      try{child.stdin.write(`${JSON.stringify(message)}\n`,(error)=>{if(error)stop(error);});return true;}
+      catch(error){stop(error);return false;}
+    };
     const timeout=setTimeout(()=>stop(new Error("Timed out while reading the Codex task.")),8000);
     child.stdout.setEncoding("utf8"); child.stdout.on("data",(chunk)=>{buffer+=chunk;const lines=buffer.split(/\r?\n/);buffer=lines.pop()||"";for(const line of lines)try{const event=JSON.parse(line);if(event.id===1){send({method:"initialized",params:{}});send({id:2,method:"thread/read",params:{threadId,includeTurns:true}});}if(event.id===2){if(event.error)stop(new Error(event.error.message||"Could not read Codex task."));else stop(null,event.result?.thread||null);}}catch{}});
+    child.stdin.on("error",(error)=>stop(error));
     child.on("error",stop); child.on("close",()=>{if(!finished)stop(new Error("Codex task reader stopped."));});
     send({id:1,method:"initialize",params:{clientInfo:{name:"serent-command-center-reconciler",title:"Serent Command Center",version:"1.0.0"},capabilities:{experimentalApi:true}}});
   });
@@ -1372,13 +1418,17 @@ async function launchPersistentCodexTask(item, instruction) {
   const cli=await resolveCodexCli();
   const child=spawn(cli,["app-server","--stdio"],{cwd:aiOsRoot,env:process.env,windowsHide:true});
   activeProcesses.set(id,child);
-  let buffer="";let finalMessage="";let stderr="";let threadId="";let finishedTask=false;let pollTimer=null;let pollId=20;let terminalPolls=0;
-  const send=(message)=>child.stdin.write(`${JSON.stringify(message)}\n`);
+  let buffer="";let finalMessage="";let stderr="";let threadId="";let finishedTask=false;let pollTimer=null;let taskTimeout=null;let pollId=20;let terminalPolls=0;
   const finish=(success,error="")=>{
-    if(finishedTask)return; finishedTask=true; if(pollTimer)clearInterval(pollTimer);clearTimeout(taskTimeout);activeProcesses.delete(id); const finished=nowIso();
+    if(finishedTask)return; finishedTask=true; if(pollTimer)clearInterval(pollTimer);if(taskTimeout)clearTimeout(taskTimeout);activeProcesses.delete(id); const finished=nowIso();
     if(success){db.prepare("UPDATE codex_tasks SET thread_id=?,status='complete',result=?,updated_at=? WHERE id=?").run(threadId,finalMessage.slice(0,50000),finished,id);db.prepare("UPDATE work_items SET status='back_for_review',updated_at=? WHERE id=?").run(finished,item.id);eventFor(item.id,"codex_task_returned",`Separate Codex task completed${threadId?` (${threadId})`:""}.`);}
     else{const detail=error||stderr.trim()||"The separate Codex task stopped without a result.";db.prepare("UPDATE codex_tasks SET thread_id=?,status='error',error=?,updated_at=? WHERE id=?").run(threadId,detail,finished,id);db.prepare("UPDATE work_items SET status='back_for_review',updated_at=? WHERE id=?").run(finished,item.id);eventFor(item.id,"codex_task_error",detail.slice(0,1200));}
     setTimeout(()=>{if(!child.killed)child.kill();},150);
+  };
+  const send=(message)=>{
+    if(finishedTask||child.killed||!child.stdin.writable)return false;
+    try{child.stdin.write(`${JSON.stringify(message)}\n`,(error)=>{if(error&&!finishedTask)finish(false,error.message);});return true;}
+    catch(error){finish(false,error.message);return false;}
   };
   child.stdout.setEncoding("utf8");child.stderr.setEncoding("utf8");
   child.stdout.on("data",(chunk)=>{buffer+=chunk;const lines=buffer.split(/\r?\n/);buffer=lines.pop()||"";for(const line of lines)try{const event=JSON.parse(line);
@@ -1390,9 +1440,10 @@ async function launchPersistentCodexTask(item, instruction) {
     if(event.id&&event.error&&event.id<20)finish(false,event.error.message||"Codex app-server request failed.");
   }catch{}});
   child.stderr.on("data",(chunk)=>{stderr=`${stderr}${chunk}`.slice(-8000);});
+  child.stdin.on("error",(error)=>{if(!finishedTask)finish(false,error.message);});
   child.on("error",(error)=>finish(false,error.message));
   child.on("close",()=>{if(!finishedTask)finish(false);});
-  const taskTimeout=setTimeout(()=>finish(false,"The separate Codex task exceeded 15 minutes without returning a result."),15*60*1000);
+  taskTimeout=setTimeout(()=>finish(false,"The separate Codex task exceeded 15 minutes without returning a result."),15*60*1000);
   send({id:1,method:"initialize",params:{clientInfo:{name:"serent-command-center",title:"Serent Command Center",version:"1.0.0"},capabilities:{experimentalApi:true}}});
   return {id,threadId,status:"starting",title,instruction,createdAt:now,updatedAt:now};
 }
@@ -1447,7 +1498,8 @@ async function launchAgentRun({ workItemId = null, mailMessageId = null, company
     }
   });
   child.stderr.on("data", (chunk) => { stderrBuffer = `${stderrBuffer}${chunk}`.slice(-8000); });
-  child.stdin.end(`Use the installed ${skillId} skill for this assignment.\n\n${safeIntent}\n\nThis is a Serent Command Center background assignment. Stay within these allowed source categories: ${allowedSources.join(", ") || "local context only"}. Work read-only. Never send messages or modify ClickUp, calendar, Box, Guru, email, or any shared system. ${scope === "mail_draft" ? "Return only the sendable reply body with no commentary, labels, or Markdown fence." : "Return a concise, source-backed result."}`);
+  const skillInstruction = skillId === "generic-codex" ? "Use normal Codex capabilities for this scoped assignment." : `Use the installed ${skillId} skill for this assignment.`;
+  child.stdin.end(`${skillInstruction}\n\n${safeIntent}\n\nThis is a Serent Command Center background assignment. Stay within these allowed source categories: ${allowedSources.join(", ") || "local context only"}. Work read-only. Never send messages or modify ClickUp, calendar, Box, Guru, email, or any shared system. ${scope === "mail_draft" ? "Return only the sendable reply body with no commentary, labels, or Markdown fence." : "Return a concise, source-backed result."}`);
 
   child.on("close", (code) => {
     clearTimeout(timeout);
@@ -1498,7 +1550,7 @@ async function launchAgentRun({ workItemId = null, mailMessageId = null, company
   return mapRun(db.prepare("SELECT * FROM agent_runs WHERE id = ?").get(id));
 }
 
-async function launchMailDraft(mailMessageId, { feedback = "" } = {}) {
+async function launchMailDraft(mailMessageId, { automatic = false, feedback = "" } = {}) {
   const active = db.prepare("SELECT * FROM agent_runs WHERE mail_message_id=? AND scope='mail_draft' AND status IN ('queued','working') ORDER BY created_at DESC LIMIT 1").get(mailMessageId);
   if (active) return mapRun(active);
   const mail = await mailDetail(mailMessageId);
@@ -1509,9 +1561,9 @@ async function launchMailDraft(mailMessageId, { feedback = "" } = {}) {
   const now = nowIso();
   const existingDraft = db.prepare("SELECT * FROM mail_drafts WHERE mail_message_id=?").get(mailMessageId);
   const draftId = existingDraft?.id || randomUUID();
-  db.prepare(`INSERT INTO mail_drafts(id,mail_message_id,generated_body,current_body,status,skill_id,source_basis,created_at,updated_at)
-    VALUES(?,?, '', '', 'queued','draft-executive-email',?,?,?)
-    ON CONFLICT(mail_message_id) DO UPDATE SET status='queued',skill_id='draft-executive-email',source_basis=excluded.source_basis,updated_at=excluded.updated_at`).run(draftId, mailMessageId, JSON.stringify(preview.contextManifest), now, now);
+  db.prepare(`INSERT INTO mail_drafts(id,mail_message_id,generated_body,current_body,status,origin_mode,skill_id,source_basis,created_at,updated_at)
+    VALUES(?,?, '', '', 'queued',?,'draft-executive-email',?,?,?)
+    ON CONFLICT(mail_message_id) DO UPDATE SET status='queued',origin_mode=excluded.origin_mode,skill_id='draft-executive-email',source_basis=excluded.source_basis,updated_at=excluded.updated_at`).run(draftId, mailMessageId, automatic ? "automatic" : "manual", JSON.stringify(preview.contextManifest), now, now);
   db.prepare("UPDATE mail_messages SET draft_state='queued',updated_at=? WHERE id=?").run(now, mailMessageId);
   return launchAgentRun({ mailMessageId, companySlug: mail.companySlug, scope: "mail_draft", intent, title: `Draft reply · ${mail.subject}`, allowedSources: ["outlook", "ai_os", "project_files", "notes"], skillId: "draft-executive-email", executorType: "codex_readonly", contextManifest: preview.contextManifest });
 }
@@ -1614,7 +1666,10 @@ function searchAll(query) {
 const server = createServer(async (request, response) => {
   try {
     const url = new URL(request.url || "/", `http://${host}:${port}`);
+    const origin = request.headers.origin || "";
+    if (origin && origin !== allowedOrigin) return responseJson(response, 403, { error: "Request origin is not allowed." });
     if (request.method === "OPTIONS") return responseJson(response, 204, {});
+    if (origin && request.method !== "GET" && request.headers["x-serent-command-center"] !== "1") return responseJson(response, 403, { error: "Command Center request marker is required." });
     if (request.method === "GET" && url.pathname === "/api/health") return responseJson(response, 200, { status: "ready", checkedAt: nowIso(), activeJobs: activeProcesses.size, database: databasePath });
     if (request.method === "GET" && url.pathname === "/api/bootstrap") return responseJson(response, 200, bootstrapPayload(Object.fromEntries(url.searchParams)));
     if (request.method === "GET" && url.pathname === "/api/work-items") return responseJson(response, 200, queryWorkItems(Object.fromEntries(url.searchParams)));
@@ -1688,10 +1743,15 @@ const server = createServer(async (request, response) => {
       const body = await readJsonBody(request);
       const company = body.companySlug === undefined ? current.company_slug : (body.companySlug && db.prepare("SELECT slug FROM companies WHERE slug=?").get(body.companySlug) ? body.companySlug : null);
       const reviewState = ["unreviewed", "reviewed", "dismissed"].includes(body.reviewState) ? body.reviewState : current.review_state;
-      const replyState = ["needs_reply", "responded", "informational"].includes(body.replyState) ? body.replyState : current.reply_state;
+      const hasReplyState = ["needs_reply", "responded", "informational"].includes(body.replyState);
+      const replyState = hasReplyState ? body.replyState : current.reply_state;
+      const replyOverride = body.replyState === null ? "" : hasReplyState ? body.replyState : current.reply_override;
       const snoozedUntil = body.snoozedUntil === undefined ? current.snoozed_until : body.snoozedUntil || null;
-      db.prepare("UPDATE mail_messages SET company_slug=?,review_state=?,reply_state=?,snoozed_until=?,updated_at=? WHERE id=?").run(company, reviewState, replyState, snoozedUntil, nowIso(), id);
+      db.prepare("UPDATE mail_messages SET company_slug=?,review_state=?,reply_state=?,reply_override=?,snoozed_until=?,updated_at=? WHERE id=?").run(company, reviewState, replyState, replyOverride, snoozedUntil, nowIso(), id);
       if (body.promote && !current.action_work_item_id) ensureMailAction(id, { highImpact: true });
+      const actionId = current.action_work_item_id || (body.promote ? db.prepare("SELECT action_work_item_id FROM mail_messages WHERE id=?").get(id)?.action_work_item_id : null);
+      if (actionId && snoozedUntil && Date.parse(snoozedUntil) > Date.now()) db.prepare("UPDATE work_items SET status='waiting_external',updated_at=? WHERE id=? AND status NOT IN ('done','dismissed')").run(nowIso(),actionId);
+      if (actionId && (!snoozedUntil || Date.parse(snoozedUntil) <= Date.now())) db.prepare("UPDATE work_items SET status='to_review',updated_at=? WHERE id=? AND status='waiting_external'").run(nowIso(),actionId);
       const action = body.promote ? "promoted" : snoozedUntil !== current.snoozed_until ? "snoozed" : company !== current.company_slug ? "company_corrected" : replyState !== current.reply_state ? "reply_state_corrected" : "reviewed";
       recordFeedback({ eventType: action, mailMessageId: id, companySlug: company, detail: String(body.detail || action), beforeValue: JSON.stringify({ companySlug: current.company_slug, reviewState: current.review_state, replyState: current.reply_state, snoozedUntil: current.snoozed_until }), afterValue: JSON.stringify({ companySlug: company, reviewState, replyState, snoozedUntil }) });
       return responseJson(response, 200, mapMail(db.prepare(`${mailSelect} WHERE m.id=?`).get(id), true));

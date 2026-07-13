@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { once } from "node:events";
 import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
@@ -34,9 +34,18 @@ test("migrates a fresh local store and exposes adaptive Mail contracts", async (
   });
   await waitFor(`http://127.0.0.1:${port}/api/health`);
 
+  const rejectedOrigin = await fetch(`http://127.0.0.1:${port}/api/calendar/refresh`, { method: "POST", headers: { origin: "https://example.com" } });
+  assert.equal(rejectedOrigin.status, 403);
+
   const bootstrap = await (await fetch(`http://127.0.0.1:${port}/api/bootstrap`)).json();
   assert.equal(bootstrap.runner.status, "ready");
   assert.deepEqual(bootstrap.mailCounts, { all: 0, needs_reply: 0, unread: 0, drafts: 0, snoozed: 0 });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const dailyBefore = await stat(bootstrap.dailyNote.filePath);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  await fetch(`http://127.0.0.1:${port}/api/bootstrap`);
+  const dailyAfter = await stat(bootstrap.dailyNote.filePath);
+  assert.equal(dailyAfter.mtimeMs, dailyBefore.mtimeMs, "reading bootstrap must not rewrite the daily note");
 
   const mail = await (await fetch(`http://127.0.0.1:${port}/api/mail?view=needs_reply`)).json();
   assert.deepEqual(mail.items, []);
@@ -90,6 +99,12 @@ test("migrates a fresh local store and exposes adaptive Mail contracts", async (
   const mailDetail = await (await fetch(`http://127.0.0.1:${port}/api/mail/test-mail`)).json();
   assert.equal(mailDetail.body.length > 0, true);
   assert.equal(mailDetail.activeRules.length, 1);
+  const correctedMail = await (await fetch(`http://127.0.0.1:${port}/api/mail/test-mail`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ replyState: "responded" }) })).json();
+  assert.equal(correctedMail.replyState, "responded");
+  const verifyDb = new DatabaseSync(path.join(dataDir, "serent-tend.sqlite"));
+  const correctedRow = verifyDb.prepare("SELECT reply_override FROM mail_messages WHERE id='test-mail'").get();
+  assert.equal(correctedRow.reply_override, "responded");
+  verifyDb.close();
 
   const note = await (await fetch(`http://127.0.0.1:${port}/api/notes`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ title: "StockIQ decision", body: "Use the new packaging decision in follow-through.", type: "decision", companySlug: "stockiq" }) })).json();
   assert.match(note.filePath, /stockiq.+decision.+\.md$/i);

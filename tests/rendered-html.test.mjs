@@ -21,6 +21,7 @@ test("server-renders the local Serent Command Center shell", async () => {
   assert.match(html, /<title>Serent Command Center<\/title>/i);
   assert.match(html, /Opening your cached work home/i);
   assert.doesNotMatch(html, /Your site is taking shape|Codex is building the first version/i);
+  assert.doesNotMatch(html, /C:\/Users\/JakeNudell/i);
 });
 
 test("defines the inbox, workbench, notes, and review-only contracts", async () => {
@@ -38,7 +39,7 @@ test("defines the inbox, workbench, notes, and review-only contracts", async () 
   assert.match(runner, /read-only/);
   assert.match(runner, /zoom-transcript-router/);
   assert.match(runner, /draft-executive-email/);
-  assert.match(page, /No external action was executed/i);
+  assert.match(runner, /No external action was executed/i);
   assert.match(page, /Ask Codex to edit this document/i);
   assert.match(page, /Done in ClickUp/i);
   assert.match(page, /Return the result to this card/i);
@@ -57,4 +58,8 @@ test("defines the inbox, workbench, notes, and review-only contracts", async () 
   assert.match(runner, /event\.id<20/);
   assert.match(runner, /note_edit_proposals/);
   assert.match(runner, /status_repaired/);
+  assert.match(runner, /Request origin is not allowed/);
+  assert.match(runner, /verified\?\.verified === true/);
+  assert.match(page, /noteSaveVersion/);
+  assert.match(page, /selectedMessageId/);
 });
