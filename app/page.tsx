@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import MailWorkspace from "./mail-workspace";
 import CalendarWorkspace from "./calendar-workspace";
+import MarkdownEditor from "./markdown-editor";
 
 type WorkStatus =
   | "to_review"
@@ -223,6 +224,11 @@ function relativeTime(value: string | null) {
   return date.toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
+function bodyForEditor(title: string, body: string) {
+  const leadingTitle = body.match(/^#\s+([^\r\n]+)\r?\n+/);
+  return leadingTitle?.[1]?.trim() === title.trim() ? body.slice(leadingTitle[0].length) : body;
+}
+
 function fullDate(value: string) {
   return new Date(value).toLocaleString([], {
     month: "short",
@@ -322,6 +328,8 @@ export default function Home() {
   const [noteEditId, setNoteEditId] = useState("");
   const [noteDirty, setNoteDirty] = useState(false);
   const [noteCodexInstruction, setNoteCodexInstruction] = useState("");
+  const [noteQuery, setNoteQuery] = useState("");
+  const [noteRailOpen, setNoteRailOpen] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [policies, setPolicies] = useState<PreferenceRule[]>([]);
@@ -346,7 +354,7 @@ export default function Home() {
         setNotes(nextNotes);
         if (!activeNoteId) {
           setNoteTitle(next.dailyNote.title);
-          setNoteDraft(next.dailyNote.body);
+          setNoteDraft(bodyForEditor(next.dailyNote.title, next.dailyNote.body));
           setNoteEditId(next.dailyNote.id);
           setActiveNoteId(next.dailyNote.id);
         }
@@ -370,7 +378,7 @@ export default function Home() {
         setNotes(nextNotes);
         setActiveNoteId(next.dailyNote.id);
         setNoteTitle(next.dailyNote.title);
-        setNoteDraft(next.dailyNote.body);
+        setNoteDraft(bodyForEditor(next.dailyNote.title, next.dailyNote.body));
         setNoteEditId(next.dailyNote.id);
       } catch (error) {
         if (!cancelled) setNotice(error instanceof Error ? error.message : "The local runner is offline.");
@@ -396,6 +404,17 @@ export default function Home() {
   }, [companyFilter]);
 
   const activeNote = notes.find((note) => note.id === activeNoteId) || data?.dailyNote || null;
+  const filteredNotes = useMemo(() => {
+    const query = noteQuery.trim().toLowerCase();
+    if (!query) return notes;
+    return notes.filter((note) => `${note.title} ${note.body} ${note.type}`.toLowerCase().includes(query));
+  }, [noteQuery, notes]);
+  const noteGroups = useMemo(() => [
+    { id: "daily", label: "Daily", notes: filteredNotes.filter((note) => note.type === "daily") },
+    { id: "meetings", label: "Meetings", notes: filteredNotes.filter((note) => note.type === "meeting") },
+    { id: "projects", label: "Projects & decisions", notes: filteredNotes.filter((note) => ["project", "decision"].includes(note.type)) },
+    { id: "notes", label: "Notes", notes: filteredNotes.filter((note) => note.type === "scratch") },
+  ].filter((group) => group.notes.length), [filteredNotes]);
 
   const saveNoteSnapshot = useCallback(async (id: string, title: string, body: string, version: number) => {
     const saved = await api<Note>(`/api/notes/${encodeURIComponent(id)}`, {
@@ -431,7 +450,7 @@ export default function Home() {
     }
     setActiveNoteId(note.id);
     setNoteTitle(note.title);
-    setNoteDraft(note.body);
+    setNoteDraft(bodyForEditor(note.title, note.body));
     setNoteEditId(note.id);
     setNoteDirty(false);
   };
@@ -451,7 +470,7 @@ export default function Home() {
   const selected = items.find((item) => item.id === effectiveSelectedId) || null;
   const selectedWorkingSurface = selected ? workingSurface(selected) : null;
   const selectedActiveRun = selected?.agentRuns.find((run) => ["queued", "working"].includes(run.status)) || null;
-  const selectedActiveTask = selected?.codexTasks.find((task) => ["starting", "working"].includes(task.status)) || null;
+  const selectedActiveTask = selected?.codexTasks.find((task) => ["starting", "working", "waiting_on_user"].includes(task.status)) || null;
   const selectedSkillId = selected && skillSelection.itemId === selected.id ? skillSelection.skillId : "";
   const visibleDraft = selected && draftItemId === selected.id ? draft : selected?.draft || "";
   const allRuns = items.flatMap((item) => item.agentRuns).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
@@ -570,10 +589,11 @@ export default function Home() {
     if (!selected) return;
     setBusy(true);
     try {
-      await api(`/api/work-items/${encodeURIComponent(selected.id)}/codex-task`, { method: "POST", body: JSON.stringify({ instruction: composer.trim() || selected.suggestedAction }) });
+      const launch = await api<{ deepLink: string }>(`/api/work-items/${encodeURIComponent(selected.id)}/codex-task-link`, { method: "POST", body: JSON.stringify({ instruction: composer.trim() || selected.suggestedAction }) });
       setComposer("");
-      setNotice("A separate Codex task was created. It will appear in the Codex sidebar and stay linked to this card.");
+      setNotice(`Opened "${selected.companyName} - ${selected.title}" as a normal Codex task. Press Send there to start it.`);
       await load(true);
+      window.location.assign(launch.deepLink);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "The separate Codex task could not be created.");
     } finally { setBusy(false); }
@@ -608,7 +628,7 @@ export default function Home() {
     try {
       const updated = await api<Note>(`/api/notes/${encodeURIComponent(activeNote.id)}/proposals/${encodeURIComponent(activeNote.latestProposal.id)}`, { method: "PATCH", body: JSON.stringify({ decision }) });
       setNotes((current) => current.map((note) => note.id === updated.id ? updated : note));
-      if (decision === "accept") { setNoteTitle(updated.title); setNoteDraft(updated.body); setNoteEditId(updated.id); setNoteDirty(false); }
+      if (decision === "accept") { setNoteTitle(updated.title); setNoteDraft(bodyForEditor(updated.title, updated.body)); setNoteEditId(updated.id); setNoteDirty(false); }
       setNotice(decision === "accept" ? "Codex's edit was applied to the Markdown document." : "The proposed edit was rejected.");
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "The proposal could not be updated.");
@@ -637,7 +657,7 @@ export default function Home() {
     setNotes((current) => [note, ...current]);
     setActiveNoteId(note.id);
     setNoteTitle(note.title);
-    setNoteDraft(note.body);
+    setNoteDraft(bodyForEditor(note.title, note.body));
     setNoteEditId(note.id);
     setNoteDirty(false);
     setView("notes");
@@ -695,7 +715,7 @@ export default function Home() {
   }
 
   return (
-    <main className="app-shell">
+    <main className={`app-shell view-${view}`}>
       <aside className="left-rail">
         <div>
           <p className="brand-eyebrow">SERENT</p>
@@ -793,41 +813,48 @@ export default function Home() {
         ) : null}
 
         {view === "notes" ? (
-          <section className="notes-layout">
-            <div className="note-list">
-              <div className="view-heading compact"><p className="kicker">SHARED DOCUMENTS</p><h2>Your workbench</h2><p>Markdown organized by company, meeting, project, and topic.</p></div>
-              <button className="new-note" type="button" onClick={async () => {
+          <section className={noteRailOpen ? "notes-layout" : "notes-layout list-collapsed"}>
+            <aside className="note-list" aria-label="Document navigation">
+              <div className="view-heading compact"><p className="kicker">DOCUMENTS</p><h2>Your workbench</h2><p>Find a document and keep writing.</p></div>
+              <div className="note-list-actions"><button className="new-note" type="button" onClick={async () => {
                 const note = await api<Note>("/api/notes", { method: "POST", body: JSON.stringify({ title: "Untitled note", body: "", type: "scratch", companySlug: companyFilter === "all" ? null : companyFilter }) });
-                setNotes((current) => [note, ...current]); setActiveNoteId(note.id); setNoteTitle(note.title); setNoteDraft(note.body); setNoteEditId(note.id); setNoteDirty(false);
-              }}>+ New note</button>
-              {notes.map((note) => (
-                <button className={activeNoteId === note.id ? "note-row active" : "note-row"} key={note.id} onClick={() => void selectNote(note)} type="button">
-                  <span className="note-type">{note.type}</span><strong>{note.title}</strong><small>{note.body.slice(0, 92) || "Empty note"}</small>
-                </button>
-              ))}
-            </div>
+                setNotes((current) => [note, ...current]); setActiveNoteId(note.id); setNoteTitle(note.title); setNoteDraft(bodyForEditor(note.title, note.body)); setNoteEditId(note.id); setNoteDirty(false);
+              }}>+ New</button><button className="collapse-note-list" type="button" onClick={() => setNoteRailOpen(false)} aria-label="Hide document list">Hide</button></div>
+              <input className="note-search" value={noteQuery} onChange={(event) => setNoteQuery(event.target.value)} placeholder="Search documents..." aria-label="Search documents" />
+              <div className="note-groups">{noteGroups.map((group) => (
+                <section className="note-group" key={group.id}>
+                  <h3>{group.label}<span>{group.notes.length}</span></h3>
+                  {group.notes.map((note) => (
+                    <button className={activeNoteId === note.id ? "note-row active" : "note-row"} key={note.id} onClick={() => void selectNote(note)} type="button">
+                      <strong>{note.title}</strong><small>{note.body.replace(/[#*_`>-]/g, "").slice(0, 92) || "Empty note"}</small>
+                    </button>
+                  ))}
+                </section>
+              ))}{!noteGroups.length ? <p className="note-empty">No documents match your search.</p> : null}</div>
+            </aside>
             <article className="note-editor">
               {activeNote ? (
-                <>
-                  <div className="note-editor-meta"><span>{activeNote.origin === "manual" ? "Jake's note" : "Agent-generated"}</span><span>{noteDirty ? "Saving…" : "Saved locally"}</span></div>
-                  <input className="note-title-input" value={noteEditId === activeNote.id ? noteTitle : activeNote.title} onChange={(event) => { setNoteEditId(activeNote.id); setNoteTitle(event.target.value); setNoteDirty(true); }} aria-label="Note title" />
-                  <textarea className="note-body-input" value={noteEditId === activeNote.id ? noteDraft : activeNote.body} onChange={(event) => { setNoteEditId(activeNote.id); setNoteDraft(event.target.value); setNoteDirty(true); }} placeholder="Write in Markdown. Use this space to think, plan, and work with Codex." aria-label="Note body" />
-                  <small className="document-path">Markdown file: {activeNote.filePath || "Creating local file..."}</small>
-                  {activeNote.latestProposal ? <section className={`note-proposal proposal-${activeNote.latestProposal.status}`}>
-                    <div><strong>Codex edit</strong><span>{activeNote.latestProposal.status.replaceAll("_", " ")}</span></div>
-                    <p>{activeNote.latestProposal.summary || activeNote.latestProposal.error || `Working on: ${activeNote.latestProposal.instruction}`}</p>
-                    {activeNote.latestProposal.status === "ready" ? <><details><summary>Preview revised Markdown</summary><pre>{activeNote.latestProposal.proposedBody}</pre></details><div className="proposal-actions"><button type="button" disabled={busy} onClick={() => void decideNoteProposal("accept")}>Accept edit</button><button type="button" disabled={busy} onClick={() => void decideNoteProposal("reject")}>Reject</button></div></> : null}
-                  </section> : null}
-                  <form className="note-codex-composer" onSubmit={(event) => { event.preventDefault(); void requestNoteEdit(); }}>
-                    <label htmlFor="note-codex-instruction">Ask Codex to edit this document</label>
-                    <textarea id="note-codex-instruction" value={noteCodexInstruction} onChange={(event) => setNoteCodexInstruction(event.target.value)} placeholder="Add an agenda for tomorrow's kickoff using the company context and open questions..." />
-                    <button type="submit" disabled={busy || !noteCodexInstruction.trim()}>Propose edit</button>
-                  </form>
-                  <div className="note-actions">
-                    <span>{activeNote.companySlug ? data.companies.find((company) => company.slug === activeNote.companySlug)?.displayName : "Unfiled"}</span>
-                    <button type="button" onClick={async () => { await api(`/api/notes/${activeNote.id}/promote`, { method: "POST", body: JSON.stringify({}) }); setNotice("Promoted to the action inbox."); await load(); }}>Promote to action</button>
+                <div className="note-page-shell">
+                  <div className="note-editor-topbar"><button type="button" onClick={() => setNoteRailOpen((current) => !current)}>{noteRailOpen ? "Hide documents" : "Show documents"}</button><span className={noteDirty ? "save-state saving" : "save-state"}>{noteDirty ? "Saving..." : "Saved locally"}</span></div>
+                  <div className="note-page">
+                    <div className="note-editor-meta"><span>{activeNote.origin === "manual" ? "Jake's note" : "Agent-generated"}</span><span>{activeNote.type}</span></div>
+                    <input className="note-title-input" value={noteEditId === activeNote.id ? noteTitle : activeNote.title} onChange={(event) => { setNoteEditId(activeNote.id); setNoteTitle(event.target.value); setNoteDirty(true); }} aria-label="Note title" placeholder="Untitled" />
+                    <MarkdownEditor value={noteEditId === activeNote.id ? noteDraft : bodyForEditor(activeNote.title, activeNote.body)} onChange={(body) => { setNoteEditId(activeNote.id); setNoteDraft(body); setNoteDirty(true); }} placeholder="Start writing, or type Markdown shortcuts like #, -, and [ ]..." ariaLabel="Note body" />
+                    {activeNote.latestProposal ? <section className={`note-proposal proposal-${activeNote.latestProposal.status}`}>
+                      <div><strong>Codex edit</strong><span>{activeNote.latestProposal.status.replaceAll("_", " ")}</span></div>
+                      <p>{activeNote.latestProposal.summary || activeNote.latestProposal.error || `Working on: ${activeNote.latestProposal.instruction}`}</p>
+                      {activeNote.latestProposal.status === "ready" ? <><details><summary>Preview revised Markdown</summary><pre>{activeNote.latestProposal.proposedBody}</pre></details><div className="proposal-actions"><button type="button" disabled={busy} onClick={() => void decideNoteProposal("accept")}>Accept edit</button><button type="button" disabled={busy} onClick={() => void decideNoteProposal("reject")}>Reject</button></div></> : null}
+                    </section> : null}
+                    <details className="note-codex-drawer"><summary>Ask Codex to edit this document</summary>
+                      <form className="note-codex-composer" onSubmit={(event) => { event.preventDefault(); void requestNoteEdit(); }}>
+                        <label htmlFor="note-codex-instruction">Describe the change you want</label>
+                        <textarea id="note-codex-instruction" value={noteCodexInstruction} onChange={(event) => setNoteCodexInstruction(event.target.value)} placeholder="Add an agenda for tomorrow's kickoff using the company context and open questions..." />
+                        <button type="submit" disabled={busy || !noteCodexInstruction.trim()}>Propose edit</button>
+                      </form>
+                    </details>
+                    <div className="note-actions"><span>{activeNote.companySlug ? data.companies.find((company) => company.slug === activeNote.companySlug)?.displayName : "Unfiled"}</span><div><details className="document-info"><summary>Document info</summary><small className="document-path">{activeNote.filePath || "Creating local file..."}</small></details><button type="button" onClick={async () => { await api(`/api/notes/${activeNote.id}/promote`, { method: "POST", body: JSON.stringify({}) }); setNotice("Promoted to the action inbox."); await load(); }}>Promote to action</button></div></div>
                   </div>
-                </>
+                </div>
               ) : <p>Select a note.</p>}
             </article>
           </section>
@@ -905,7 +932,7 @@ export default function Home() {
 
             {selected.codexTasks.length ? <details className="workbench-section" open>
               <summary>Separate Codex tasks ({selected.codexTasks.length})</summary>
-              {selected.codexTasks.map((task) => <article className={`codex-task-receipt task-${task.status}`} key={task.id}><div><strong>{task.title}</strong><span>{task.status.replaceAll("_", " ")}</span></div><p>{task.result || task.error || "Starting a persistent Codex task..."}</p>{task.threadId ? <small>Sidebar task: {task.threadId}</small> : null}</article>)}
+              {selected.codexTasks.map((task) => <article className={`codex-task-receipt task-${task.status}`} key={task.id}><div><strong>{task.title}</strong><span>{task.status.replaceAll("_", " ")}</span></div><p>{task.result || task.error || (task.status === "waiting_on_user" ? "The assignment is prefilled in Codex. Press Send there to start it." : "Codex is working on the assignment...")}</p>{task.threadId ? <small>Created in the Codex sidebar</small> : task.status === "waiting_on_user" ? <small>Waiting for you in Codex</small> : null}</article>)}
             </details> : null}
 
             {selected.externalActions.length ? <details className="workbench-section" open>
@@ -928,10 +955,10 @@ export default function Home() {
               {!['queued','working','done','dismissed'].includes(selected.status) ? <button disabled={busy} type="button" onClick={() => { const feedback = window.prompt("Why should Command Center stop surfacing items like this?", "Not consequential for me."); if (feedback !== null) void patchItem({ status: "dismissed", feedback }); }}>Not needed</button> : null}
             </div>
 
-            {selectedActiveRun || selectedActiveTask ? <section className="codex-active-banner"><strong>Codex is working on this</strong><p>{selectedActiveRun ? requestedOutcome(selectedActiveRun) : selectedActiveTask?.instruction}</p><small>{selectedActiveTask ? "The work is in a separate Codex task." : "The result will return to this card. No external action will be taken."}</small></section> : <form className="codex-composer" onSubmit={(event) => { event.preventDefault(); void submitCodexChoice(); }}>
-              <div><span>How should Codex handle this?</span><select value={codexDestination} onChange={(event) => setCodexDestination(event.target.value as "card" | "task")} aria-label="Where Codex should work"><option value="card">Return the result to this card</option><option value="task">Open a separate Codex task</option></select></div>
+            {selectedActiveRun || selectedActiveTask ? <section className="codex-active-banner"><strong>{selectedActiveTask?.status === "waiting_on_user" ? "Finish starting this in Codex" : "Codex is working on this"}</strong><p>{selectedActiveRun ? requestedOutcome(selectedActiveRun) : selectedActiveTask?.instruction}</p><small>{selectedActiveTask?.status === "waiting_on_user" ? "The assignment is prefilled in the new task. Press Send there to begin." : selectedActiveTask ? "The work is in a separate Codex task." : "The result will return to this card. No external action will be taken."}</small></section> : <form className="codex-composer" onSubmit={(event) => { event.preventDefault(); void submitCodexChoice(); }}>
+              <div><span>How should Codex handle this?</span><select value={codexDestination} onChange={(event) => setCodexDestination(event.target.value as "card" | "task")} aria-label="Where Codex should work"><option value="card">Return the result to this card</option><option value="task">Create a separate Codex sidebar task</option></select></div>
               <textarea value={composer} onChange={(event) => setComposer(event.target.value)} placeholder="Describe the outcome you want, or leave this blank to use the suggested next step..." aria-label="Outcome for Codex" />
-              <div className="composer-actions"><button className="open-codex-task" type="submit" disabled={busy}>{codexDestination === "task" ? "Open Codex task" : "Start and return here"}</button></div>
+              <div className="composer-actions"><button className="open-codex-task" type="submit" disabled={busy}>{codexDestination === "task" ? "Create sidebar task" : "Start and return here"}</button></div>
             </form>}
           </>
         ) : (

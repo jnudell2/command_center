@@ -1403,6 +1403,35 @@ async function reconcilePersistentTasks() {
   }
 }
 
+function userOwnedCodexTaskPrompt(item, taskId, instruction) {
+  return `Use the Serent Command Center workflow to complete this assignment in a normal, user-owned Codex task.
+
+Assignment: ${instruction}
+Company: ${item.company_name || "Unassigned"}
+Originating Command Center item: ${item.title}
+Work item ID: ${item.id}
+Summary: ${item.summary}
+Why now: ${item.why_now}
+Expected next action: ${item.suggested_action}
+Company context: ${item.ai_os_path ? path.resolve(aiOsRoot,item.ai_os_path) : "Read the relevant AI OS company and project context."}
+
+First, POST {"status":"working"} to http://127.0.0.1:4318/api/codex-tasks/${taskId}/callback. Read the live card and its linked notes, mail, and sources from GET http://127.0.0.1:4318/api/work-items before doing the work. Work independently, keep shared-system writes review-gated, and save local artifacts in the relevant project output convention. When finished, POST {"status":"complete","result":"a concise handoff with the answer and artifact paths"} to the same callback URL. If blocked, POST {"status":"error","error":"what is blocking the task"}.`;
+}
+
+function prepareUserOwnedCodexTask(item, instruction) {
+  const id=randomUUID(); const now=nowIso();
+  const title=`${item.company_name || "Serent"} - ${item.title}`.slice(0,240);
+  const prompt=userOwnedCodexTaskPrompt(item,id,instruction);
+  const deepLink=new URL("codex://threads/new");
+  deepLink.searchParams.set("path",aiOsRoot);
+  deepLink.searchParams.set("prompt",prompt);
+  deepLink.searchParams.set("originUrl",`http://localhost:3000/?workItem=${encodeURIComponent(item.id)}`);
+  db.prepare(`INSERT INTO codex_tasks(id,work_item_id,title,instruction,status,created_at,updated_at) VALUES(?,?,?,?, 'waiting_on_user',?,?)`).run(id,item.id,title,instruction,now,now);
+  db.prepare("UPDATE work_items SET decision_state=CASE WHEN decision_state='proposed' THEN 'accepted' ELSE decision_state END,updated_at=? WHERE id=?").run(now,item.id);
+  eventFor(item.id,"codex_task_prepared",`Prepared a normal Codex sidebar task: ${title}`);
+  return {id,threadId:"",status:"waiting_on_user",title,instruction,deepLink:deepLink.toString(),createdAt:now,updatedAt:now};
+}
+
 async function launchPersistentCodexTask(item, instruction) {
   const id=randomUUID(); const now=nowIso();
   const company=item.company_slug ? db.prepare("SELECT * FROM companies WHERE slug=?").get(item.company_slug) : null;
@@ -1433,11 +1462,12 @@ async function launchPersistentCodexTask(item, instruction) {
   child.stdout.setEncoding("utf8");child.stderr.setEncoding("utf8");
   child.stdout.on("data",(chunk)=>{buffer+=chunk;const lines=buffer.split(/\r?\n/);buffer=lines.pop()||"";for(const line of lines)try{const event=JSON.parse(line);
     if(event.id===1){send({method:"initialized",params:{}});send({id:2,method:"thread/start",params:{cwd:aiOsRoot,approvalPolicy:"never",sandbox:"workspace-write",ephemeral:false,threadSource:"app",runtimeWorkspaceRoots:[aiOsRoot]}});}
-    if(event.id===2&&event.result?.thread?.id){threadId=event.result.thread.id;db.prepare("UPDATE codex_tasks SET thread_id=?,status='working',updated_at=? WHERE id=?").run(threadId,nowIso(),id);send({id:3,method:"turn/start",params:{threadId,input:[{type:"text",text:prompt}]}});pollTimer=setInterval(()=>{if(!finishedTask)send({id:pollId++,method:"thread/read",params:{threadId,includeTurns:true}});},5000);}
+    if(event.id===2&&event.result?.thread?.id){threadId=event.result.thread.id;db.prepare("UPDATE codex_tasks SET thread_id=?,status='working',updated_at=? WHERE id=?").run(threadId,nowIso(),id);send({id:4,method:"thread/name/set",params:{threadId,name:title}});send({id:3,method:"turn/start",params:{threadId,input:[{type:"text",text:prompt}]}});pollTimer=setInterval(()=>{if(!finishedTask)send({id:pollId++,method:"thread/read",params:{threadId,includeTurns:true}});},5000);}
     if(event.method==="item/completed"&&event.params?.item?.type==="agentMessage")finalMessage=event.params.item.text||"";
     if(event.method==="turn/completed"&&event.params?.turn?.status==="completed"&&finalMessage)finish(true);
     if(event.id>=20&&event.result?.thread){const outcome=threadOutcome(event.result.thread);if(outcome.status==="completed"&&outcome.final){finalMessage=outcome.final;finish(true);}else if(["failed","cancelled"].includes(outcome.status)){terminalPolls+=1;if(terminalPolls>=3)finish(false,outcome.error||`Codex task ended as ${outcome.status}.`);}else terminalPolls=0;}
-    if(event.id&&event.error&&event.id<20)finish(false,event.error.message||"Codex app-server request failed.");
+    if(event.id===4&&event.error)eventFor(item.id,"codex_task_naming_warning",event.error.message||"The Codex task was created but could not be named in the sidebar.");
+    if(event.id&&event.error&&event.id<20&&event.id!==4)finish(false,event.error.message||"Codex app-server request failed.");
   }catch{}});
   child.stderr.on("data",(chunk)=>{stderr=`${stderr}${chunk}`.slice(-8000);});
   child.stdin.on("error",(error)=>{if(!finishedTask)finish(false,error.message);});
@@ -1773,6 +1803,38 @@ const server = createServer(async (request, response) => {
       const instruction = String(body.instruction || item.suggested_action || "Complete this assignment.").trim().slice(0,4000);
       if (!instruction) throw new Error("Describe the assignment for the new Codex task.");
       return responseJson(response, 202, await launchPersistentCodexTask(item,instruction));
+    }
+    const codexTaskLinkMatch = url.pathname.match(/^\/api\/work-items\/([^/]+)\/codex-task-link$/);
+    if (request.method === "POST" && codexTaskLinkMatch) {
+      const item = db.prepare(`SELECT w.*,c.display_name AS company_name,c.ai_os_path FROM work_items w LEFT JOIN companies c ON c.slug=w.company_slug WHERE w.id=?`).get(decodeURIComponent(codexTaskLinkMatch[1]));
+      if (!item) throw new Error("Unknown work item.");
+      const body = await readJsonBody(request);
+      const instruction = String(body.instruction || item.suggested_action || "Complete this assignment.").trim().slice(0,4000);
+      if (!instruction) throw new Error("Describe the assignment for the new Codex task.");
+      return responseJson(response, 201, prepareUserOwnedCodexTask(item,instruction));
+    }
+    const codexTaskCallbackMatch = url.pathname.match(/^\/api\/codex-tasks\/([^/]+)\/callback$/);
+    if (request.method === "POST" && codexTaskCallbackMatch) {
+      const task = db.prepare("SELECT * FROM codex_tasks WHERE id=?").get(decodeURIComponent(codexTaskCallbackMatch[1]));
+      if (!task) throw new Error("Unknown Codex task receipt.");
+      const body = await readJsonBody(request); const status=String(body.status||""); const now=nowIso();
+      if (!['working','complete','error'].includes(status)) throw new Error("Codex task callback status must be working, complete, or error.");
+      if(status==='working'){
+        db.prepare("UPDATE codex_tasks SET status='working',updated_at=? WHERE id=?").run(now,task.id);
+        db.prepare("UPDATE work_items SET status='working',updated_at=? WHERE id=?").run(now,task.work_item_id);
+        eventFor(task.work_item_id,"codex_task_started",`Started the user-owned Codex task: ${task.title}`);
+      }else if(status==='complete'){
+        const result=String(body.result||"The separate Codex task completed.").slice(0,50000);
+        db.prepare("UPDATE codex_tasks SET status='complete',result=?,error='',updated_at=? WHERE id=?").run(result,now,task.id);
+        db.prepare("UPDATE work_items SET status='back_for_review',updated_at=? WHERE id=?").run(now,task.work_item_id);
+        eventFor(task.work_item_id,"codex_task_returned","User-owned Codex task completed and returned for review.");
+      }else{
+        const error=String(body.error||"The separate Codex task needs attention.").slice(0,8000);
+        db.prepare("UPDATE codex_tasks SET status='error',error=?,updated_at=? WHERE id=?").run(error,now,task.id);
+        db.prepare("UPDATE work_items SET status='back_for_review',updated_at=? WHERE id=?").run(now,task.work_item_id);
+        eventFor(task.work_item_id,"codex_task_error",error);
+      }
+      return responseJson(response, 200, {id:task.id,status,updatedAt:now});
     }
 
     const workItemMatch = url.pathname.match(/^\/api\/work-items\/([^/]+)$/);

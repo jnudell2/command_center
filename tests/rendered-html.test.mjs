@@ -25,9 +25,11 @@ test("server-renders the local Serent Command Center shell", async () => {
 });
 
 test("defines the inbox, workbench, notes, and review-only contracts", async () => {
-  const [page, runner] = await Promise.all([
+  const [page, runner, editor, styles] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../scripts/local-control-server.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../app/markdown-editor.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
   ]);
   for (const label of ["Today", "Calendar", "Mail", "Companies", "Documents", "Codex work", "Search"]) assert.match(page, new RegExp(label, "i"));
   assert.match(page, /Learning &(?:amp;)? sources/i);
@@ -43,7 +45,7 @@ test("defines the inbox, workbench, notes, and review-only contracts", async () 
   assert.match(page, /Ask Codex to edit this document/i);
   assert.match(page, /Done in ClickUp/i);
   assert.match(page, /Return the result to this card/i);
-  assert.match(page, /Open a separate Codex task/i);
+  assert.match(page, /Create a separate Codex sidebar task/i);
   for (const label of ["Needs Me", "My Work", "Codex Working", "Waiting", "Done"]) assert.match(page, new RegExp(label, "i"));
   for (const label of ["Working on", "Returns to", "External actions"]) assert.match(page, new RegExp(label, "i"));
   for (const label of ["Draft reply", "Meeting agenda", "Deck outline", "Scheduling note", "Working notes"]) assert.match(page, new RegExp(label, "i"));
@@ -51,6 +53,10 @@ test("defines the inbox, workbench, notes, and review-only contracts", async () 
   for (const label of ["Committed", "Accepted", "Likely owed", "Suggested"]) assert.match(page, new RegExp(label, "i"));
   assert.match(runner, /complete-clickup/);
   assert.match(runner, /codex-task/);
+  assert.match(runner, /codex-task-link/);
+  assert.match(runner, /codex-tasks\/\(\[\^\/\]\+\)\\\/callback|codex-tasks/);
+  assert.match(runner, /codex:\/\/threads\/new/);
+  assert.match(runner, /thread\/name\/set/);
   assert.match(runner, /reconcilePersistentTasks/);
   assert.match(runner, /Relevant transcript summaries/);
   assert.match(runner, /thread\/read/);
@@ -62,4 +68,16 @@ test("defines the inbox, workbench, notes, and review-only contracts", async () 
   assert.match(runner, /verified\?\.verified === true/);
   assert.match(page, /noteSaveVersion/);
   assert.match(page, /selectedMessageId/);
+  assert.match(page, /view-\$\{view\}/);
+  assert.match(page, /MarkdownEditor/);
+  assert.match(editor, /contentType:\s*["']markdown["']/);
+  assert.match(editor, /getMarkdown\(\)/);
+  assert.match(editor, /raw Markdown/i);
+  assert.match(editor, /TaskList/);
+  assert.match(styles, /\.app-shell\.view-inbox/);
+  assert.match(styles, /\.notes-layout\s*\{[^}]*300px minmax\(0,1fr\)/s);
+  assert.match(styles, /\.note-page\s*\{[^}]*max-width:\s*860px/s);
+  assert.match(styles, /\.codex-composer\s*\{[^}]*position:\s*sticky/s);
+  assert.doesNotMatch(styles, /\.codex-composer\s*\{[^}]*position:\s*fixed/s);
+  assert.match(styles, /@media \(max-width:\s*1024px\)/);
 });

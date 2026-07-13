@@ -13,6 +13,12 @@
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next"
   },
   "dependencies": {
+    "@tiptap/extension-placeholder": "^3.27.4",
+    "@tiptap/extension-task-item": "^3.27.4",
+    "@tiptap/extension-task-list": "^3.27.4",
+    "@tiptap/markdown": "^3.27.4",
+    "@tiptap/react": "^3.27.4",
+    "@tiptap/starter-kit": "^3.27.4",
     "next": "16.2.6",
     "react": "19.2.6",
     "react-dom": "19.2.6"
