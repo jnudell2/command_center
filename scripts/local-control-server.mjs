@@ -7,12 +7,23 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { clearSerentTokenCache, fetchActiveMail, fetchCalendarEvents, fetchMailAttachments, fetchMailBody, htmlToText } from "./graph-mail.mjs";
-import { codexTaskLaunchMode } from "./codex-task-routing.mjs";
 import { isDirectlyAddressedToJake, isLikelyAutomatedMail, normalizedSubject } from "./mail-triage.mjs";
 import { isAllowedTranscriptPath, isEligibleCompletedMeeting, normalizeMeetingAction, safeMeetingName, scoreTranscriptCandidate } from "./meeting-workflow.mjs";
-import { buildPmChatPrompt, buildPmSnapshot, isPmThreadActive } from "./pm-orchestrator.mjs";
+import { buildPmSnapshot, isPmThreadActive } from "./pm-orchestrator.mjs";
 import { classifyProjectPlanItem, parseDependencies, projectExecutionGuidance, projectFollowUpBucket } from "./project-execution.mjs";
 import { parseCardCommand } from "./card-command.mjs";
+import {
+  activeAssignmentStates,
+  assignmentScopeHash,
+  createAssignmentIdentity,
+  createCallbackCapability,
+  legacyAssignmentState,
+  normalizeAssignmentDestination,
+  normalizeAssignmentEvent,
+  transitionAssignment,
+  verifyCallbackCapability,
+  workItemStatusForAssignment,
+} from "./assignment-lifecycle.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const appRoot = path.resolve(scriptDir, "..");
@@ -28,7 +39,6 @@ const activeProcesses = new Map();
 let mailRefreshPromise = null;
 let calendarRefreshPromise = null;
 let pmRunPromise = null;
-let pmChatPromise = null;
 const localWorkflowsEnabled = process.env.SERENT_TEND_DISABLE_LOCAL_WORKFLOWS !== "1";
 const transcriptRoot = path.join(homedir(), "Projects", "ai-operating-system-transcripts");
 const transcriptInbox = path.join(transcriptRoot, "inbox");
@@ -425,6 +435,59 @@ const schemaStatements = [
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS assignments (
+    id TEXT PRIMARY KEY,
+    assignment_key TEXT NOT NULL UNIQUE,
+    work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    destination TEXT NOT NULL CHECK(destination IN ('card','separate_task')),
+    title TEXT NOT NULL,
+    instruction TEXT NOT NULL,
+    scope_hash TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'prepared',
+    attempt INTEGER NOT NULL DEFAULT 1,
+    prior_work_item_status TEXT NOT NULL DEFAULT 'to_review',
+    owner_type TEXT NOT NULL DEFAULT 'native_codex',
+    owner_id TEXT NOT NULL DEFAULT '',
+    callback_capability_hash TEXT NOT NULL,
+    capability_generation INTEGER NOT NULL DEFAULT 1,
+    allowed_sources TEXT NOT NULL DEFAULT '[]',
+    context_manifest TEXT NOT NULL DEFAULT '{}',
+    external_action_boundary TEXT NOT NULL DEFAULT 'No external writes without Jake''s separate approval.',
+    result TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    revision_of TEXT REFERENCES assignments(id) ON DELETE SET NULL,
+    accepted_at TEXT,
+    started_at TEXT,
+    heartbeat_at TEXT,
+    needs_input_at TEXT,
+    completed_at TEXT,
+    failed_at TEXT,
+    released_at TEXT,
+    cancelled_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS assignment_events (
+    id TEXT PRIMARY KEY,
+    assignment_id TEXT NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
+    attempt INTEGER NOT NULL DEFAULT 1,
+    event_key TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    owner_id TEXT NOT NULL DEFAULT '',
+    occurred_at TEXT,
+    received_at TEXT NOT NULL,
+    previous_status TEXT NOT NULL,
+    next_status TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    applied INTEGER NOT NULL DEFAULT 1,
+    rejection_reason TEXT NOT NULL DEFAULT '',
+    UNIQUE(assignment_id, attempt, event_key)
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS assignments_active_work_item_idx
+    ON assignments(work_item_id)
+    WHERE status IN ('prepared','accepted','working','needs_input','needs_attention')`,
+  `CREATE INDEX IF NOT EXISTS assignments_work_item_updated_idx ON assignments(work_item_id,updated_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS assignment_events_assignment_idx ON assignment_events(assignment_id,received_at DESC)`,
   `CREATE TABLE IF NOT EXISTS pm_agent_config (
     id TEXT PRIMARY KEY,
     mode TEXT NOT NULL DEFAULT 'observer',
@@ -920,6 +983,147 @@ function repairMisroutedTranscriptRuns() {
 
 repairMisroutedTranscriptRuns();
 
+function migrateLegacyAssignments() {
+  if (db.prepare("SELECT version FROM schema_migrations WHERE version=12").get()) return;
+  const activeLegacyOwners = db.prepare(`SELECT id,work_item_id,thread_id,status FROM codex_tasks
+    WHERE status IN ('accepted','starting','working','needs_input','needs_attention') AND thread_id<>''`).all();
+  if (activeLegacyOwners.length) {
+    throw new Error(`Assignment migration paused: ${activeLegacyOwners.length} legacy native Codex owner(s) are still active.`);
+  }
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const importedAt = nowIso();
+    const insertAssignment = db.prepare(`INSERT OR IGNORE INTO assignments
+      (id,assignment_key,work_item_id,destination,title,instruction,scope_hash,status,attempt,prior_work_item_status,
+       owner_type,owner_id,callback_capability_hash,capability_generation,allowed_sources,context_manifest,
+       external_action_boundary,result,error,revision_of,accepted_at,started_at,heartbeat_at,needs_input_at,
+       completed_at,failed_at,released_at,cancelled_at,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    const insertEvent = db.prepare(`INSERT OR IGNORE INTO assignment_events
+      (id,assignment_id,attempt,event_key,event_type,owner_id,occurred_at,received_at,previous_status,next_status,payload_json,applied,rejection_reason)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,1,'')`);
+    const activeByWorkItem = new Set();
+    const legacyTasks = db.prepare(`SELECT t.*,w.status AS work_item_status FROM codex_tasks t
+      JOIN work_items w ON w.id=t.work_item_id ORDER BY t.created_at DESC`).all();
+    for (const task of legacyTasks) {
+      let status = legacyAssignmentState(task);
+      if (activeAssignmentStates.has(status)) {
+        if (activeByWorkItem.has(task.work_item_id)) status = "cancelled";
+        else activeByWorkItem.add(task.work_item_id);
+      }
+      const capability = createCallbackCapability();
+      const ownerId = task.thread_id || "";
+      const terminalAt = task.updated_at || task.created_at;
+      insertAssignment.run(
+        task.id,
+        `legacy-codex-task:${task.id}`,
+        task.work_item_id,
+        "separate_task",
+        task.title,
+        task.instruction,
+        assignmentScopeHash({ workItemId: task.work_item_id, destination: "separate_task", instruction: task.instruction }),
+        status,
+        1,
+        task.work_item_status || "to_review",
+        "legacy_native_codex",
+        ownerId,
+        capability.hash,
+        0,
+        "[]",
+        JSON.stringify({ legacyCodexTaskId: task.id }),
+        "No external writes without Jake's separate approval.",
+        task.result || "",
+        task.error || "",
+        null,
+        ["accepted", "working", "needs_input", "needs_attention", "completed", "failed", "ownership_released"].includes(status) ? task.created_at : null,
+        ["working", "needs_input", "needs_attention", "completed", "failed", "ownership_released"].includes(status) ? task.created_at : null,
+        task.heartbeat_at || null,
+        status === "needs_input" ? terminalAt : null,
+        status === "completed" ? terminalAt : null,
+        status === "failed" ? terminalAt : null,
+        status === "ownership_released" ? terminalAt : null,
+        status === "cancelled" ? terminalAt : null,
+        task.created_at,
+        terminalAt,
+      );
+      insertEvent.run(
+        randomUUID(),
+        task.id,
+        1,
+        `legacy-import:${task.id}`,
+        "legacy_imported",
+        ownerId,
+        terminalAt,
+        importedAt,
+        status,
+        status,
+        JSON.stringify({ legacyStatus: task.status, legacyCodexTaskId: task.id }),
+      );
+    }
+
+    const legacyRuns = db.prepare(`SELECT r.*,w.status AS work_item_status FROM agent_runs r
+      JOIN work_items w ON w.id=r.work_item_id WHERE r.status IN ('review','error') ORDER BY r.created_at`).all();
+    for (const run of legacyRuns) {
+      const id = `agent-run:${run.id}`;
+      const status = run.status === "review" ? "completed" : "failed";
+      const capability = createCallbackCapability();
+      insertAssignment.run(
+        id,
+        `legacy-agent-run:${run.id}`,
+        run.work_item_id,
+        "card",
+        run.title,
+        run.intent,
+        assignmentScopeHash({ workItemId: run.work_item_id, destination: "card", instruction: run.intent }),
+        status,
+        1,
+        run.work_item_status || "to_review",
+        "legacy_local_runner",
+        `legacy-agent-run:${run.id}`,
+        capability.hash,
+        0,
+        run.allowed_sources || "[]",
+        run.context_manifest || "{}",
+        "No external writes were authorized.",
+        run.result || "",
+        run.error || "",
+        null,
+        run.created_at,
+        run.created_at,
+        null,
+        null,
+        status === "completed" ? run.updated_at : null,
+        status === "failed" ? run.updated_at : null,
+        null,
+        null,
+        run.created_at,
+        run.updated_at,
+      );
+      insertEvent.run(
+        randomUUID(),
+        id,
+        1,
+        `legacy-import:${run.id}`,
+        "legacy_imported",
+        `legacy-agent-run:${run.id}`,
+        run.updated_at,
+        importedAt,
+        status,
+        status,
+        JSON.stringify({ legacyStatus: run.status, legacyAgentRunId: run.id }),
+      );
+    }
+    db.prepare("INSERT INTO schema_migrations(version,applied_at) VALUES(12,?)").run(importedAt);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+migrateLegacyAssignments();
+
 function responseJson(response, status, payload) {
   response.writeHead(status, {
     "Access-Control-Allow-Origin": allowedOrigin,
@@ -1068,6 +1272,56 @@ function mapRun(row) {
   };
 }
 
+function mapAssignment(row, { includeEvents = false } = {}) {
+  if (!row) return null;
+  const events = includeEvents ? db.prepare(`SELECT id,event_key,event_type,owner_id,occurred_at,received_at,
+      previous_status,next_status,payload_json,applied,rejection_reason FROM assignment_events
+      WHERE assignment_id=? ORDER BY received_at DESC,id DESC LIMIT 50`).all(row.id).map((event) => ({
+        id: event.id,
+        eventKey: event.event_key,
+        type: event.event_type,
+        ownerId: event.owner_id,
+        occurredAt: event.occurred_at,
+        receivedAt: event.received_at,
+        previousStatus: event.previous_status,
+        nextStatus: event.next_status,
+        payload: JSON.parse(event.payload_json || "{}"),
+        applied: Boolean(event.applied),
+        rejectionReason: event.rejection_reason,
+      })) : [];
+  return {
+    id: row.id,
+    assignmentKey: row.assignment_key,
+    workItemId: row.work_item_id,
+    destination: row.destination,
+    title: row.title,
+    instruction: row.instruction,
+    status: row.status,
+    attempt: Number(row.attempt || 1),
+    priorWorkItemStatus: row.prior_work_item_status,
+    ownerType: row.owner_type,
+    ownerId: row.owner_id,
+    capabilityGeneration: Number(row.capability_generation || 1),
+    allowedSources: JSON.parse(row.allowed_sources || "[]"),
+    contextManifest: JSON.parse(row.context_manifest || "{}"),
+    externalActionBoundary: row.external_action_boundary,
+    result: row.result,
+    error: row.error,
+    revisionOf: row.revision_of,
+    acceptedAt: row.accepted_at,
+    startedAt: row.started_at,
+    heartbeatAt: row.heartbeat_at,
+    needsInputAt: row.needs_input_at,
+    completedAt: row.completed_at,
+    failedAt: row.failed_at,
+    releasedAt: row.released_at,
+    cancelledAt: row.cancelled_at,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    events,
+  };
+}
+
 function mapRule(row) {
   return {
     id: row.id,
@@ -1200,6 +1454,7 @@ function hydrateWorkItem(row) {
     id: task.id, threadId: task.thread_id, title: task.title, instruction: task.instruction,
     status: task.status, result: task.result, error: task.error, createdAt: task.created_at, updatedAt: task.updated_at,
   }));
+  const assignments = db.prepare("SELECT * FROM assignments WHERE work_item_id=? ORDER BY updated_at DESC,created_at DESC LIMIT 20").all(row.id).map((assignment) => mapAssignment(assignment));
   const projectContextRow = db.prepare(`SELECT p.id AS project_id,p.title AS project_title,pi.id AS plan_item_id,
       pi.title AS plan_item_title,pi.workstream,pi.due_date,ph.title AS phase_title
     FROM project_action_links l
@@ -1248,6 +1503,7 @@ function hydrateWorkItem(row) {
     agentRuns: runs,
     externalActions,
     codexTasks,
+    assignments,
     projectContext,
     activeRules: rules,
   };
@@ -2204,72 +2460,6 @@ async function relevantTranscriptPaths(companySlug, query = "") {
   } catch { return []; }
 }
 
-async function deliverPmChatUpdate(kind, payload) {
-  const config = db.prepare("SELECT * FROM pm_agent_config WHERE id='default'").get();
-  const prompt = buildPmChatPrompt({ kind, payload, generatedAt: nowIso() });
-  const cli = await resolveCodexCli();
-  return new Promise((resolve, reject) => {
-    const child = spawn(cli, ["app-server", "--stdio"], { cwd: aiOsRoot, env: process.env, windowsHide: true });
-    let buffer = ""; let stderr = ""; let finished = false; let threadId = config?.chat_thread_id || ""; const creating = !threadId; let timeout;
-    const finish = (error = null) => {
-      if (finished) return;
-      finished = true; clearTimeout(timeout);
-      const now = nowIso();
-      db.prepare("UPDATE pm_agent_config SET chat_status=?,chat_error=?,chat_updated_at=?,updated_at=? WHERE id='default'")
-        .run(error ? "error" : "ready", error ? String(error.message || error).slice(0,4000) : "", now, now);
-      setTimeout(() => { if (!child.killed) child.kill(); }, 100);
-      if (error) reject(error); else resolve({ threadId, status: "ready" });
-    };
-    const send = (message) => {
-      if (finished || child.killed || !child.stdin.writable) return false;
-      try { child.stdin.write(`${JSON.stringify(message)}\n`, (error) => { if (error) finish(error); }); return true; }
-      catch (error) { finish(error); return false; }
-    };
-    timeout = setTimeout(() => finish(new Error("The PM pulse delivery did not finish within 12 minutes.")), 12 * 60 * 1000);
-    child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      buffer += chunk; const lines = buffer.split(/\r?\n/); buffer = lines.pop() || "";
-      for (const line of lines) try {
-        const event = JSON.parse(line);
-        if (event.id === 1) { send({ method: "initialized", params: {} }); send(threadId ? { id: 2, method: "thread/resume", params: { threadId } } : { id: 2, method: "thread/start", params: { cwd: aiOsRoot, approvalPolicy: "never", sandbox: "workspace-write", ephemeral: false, threadSource: "app", runtimeWorkspaceRoots: [aiOsRoot] } }); }
-        if (event.id === 2 && event.result?.thread?.id) {
-          threadId = event.result.thread.id;
-          if (creating) {
-            const now = nowIso();
-            db.prepare("UPDATE pm_agent_config SET chat_thread_id=?,chat_status='working',chat_error='',chat_updated_at=?,updated_at=? WHERE id='default'").run(threadId, now, now);
-            send({ id: 4, method: "thread/name/set", params: { threadId, name: "Command Center PM Agent" } });
-          }
-          send({ id: 3, method: "turn/start", params: { threadId, input: [{ type: "text", text: prompt }] } });
-        }
-        if (event.id === 2 && event.error) finish(new Error(event.error.message || "The PM conversation could not be opened."));
-        if (event.id === 3 && event.error) finish(new Error(event.error.message || "The PM pulse could not be delivered."));
-        if (event.method === "turn/completed") {
-          const status = String(event.params?.turn?.status || "");
-          if (status === "completed") finish();
-          else if (["failed", "cancelled", "interrupted"].includes(status)) finish(new Error(`The PM pulse ended as ${status}.`));
-        }
-      } catch { /* Ignore non-protocol output. */ }
-    });
-    child.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-8000); });
-    child.stdin.on("error", finish); child.on("error", finish);
-    child.on("close", () => { if (!finished) finish(new Error(stderr.trim() || "The PM pulse connection stopped.")); });
-    send({ id: 1, method: "initialize", params: { clientInfo: { name: "serent-command-center-pm-delivery", title: "Command Center PM Pulse Delivery", version: "1.0.0" }, capabilities: { experimentalApi: true } } });
-  });
-}
-
-function queuePmChatUpdate(kind, payload) {
-  if (!localWorkflowsEnabled || pmChatPromise) return false;
-  pmChatPromise = deliverPmChatUpdate(kind, payload).catch(() => null).finally(() => { pmChatPromise = null; });
-  return true;
-}
-
-async function ensurePmChatOpen() {
-  const config = db.prepare("SELECT * FROM pm_agent_config WHERE id='default'").get();
-  if (!config?.chat_thread_id) throw new Error("The scheduled PM pulse has not created the persistent CEO/PM conversation yet.");
-  openCodexThreadInApp(config.chat_thread_id);
-  return pmAgentPayload();
-}
-
 function mapPmConfig(row) {
   return {
     mode: row?.mode || "observer",
@@ -2395,9 +2585,7 @@ async function runPmAgent(kind = "manual") {
       db.prepare("UPDATE pm_runs SET status='complete',summary=?,thread_count=?,recommendation_count=?,finished_at=? WHERE id=?").run(summary, snapshot.observations.length, snapshot.recommendations.length, created, id);
       const morningDate = kind === "morning" ? localDateKey() : db.prepare("SELECT last_morning_date FROM pm_agent_config WHERE id='default'").get()?.last_morning_date || "";
       db.prepare("UPDATE pm_agent_config SET last_run_at=?,last_morning_date=?,updated_at=? WHERE id='default'").run(created, morningDate, created);
-      const payload = pmAgentPayload();
-      queuePmChatUpdate(kind, payload);
-      return payload;
+      return pmAgentPayload();
     } catch (error) {
       const finished = nowIso(); const message = error instanceof Error ? error.message : "The PM check failed.";
       db.prepare("UPDATE pm_runs SET status='error',error=?,finished_at=? WHERE id=?").run(message.slice(0,4000), finished, id);
@@ -2412,88 +2600,246 @@ function pacificClock() {
   return { date: `${parts.year}-${parts.month}-${parts.day}`, time: `${parts.hour}:${parts.minute}` };
 }
 
-async function maybeRunPmAgent() {
-  if (!localWorkflowsEnabled || pmRunPromise) return;
-  const row = db.prepare("SELECT * FROM pm_agent_config WHERE id='default'").get();
-  if (!row?.enabled) return;
-  const clock = pacificClock();
-  if (clock.time >= row.morning_time && row.last_morning_date !== clock.date) return void runPmAgent("morning").catch(() => {});
-  const last = row.last_run_at ? Date.parse(row.last_run_at) : 0;
-  if (!last || Date.now() - last >= Number(row.pulse_minutes || 30) * 60000) return void runPmAgent("pulse").catch(() => {});
+function requestError(message, statusCode = 400) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
 }
 
-function applyCodexTaskResult(task, result, eventType = "codex_task_returned") {
-  const now = nowIso();
-  const value = String(result || "").slice(0, 50000);
-  db.prepare("UPDATE codex_tasks SET status='complete',result=?,error='',last_checked_at=?,updated_at=? WHERE id=?").run(value, now, now, task.id);
-  const item = db.prepare("SELECT * FROM work_items WHERE id=?").get(task.work_item_id);
-  if (item?.preparation_skill === "draft-executive-email" && !String(item.draft || "").trim()) {
-    db.prepare("UPDATE work_items SET status='back_for_review',draft=?,updated_at=? WHERE id=?").run(value, now, task.work_item_id);
-  } else {
-    db.prepare("UPDATE work_items SET status='back_for_review',updated_at=? WHERE id=?").run(now, task.work_item_id);
-  }
-  eventFor(task.work_item_id, eventType, `Separate Codex task completed${task.thread_id ? ` (${task.thread_id})` : ""}. The result is ready on this card.`);
-}
-
-async function reconcilePersistentTasks() {
-  const tasks=db.prepare(`SELECT t.* FROM codex_tasks t JOIN work_items w ON w.id=t.work_item_id
-    WHERE w.status NOT IN ('done','dismissed') AND t.status='working'
-      AND datetime(COALESCE(t.heartbeat_at,t.updated_at)) <= datetime('now','-10 minutes')`).all();
-  for(const task of tasks){
-    const now=nowIso();
-    const attention="The native Codex task has not reported progress for 10 minutes. Open it directly in Codex to check its current state.";
-    db.prepare("UPDATE codex_tasks SET status='needs_attention',result=?,error='',last_checked_at=?,updated_at=? WHERE id=?").run(attention,now,now,task.id);
-    db.prepare("UPDATE work_items SET status='waiting_on_user',updated_at=? WHERE id=?").run(now,task.work_item_id);
-    eventFor(task.work_item_id,"codex_task_heartbeat_missed",attention);
+function withImmediateTransaction(callback) {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const value = callback();
+    db.exec("COMMIT");
+    return value;
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
   }
 }
 
-function userOwnedCodexTaskPrompt(item, taskId, instruction) {
-  return `Use the Serent Command Center workflow to complete this assignment in a normal, user-owned Codex task.
+function assignmentContext(item, includeScratchpad = false) {
+  const sources = db.prepare(`SELECT provider,label,source_id,source_path,source_url,retrieved_at,freshness
+    FROM source_references WHERE work_item_id=? ORDER BY retrieved_at DESC`).all(item.id);
+  const notes = db.prepare(`SELECT n.id,n.title,n.type,n.file_path FROM notes n
+    JOIN note_links l ON l.note_id=n.id WHERE l.work_item_id=? ORDER BY n.updated_at DESC`).all(item.id);
+  return {
+    workItemId: item.id,
+    companySlug: item.company_slug,
+    companyName: item.company_name || "Unassigned",
+    companyOperatingPath: item.ai_os_path ? path.resolve(aiOsRoot, item.ai_os_path) : "",
+    sourceRefs: sources,
+    noteRefs: notes,
+    scratchpad: includeScratchpad ? item.draft || "" : "",
+    scratchpadIncluded: Boolean(includeScratchpad && String(item.draft || "").trim()),
+  };
+}
 
-Assignment: ${instruction}
-Company: ${item.company_name || "Unassigned"}
-Originating Command Center item: ${item.title}
+function assignmentHandoffPacket(item, assignment, capability) {
+  const callbackUrl = `http://127.0.0.1:${port}/api/assignments/${assignment.id}/events`;
+  const context = JSON.parse(assignment.context_manifest || "{}");
+  const prompt = `Complete this Command Center assignment in a normal user-owned Codex task.
+
+Assignment key: ${assignment.assignment_key}
+Destination: ${assignment.destination === "card" ? "Return the result to the originating card" : "Work in a separate native Codex task and return a terminal receipt to the card"}
+Requested outcome: ${assignment.instruction}
+Originating card: ${item.title}
 Work item ID: ${item.id}
+Company: ${item.company_name || "Unassigned"}
 Summary: ${item.summary}
 Why now: ${item.why_now}
 Expected next action: ${item.suggested_action}
-Company context: ${item.ai_os_path ? path.resolve(aiOsRoot,item.ai_os_path) : "Read the relevant AI OS company and project context."}
+Context manifest: ${JSON.stringify(context)}
+External-action boundary: ${assignment.external_action_boundary}
 
-First, POST {"status":"started","threadId":"the native Codex task ID when available"} to http://127.0.0.1:4318/api/codex-tasks/${taskId}/callback. Read the live card and its linked notes, mail, and sources from GET http://127.0.0.1:4318/api/work-items/${item.id} before doing the work. If the work lasts more than five minutes, POST {"status":"heartbeat"} to the callback after each major step. If Jake or the owning PM must decide something, POST {"status":"needs_input","result":"the decision needed"} and keep ownership. Work independently, keep shared-system writes review-gated, and save local artifacts in the relevant project output convention. When finished, POST {"status":"completed","result":"a concise handoff with the answer and artifact paths"} to the same callback URL. If terminally blocked, POST {"status":"failed","error":"what is blocking the task"}. If handing the assignment back without completing it, POST {"status":"ownership_released","result":"why ownership was released"}.`;
+Command Center records lifecycle receipts only; it does not launch, resume, open, or inspect this task. Generate a unique eventId for every callback and keep one stable ownerId for the native Codex task. POST JSON to ${callbackUrl} with this header (the capability ends at the line break):
+Authorization: Bearer ${capability}
+
+Lifecycle: accepted {eventId,type:"accepted",ownerId}; started {eventId,type:"started",ownerId}; heartbeat {eventId,type:"heartbeat",ownerId}; needs input {eventId,type:"needs_input",ownerId,result:"question"}; completed {eventId,type:"completed",ownerId,result:"reviewable result and artifact paths"}; failed {eventId,type:"failed",ownerId,error:"terminal reason"}; ownership released {eventId,type:"ownership_released",ownerId,result:"reason"}.
+
+Read the live card from GET http://127.0.0.1:${port}/api/work-items/${item.id} before working. Never send messages or write to external/shared systems without Jake's separate explicit approval.`;
+  return { assignmentId: assignment.id, assignmentKey: assignment.assignment_key, callbackUrl, capabilityGeneration: assignment.capability_generation, prompt };
 }
 
-function codexTaskDeepLink(item, taskId, instruction) {
-  const deepLink=new URL("codex://threads/new");
-  deepLink.searchParams.set("path",aiOsRoot);
-  deepLink.searchParams.set("prompt",userOwnedCodexTaskPrompt(item,taskId,instruction));
-  deepLink.searchParams.set("originUrl",`http://localhost:3000/?workItem=${encodeURIComponent(item.id)}`);
-  return deepLink.toString();
-}
-
-function prepareUserOwnedCodexTask(item, instruction) {
-  const id=randomUUID(); const now=nowIso();
-  const title=`${item.company_name || "Serent"} - ${item.title}`.slice(0,240);
-  db.prepare(`INSERT INTO codex_tasks(id,work_item_id,title,instruction,status,created_at,updated_at) VALUES(?,?,?,?, 'waiting_on_user',?,?)`).run(id,item.id,title,instruction,now,now);
-  db.prepare("UPDATE work_items SET decision_state=CASE WHEN decision_state='proposed' THEN 'accepted' ELSE decision_state END,updated_at=? WHERE id=?").run(now,item.id);
-  eventFor(item.id,"codex_task_prepared",`Prepared a normal Codex sidebar task: ${title}`);
-  return {id,threadId:"",status:"waiting_on_user",title,instruction,deepLink:codexTaskDeepLink(item,id,instruction),createdAt:now,updatedAt:now};
-}
-
-function openCodexThreadInApp(threadId) {
-  if (!/^[0-9a-f-]{36}$/i.test(threadId)) return;
-  const launcher=spawn("explorer.exe",[`codex://threads/${threadId}`],{windowsHide:true,detached:true,stdio:"ignore"});
-  launcher.unref();
-}
-
-function preparePersistentCodexTask(item, instruction) {
-  const existing=db.prepare("SELECT * FROM codex_tasks WHERE work_item_id=? ORDER BY created_at DESC LIMIT 1").get(item.id);
-  const launchMode=codexTaskLaunchMode(existing);
-  if(launchMode==="already_running"){
-    eventFor(item.id,"codex_task_reused","The existing native Codex task receipt is still open, so no duplicate was created.");
-    return {id:existing.id,threadId:existing.thread_id,status:existing.status,title:existing.title,instruction:existing.instruction,result:existing.result,error:existing.error,deepLink:existing.status==="waiting_on_user"?codexTaskDeepLink(item,existing.id,existing.instruction):"",createdAt:existing.created_at,updatedAt:existing.updated_at,reused:true};
+function prepareAssignment(item, { destination, instruction, includeScratchpad = false, revisionOf = null, clientRequestId = "" }) {
+  const safeDestination = normalizeAssignmentDestination(destination);
+  const safeInstruction = String(instruction || "").trim().slice(0, 4000);
+  if (!safeInstruction) throw requestError("Describe what Codex should prepare.");
+  const scopeHash = assignmentScopeHash({ workItemId: item.id, destination: safeDestination, instruction: safeInstruction });
+  const existing = db.prepare(`SELECT * FROM assignments WHERE work_item_id=?
+    AND status IN ('prepared','accepted','working','needs_input','needs_attention') ORDER BY updated_at DESC LIMIT 1`).get(item.id);
+  if (existing) {
+    if (existing.scope_hash !== scopeHash || existing.destination !== safeDestination) {
+      throw requestError("This card already has an active Codex assignment with a different outcome. Cancel the unowned preparation or wait for the current owner to release it before replacing it.", 409);
+    }
+    return { outcome: "assignment_reused", assignment: mapAssignment(existing, { includeEvents: true }), handoffPacket: null, reused: true };
   }
-  return { ...prepareUserOwnedCodexTask(item,instruction), reused:false };
+  if (revisionOf) {
+    const prior = db.prepare("SELECT id,work_item_id,status FROM assignments WHERE id=?").get(revisionOf);
+    if (!prior || prior.work_item_id !== item.id || !["completed", "failed", "ownership_released"].includes(prior.status)) {
+      throw requestError("Choose a terminal result from this card to revise.", 409);
+    }
+  }
+
+  return withImmediateTransaction(() => {
+    const { id, assignmentKey } = createAssignmentIdentity(item.id);
+    const capability = createCallbackCapability();
+    const now = nowIso();
+    const title = `${item.company_name || "Serent"} - ${item.title}`.slice(0, 240);
+    const contextManifest = assignmentContext(item, includeScratchpad);
+    const allowedSources = [...new Set(contextManifest.sourceRefs.map((source) => source.provider).concat(["ai_os", "project_files"]))];
+    db.prepare(`INSERT INTO assignments
+      (id,assignment_key,work_item_id,destination,title,instruction,scope_hash,status,attempt,prior_work_item_status,
+       owner_type,owner_id,callback_capability_hash,capability_generation,allowed_sources,context_manifest,
+       external_action_boundary,result,error,revision_of,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,'prepared',1,?,'native_codex','',?,1,?,?,?,'','',?,?,?)`)
+      .run(id, assignmentKey, item.id, safeDestination, title, safeInstruction, scopeHash, item.status || "to_review", capability.hash,
+        JSON.stringify(allowedSources), JSON.stringify(contextManifest), "No external writes without Jake's separate approval.", revisionOf, now, now);
+    const eventKey = String(clientRequestId || `prepared:${id}`).trim().slice(0, 200);
+    db.prepare(`INSERT INTO assignment_events
+      (id,assignment_id,attempt,event_key,event_type,owner_id,occurred_at,received_at,previous_status,next_status,payload_json,applied,rejection_reason)
+      VALUES(?,?,1,?,'prepared','',?,?, 'none','prepared',?,1,'')`)
+      .run(randomUUID(), id, eventKey, now, now, JSON.stringify({ destination: safeDestination, instruction: safeInstruction }));
+    db.prepare("UPDATE work_items SET decision_state=CASE WHEN decision_state='proposed' THEN 'accepted' ELSE decision_state END,updated_at=? WHERE id=?").run(now, item.id);
+    eventFor(item.id, "assignment_prepared", `${safeDestination === "card" ? "Card-return" : "Separate-task"} assignment prepared. No Codex task is running yet. Assignment key: ${assignmentKey}`);
+    const row = db.prepare("SELECT * FROM assignments WHERE id=?").get(id);
+    return { outcome: "assignment_prepared", assignment: mapAssignment(row, { includeEvents: true }), handoffPacket: assignmentHandoffPacket(item, row, capability.token), reused: false };
+  });
+}
+
+function issueAssignmentPacket(assignmentId) {
+  return withImmediateTransaction(() => {
+    const assignment = db.prepare("SELECT * FROM assignments WHERE id=?").get(assignmentId);
+    if (!assignment) throw requestError("Unknown assignment.", 404);
+    if (assignment.status !== "prepared" || assignment.owner_id) throw requestError("A new packet can be issued only while the assignment is prepared and unowned.", 409);
+    const item = db.prepare(`SELECT w.*,c.display_name AS company_name,c.ai_os_path FROM work_items w
+      LEFT JOIN companies c ON c.slug=w.company_slug WHERE w.id=?`).get(assignment.work_item_id);
+    const capability = createCallbackCapability();
+    const now = nowIso();
+    const generation = Number(assignment.capability_generation || 1) + 1;
+    db.prepare("UPDATE assignments SET callback_capability_hash=?,capability_generation=?,updated_at=? WHERE id=?").run(capability.hash, generation, now, assignment.id);
+    db.prepare(`INSERT INTO assignment_events
+      (id,assignment_id,attempt,event_key,event_type,owner_id,occurred_at,received_at,previous_status,next_status,payload_json,applied,rejection_reason)
+      VALUES(?,?,?,?,'packet_issued','',?,?, 'prepared','prepared',?,1,'')`)
+      .run(randomUUID(), assignment.id, assignment.attempt, `packet:${assignment.attempt}:${generation}`, now, now, JSON.stringify({ capabilityGeneration: generation }));
+    const updated = db.prepare("SELECT * FROM assignments WHERE id=?").get(assignment.id);
+    return { assignment: mapAssignment(updated, { includeEvents: true }), handoffPacket: assignmentHandoffPacket(item, updated, capability.token) };
+  });
+}
+
+function applyAssignmentEvent(assignmentId, body, capability) {
+  const eventKey = String(body.eventId || body.eventKey || "").trim().slice(0, 200);
+  if (!/^[0-9a-z][0-9a-z._:-]{5,199}$/i.test(eventKey)) throw requestError("A stable eventId is required for every assignment callback.");
+  return withImmediateTransaction(() => {
+    const current = db.prepare("SELECT * FROM assignments WHERE id=?").get(assignmentId);
+    if (!current) throw requestError("Unknown assignment.", 404);
+    if (!verifyCallbackCapability(capability, current.callback_capability_hash)) throw requestError("Assignment callback capability is invalid.", 403);
+    const replay = db.prepare("SELECT * FROM assignment_events WHERE assignment_id=? AND attempt=? AND event_key=?").get(current.id, current.attempt, eventKey);
+    if (replay) return { assignment: mapAssignment(current, { includeEvents: true }), event: { id: replay.id, eventKey: replay.event_key, type: replay.event_type, replayed: true }, replayed: true };
+
+    const now = nowIso();
+    const ownerId = String(body.ownerId || body.threadId || "").trim().slice(0, 200);
+    const rawType = normalizeAssignmentEvent(body.type || body.status);
+    let transition;
+    try {
+      transition = transitionAssignment({ id: current.id, assignmentKey: current.assignment_key, status: current.status, ownerId: current.owner_id, ownerType: current.owner_type }, { type: rawType, ownerId, ownerType: body.ownerType });
+    } catch (error) {
+      db.prepare(`INSERT INTO assignment_events
+        (id,assignment_id,attempt,event_key,event_type,owner_id,occurred_at,received_at,previous_status,next_status,payload_json,applied,rejection_reason)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,0,?)`)
+        .run(randomUUID(), current.id, current.attempt, eventKey, rawType || "invalid", ownerId, body.occurredAt || null, now,
+          current.status, current.status, JSON.stringify(body), String(error.message || error).slice(0, 1000));
+      throw requestError(String(error.message || error), 409);
+    }
+
+    let result = current.result || "";
+    let errorText = current.error || "";
+    if (["needs_input", "needs_attention", "ownership_released", "completed"].includes(transition.nextStatus)) result = String(body.result || body.detail || "").slice(0, 50000);
+    if (transition.nextStatus === "completed") errorText = "";
+    if (transition.nextStatus === "failed") errorText = String(body.error || "The native Codex owner could not complete this assignment.").slice(0, 8000);
+    const isHeartbeat = ["accepted", "started", "heartbeat", "needs_input", "needs_attention"].includes(transition.eventType);
+    db.prepare(`UPDATE assignments SET status=?,owner_type=?,owner_id=?,result=?,error=?,
+      accepted_at=CASE WHEN ?='accepted' THEN COALESCE(accepted_at,?) ELSE accepted_at END,
+      started_at=CASE WHEN ?='started' THEN COALESCE(started_at,?) ELSE started_at END,
+      heartbeat_at=CASE WHEN ? THEN ? ELSE heartbeat_at END,
+      needs_input_at=CASE WHEN ?='needs_input' THEN ? ELSE needs_input_at END,
+      completed_at=CASE WHEN ?='completed' THEN ? ELSE completed_at END,
+      failed_at=CASE WHEN ?='failed' THEN ? ELSE failed_at END,
+      released_at=CASE WHEN ?='ownership_released' THEN ? ELSE released_at END,
+      updated_at=? WHERE id=?`)
+      .run(transition.nextStatus, transition.ownerType, transition.ownerId, result, errorText,
+        transition.eventType, now, transition.eventType, now, isHeartbeat ? 1 : 0, now,
+        transition.eventType, now, transition.eventType, now, transition.eventType, now, transition.eventType, now, now, current.id);
+    db.prepare(`INSERT INTO assignment_events
+      (id,assignment_id,attempt,event_key,event_type,owner_id,occurred_at,received_at,previous_status,next_status,payload_json,applied,rejection_reason)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,1,'')`)
+      .run(randomUUID(), current.id, current.attempt, eventKey, transition.eventType, transition.ownerId, body.occurredAt || null, now,
+        transition.previousStatus, transition.nextStatus, JSON.stringify(body));
+
+    const item = db.prepare("SELECT * FROM work_items WHERE id=?").get(current.work_item_id);
+    const projected = workItemStatusForAssignment({ nextStatus: transition.nextStatus, priorWorkItemStatus: current.prior_work_item_status });
+    if (projected && item && !["done", "dismissed"].includes(item.status)) {
+      if (transition.nextStatus === "completed" && item.preparation_skill === "draft-executive-email" && !String(item.draft || "").trim()) {
+        db.prepare("UPDATE work_items SET status=?,draft=?,updated_at=? WHERE id=?").run(projected, result, now, current.work_item_id);
+      } else {
+        db.prepare("UPDATE work_items SET status=?,updated_at=? WHERE id=?").run(projected, now, current.work_item_id);
+      }
+    }
+    const detail = ({
+      accepted: "A native Codex owner accepted this assignment and is waiting to start.",
+      started: "The verified native Codex owner started this assignment.",
+      heartbeat: "The native Codex owner reported progress.",
+      needs_input: result || "The native Codex owner needs input.",
+      needs_attention: result || "No recent lifecycle receipt was received; the existing owner remains assigned.",
+      completed: "The verified result is ready for review on this card.",
+      failed: errorText,
+      ownership_released: result || "The native Codex owner released this assignment without a result.",
+    })[transition.eventType] || `Assignment state changed to ${transition.nextStatus}.`;
+    eventFor(current.work_item_id, `assignment_${transition.eventType}`, `${detail} Assignment key: ${current.assignment_key}`);
+    const updated = db.prepare("SELECT * FROM assignments WHERE id=?").get(current.id);
+    return { assignment: mapAssignment(updated, { includeEvents: true }), event: { eventKey, type: transition.eventType, replayed: false }, replayed: false };
+  });
+}
+
+function cancelPreparedAssignment(assignmentId) {
+  return withImmediateTransaction(() => {
+    const current = db.prepare("SELECT * FROM assignments WHERE id=?").get(assignmentId);
+    if (!current) throw requestError("Unknown assignment.", 404);
+    const transition = transitionAssignment({ id: current.id, assignmentKey: current.assignment_key, status: current.status, ownerId: current.owner_id, ownerType: current.owner_type }, { type: "cancelled" });
+    const now = nowIso();
+    db.prepare("UPDATE assignments SET status='cancelled',cancelled_at=?,updated_at=? WHERE id=?").run(now, now, current.id);
+    db.prepare(`INSERT INTO assignment_events
+      (id,assignment_id,attempt,event_key,event_type,owner_id,occurred_at,received_at,previous_status,next_status,payload_json,applied,rejection_reason)
+      VALUES(?,?,?,?,'cancelled','',?,?,?,?,'{}',1,'')`)
+      .run(randomUUID(), current.id, current.attempt, `cancelled:${current.attempt}:${now}`, now, now, transition.previousStatus, transition.nextStatus);
+    eventFor(current.work_item_id, "assignment_cancelled", `Cancelled an unowned prepared assignment. Assignment key: ${current.assignment_key}`);
+    return mapAssignment(db.prepare("SELECT * FROM assignments WHERE id=?").get(current.id), { includeEvents: true });
+  });
+}
+
+function reconcileAssignmentAttention() {
+  const stale = db.prepare(`SELECT * FROM assignments WHERE status IN ('accepted','working','needs_input')
+    AND datetime(COALESCE(heartbeat_at,updated_at)) <= datetime('now','-10 minutes')`).all();
+  for (const assignment of stale) {
+    withImmediateTransaction(() => {
+      const current = db.prepare("SELECT * FROM assignments WHERE id=?").get(assignment.id);
+      if (!current || !["accepted", "working", "needs_input"].includes(current.status)) return;
+      const now = nowIso();
+      const eventKey = `attention:${current.attempt}:${current.heartbeat_at || current.updated_at}`;
+      if (db.prepare("SELECT 1 FROM assignment_events WHERE assignment_id=? AND attempt=? AND event_key=?").get(current.id, current.attempt, eventKey)) return;
+      const transition = transitionAssignment({ id: current.id, assignmentKey: current.assignment_key, status: current.status, ownerId: current.owner_id, ownerType: current.owner_type }, { type: "needs_attention", ownerId: current.owner_id });
+      const detail = "No lifecycle receipt has arrived for 10 minutes. The existing native Codex owner remains assigned; Command Center will not create a replacement.";
+      db.prepare("UPDATE assignments SET status='needs_attention',result=?,updated_at=? WHERE id=?").run(detail, now, current.id);
+      db.prepare(`INSERT INTO assignment_events
+        (id,assignment_id,attempt,event_key,event_type,owner_id,occurred_at,received_at,previous_status,next_status,payload_json,applied,rejection_reason)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,1,'')`)
+        .run(randomUUID(), current.id, current.attempt, eventKey, "needs_attention", current.owner_id, now, now,
+          transition.previousStatus, transition.nextStatus, JSON.stringify({ reason: "heartbeat_timeout", seconds: 600 }));
+      const item = db.prepare("SELECT status FROM work_items WHERE id=?").get(current.work_item_id);
+      if (item && !["done", "dismissed"].includes(item.status)) db.prepare("UPDATE work_items SET status='needs_attention',updated_at=? WHERE id=?").run(now, current.work_item_id);
+      eventFor(current.work_item_id, "assignment_needs_attention", `${detail} Assignment key: ${current.assignment_key}`);
+    });
+  }
 }
 
 async function launchAgentRun({ workItemId = null, mailMessageId = null, companySlug = null, scope, intent, title, allowedSources, revisionOf = null, sourceRefresh = null, skillId = "generic-codex", executorType = "codex_readonly", contextManifest = {} }) {
@@ -2884,6 +3230,42 @@ function searchAll(query) {
   return [...items, ...notes, ...runs, ...mail];
 }
 
+function applyCardInstruction(id, instruction) {
+  const current = db.prepare("SELECT * FROM work_items WHERE id=?").get(id);
+  if (!current) throw requestError("Unknown work item.", 404);
+  const safeInstruction = String(instruction || "").trim().slice(0, 4000);
+  if (!safeInstruction) throw requestError("Describe what you want to update.");
+  const companies = db.prepare("SELECT slug,display_name FROM companies WHERE active=1").all()
+    .map((company) => ({ slug: company.slug, displayName: company.display_name, aliases: company.slug === "firm" ? ["Serent", "Serent / Firm"] : [] }));
+  const parsed = parseCardCommand({ instruction: safeInstruction, current, companies, now: new Date() });
+  if (parsed.clarification) return { handled: true, updated: workItemById(id), changes: [], remainingIntent: "", clarification: parsed.clarification, message: parsed.clarification, undoToken: "" };
+  if (!parsed.handled) return { handled: false, updated: workItemById(id), changes: [], remainingIntent: safeInstruction, clarification: "", message: "", undoToken: "" };
+
+  const commandId = randomUUID();
+  const now = nowIso();
+  const fields = Object.keys(parsed.patch);
+  const previous = cardCommandSnapshot(current, fields);
+  if (parsed.patch.status === "done") {
+    previous.projectPlanItems = db.prepare(`SELECT p.id,p.status FROM project_plan_items p
+      JOIN project_action_links l ON l.project_plan_item_id=p.id WHERE l.work_item_id=?`).all(id);
+  }
+  applyCardCommandPatch(id, parsed.patch);
+  db.prepare(`INSERT INTO card_commands(id,work_item_id,instruction,previous_json,next_json,status,created_at)
+    VALUES(?,?,?,?,?,'applied',?)`).run(commandId, id, safeInstruction, JSON.stringify(previous), JSON.stringify(parsed.patch), now);
+  const labels = [...new Set(parsed.changes.map((change) => change.label))];
+  const message = `Updated ${labels.join(", ")}.`;
+  eventFor(id, "command_applied", `${message} Jake wrote: ${safeInstruction}`);
+  if (Object.hasOwn(parsed.patch, "company_slug")) {
+    const linkedMail = db.prepare("SELECT id FROM mail_messages WHERE action_work_item_id=? LIMIT 1").get(id);
+    if (linkedMail) db.prepare("UPDATE mail_messages SET company_slug=?,updated_at=? WHERE id=?").run(parsed.patch.company_slug, now, linkedMail.id);
+  }
+  if (parsed.patch.status === "done") {
+    db.prepare(`UPDATE project_plan_items SET status='complete',updated_at=? WHERE id IN
+      (SELECT project_plan_item_id FROM project_action_links WHERE work_item_id=?)`).run(now, id);
+  }
+  return { handled: true, updated: workItemById(id), changes: parsed.changes, remainingIntent: parsed.remainingIntent, clarification: "", message, undoToken: commandId };
+}
+
 reconcileAllProjects();
 setInterval(() => reconcileAllProjects(), 60 * 60 * 1000).unref();
 
@@ -2901,9 +3283,6 @@ const server = createServer(async (request, response) => {
       const kind = ["manual", "morning", "pulse"].includes(body.kind) ? body.kind : "manual";
       return responseJson(response, 200, await runPmAgent(kind));
     }
-    if (request.method === "POST" && url.pathname === "/api/pm-agent/chat/open") {
-      return responseJson(response, 200, await ensurePmChatOpen());
-    }
     if (request.method === "PATCH" && url.pathname === "/api/pm-agent/config") {
       const body = await readJsonBody(request); const current = db.prepare("SELECT * FROM pm_agent_config WHERE id='default'").get(); const now = nowIso();
       const enabled = body.enabled === undefined ? current.enabled : body.enabled ? 1 : 0;
@@ -2920,13 +3299,6 @@ const server = createServer(async (request, response) => {
       db.prepare(`INSERT INTO pm_thread_links(thread_id,work_item_id,title,status,created_at,updated_at) VALUES(?,?,?,'confirmed',?,?)
         ON CONFLICT(thread_id) DO UPDATE SET work_item_id=excluded.work_item_id,title=excluded.title,status='confirmed',updated_at=excluded.updated_at`).run(threadId, workItemId, String(body.title || "").slice(0,240), now, now);
       return responseJson(response, 200, await runPmAgent("manual"));
-    }
-    const pmOpenMatch = url.pathname.match(/^\/api\/pm-agent\/threads\/([^/]+)\/open$/);
-    if (pmOpenMatch && request.method === "POST") {
-      const threadId = decodeURIComponent(pmOpenMatch[1]);
-      if (!/^[0-9a-f-]{36}$/i.test(threadId)) throw new Error("Choose a valid Codex task.");
-      openCodexThreadInApp(threadId);
-      return responseJson(response, 200, { opened: true, threadId });
     }
     if (request.method === "GET" && url.pathname === "/api/bootstrap") return responseJson(response, 200, bootstrapPayload(Object.fromEntries(url.searchParams)));
     if (request.method === "GET" && url.pathname === "/api/work-items") return responseJson(response, 200, queryWorkItems(Object.fromEntries(url.searchParams)));
@@ -3128,101 +3500,66 @@ const server = createServer(async (request, response) => {
       if (!item) throw new Error("Unknown work item.");
       return responseJson(response, 202, await launchClickUpCompletion(item));
     }
-    const codexTaskMatch = url.pathname.match(/^\/api\/work-items\/([^/]+)\/codex-task$/);
-    if (request.method === "POST" && codexTaskMatch) {
-      const item = db.prepare(`SELECT w.*,c.display_name AS company_name FROM work_items w LEFT JOIN companies c ON c.slug=w.company_slug WHERE w.id=?`).get(decodeURIComponent(codexTaskMatch[1]));
-      if (!item) throw new Error("Unknown work item.");
+    const instructionMatch = url.pathname.match(/^\/api\/work-items\/([^/]+)\/instructions$/);
+    if (request.method === "POST" && instructionMatch) {
+      const id = decodeURIComponent(instructionMatch[1]);
+      const item = db.prepare(`SELECT w.*,c.display_name AS company_name,c.ai_os_path FROM work_items w
+        LEFT JOIN companies c ON c.slug=w.company_slug WHERE w.id=?`).get(id);
+      if (!item) throw requestError("Unknown work item.", 404);
       const body = await readJsonBody(request);
-      const instruction = String(body.instruction || item.suggested_action || "Complete this assignment.").trim().slice(0,4000);
-      if (!instruction) throw new Error("Describe the assignment for the new Codex task.");
-      return responseJson(response, 201, preparePersistentCodexTask(item,instruction));
-    }
-    const codexTaskLinkMatch = url.pathname.match(/^\/api\/work-items\/([^/]+)\/codex-task-link$/);
-    if (request.method === "POST" && codexTaskLinkMatch) {
-      const item = db.prepare(`SELECT w.*,c.display_name AS company_name,c.ai_os_path FROM work_items w LEFT JOIN companies c ON c.slug=w.company_slug WHERE w.id=?`).get(decodeURIComponent(codexTaskLinkMatch[1]));
-      if (!item) throw new Error("Unknown work item.");
-      const body = await readJsonBody(request);
-      const instruction = String(body.instruction || item.suggested_action || "Complete this assignment.").trim().slice(0,4000);
-      if (!instruction) throw new Error("Describe the assignment for the new Codex task.");
-      return responseJson(response, 201, preparePersistentCodexTask(item,instruction));
-    }
-    const codexTaskCallbackMatch = url.pathname.match(/^\/api\/codex-tasks\/([^/]+)\/callback$/);
-    if (request.method === "POST" && codexTaskCallbackMatch) {
-      const task = db.prepare("SELECT * FROM codex_tasks WHERE id=?").get(decodeURIComponent(codexTaskCallbackMatch[1]));
-      if (!task) throw new Error("Unknown Codex task receipt.");
-      const body = await readJsonBody(request); const status=String(body.status||""); const now=nowIso();
-      const normalizedStatus={working:'started',complete:'completed',error:'failed'}[status]||status;
-      if (!['accepted','started','heartbeat','needs_input','completed','failed','ownership_released'].includes(normalizedStatus)) throw new Error("Codex task callback status must be accepted, started, heartbeat, needs_input, completed, failed, or ownership_released.");
-      const threadId=String(body.threadId||"");
-      if(threadId && !/^[0-9a-f-]{36}$/i.test(threadId)) throw new Error("Codex task callback threadId must be a valid task ID.");
-      const verifiedThreadId=threadId||task.thread_id;
-      if(['accepted','started','heartbeat'].includes(normalizedStatus) && !/^[0-9a-f-]{36}$/i.test(verifiedThreadId)) throw new Error("A verified native Codex task ID is required before this assignment can be accepted or started.");
-      if(normalizedStatus==='accepted'){
-        db.prepare("UPDATE codex_tasks SET thread_id=CASE WHEN ?<>'' THEN ? ELSE thread_id END,status='accepted',heartbeat_at=?,updated_at=? WHERE id=?").run(threadId,threadId,now,now,task.id);
-        db.prepare("UPDATE work_items SET status='queued',updated_at=? WHERE id=?").run(now,task.work_item_id);
-        eventFor(task.work_item_id,"codex_task_accepted",`Native Codex accepted the assignment: ${task.title}`);
-      }else if(normalizedStatus==='started'||normalizedStatus==='heartbeat'){
-        db.prepare("UPDATE codex_tasks SET thread_id=CASE WHEN ?<>'' THEN ? ELSE thread_id END,status='working',heartbeat_at=?,updated_at=? WHERE id=?").run(threadId,threadId,now,now,task.id);
-        db.prepare("UPDATE work_items SET status='working',updated_at=? WHERE id=?").run(now,task.work_item_id);
-        if(normalizedStatus==='started') eventFor(task.work_item_id,"codex_task_started",`Started the native Codex task: ${task.title}`);
-      }else if(normalizedStatus==='needs_input'){
-        const detail=String(body.result||"The native Codex task needs input from its owning PM.").slice(0,8000);
-        db.prepare("UPDATE codex_tasks SET status='needs_input',result=?,heartbeat_at=?,updated_at=? WHERE id=?").run(detail,now,now,task.id);
-        db.prepare("UPDATE work_items SET status='waiting_on_user',updated_at=? WHERE id=?").run(now,task.work_item_id);
-        eventFor(task.work_item_id,"codex_task_needs_input",detail);
-      }else if(normalizedStatus==='completed'){
-        const result=String(body.result||"The separate Codex task completed.").slice(0,50000);
-        applyCodexTaskResult(task,result);
-      }else if(normalizedStatus==='failed'){
-        const error=String(body.error||"The separate Codex task needs attention.").slice(0,8000);
-        db.prepare("UPDATE codex_tasks SET status='error',error=?,updated_at=? WHERE id=?").run(error,now,task.id);
-        db.prepare("UPDATE work_items SET status='back_for_review',updated_at=? WHERE id=?").run(now,task.work_item_id);
-        eventFor(task.work_item_id,"codex_task_error",error);
-      }else{
-        const detail=String(body.result||"The native Codex task released ownership without completing the assignment.").slice(0,8000);
-        db.prepare("UPDATE codex_tasks SET status='ownership_released',result=?,heartbeat_at=?,updated_at=? WHERE id=?").run(detail,now,now,task.id);
-        db.prepare("UPDATE work_items SET status='to_review',updated_at=? WHERE id=?").run(now,task.work_item_id);
-        eventFor(task.work_item_id,"codex_task_ownership_released",detail);
+      const mode = String(body.mode || "");
+      if (mode === "update") {
+        const result = applyCardInstruction(id, body.instruction);
+        return responseJson(response, 200, { outcome: result.handled ? "card_updated" : "not_understood", ...result });
       }
-      return responseJson(response, 200, {id:task.id,status:normalizedStatus==='heartbeat'?'working':normalizedStatus,updatedAt:now});
+      if (!['return_here', 'separate_task'].includes(mode)) throw requestError("Choose Update card, Ask Codex and return here, or Prepare a separate Codex task.");
+      const prepared = prepareAssignment(item, {
+        destination: mode === "return_here" ? "card" : "separate_task",
+        instruction: body.instruction,
+        includeScratchpad: Boolean(body.includeScratchpad),
+        revisionOf: body.revisionOf || null,
+        clientRequestId: body.clientRequestId || "",
+      });
+      return responseJson(response, prepared.reused ? 200 : 201, { ...prepared, card: workItemById(id) });
+    }
+
+    const assignmentCreateMatch = url.pathname.match(/^\/api\/work-items\/([^/]+)\/assignments$/);
+    if (request.method === "POST" && assignmentCreateMatch) {
+      const item = db.prepare(`SELECT w.*,c.display_name AS company_name,c.ai_os_path FROM work_items w
+        LEFT JOIN companies c ON c.slug=w.company_slug WHERE w.id=?`).get(decodeURIComponent(assignmentCreateMatch[1]));
+      if (!item) throw requestError("Unknown work item.", 404);
+      const body = await readJsonBody(request);
+      const prepared = prepareAssignment(item, body);
+      return responseJson(response, prepared.reused ? 200 : 201, prepared);
+    }
+
+    const assignmentEventMatch = url.pathname.match(/^\/api\/assignments\/([^/]+)\/events$/);
+    if (request.method === "POST" && assignmentEventMatch) {
+      const authorization = String(request.headers.authorization || "");
+      const capability = authorization.match(/^Bearer\s+(.+)$/i)?.[1] || "";
+      const body = await readJsonBody(request);
+      return responseJson(response, 200, applyAssignmentEvent(decodeURIComponent(assignmentEventMatch[1]), body, capability));
+    }
+
+    const assignmentPacketMatch = url.pathname.match(/^\/api\/assignments\/([^/]+)\/packet$/);
+    if (request.method === "POST" && assignmentPacketMatch) {
+      return responseJson(response, 200, issueAssignmentPacket(decodeURIComponent(assignmentPacketMatch[1])));
+    }
+
+    const assignmentCancelMatch = url.pathname.match(/^\/api\/assignments\/([^/]+)\/cancel$/);
+    if (request.method === "POST" && assignmentCancelMatch) {
+      return responseJson(response, 200, { assignment: cancelPreparedAssignment(decodeURIComponent(assignmentCancelMatch[1])) });
+    }
+
+    if (request.method === "POST" && (/^\/api\/work-items\/[^/]+\/codex-task(?:-link)?$/.test(url.pathname) || /^\/api\/codex-tasks\/[^/]+\/callback$/.test(url.pathname))) {
+      throw requestError("This legacy Codex-task endpoint is retired. Use the assignment lifecycle endpoints.", 410);
     }
 
     const cardCommandMatch = url.pathname.match(/^\/api\/work-items\/([^/]+)\/command$/);
     if (request.method === "POST" && cardCommandMatch) {
       const id = decodeURIComponent(cardCommandMatch[1]);
-      const current = db.prepare("SELECT * FROM work_items WHERE id=?").get(id);
-      if (!current) throw new Error("Unknown work item.");
       const body = await readJsonBody(request);
-      const instruction = String(body.instruction || "").trim().slice(0, 4000);
-      if (!instruction) throw new Error("Describe what you want to change or do.");
-      const companies = db.prepare("SELECT slug,display_name FROM companies WHERE active=1").all().map((company) => ({ slug: company.slug, displayName: company.display_name, aliases: company.slug === "firm" ? ["Serent", "Serent / Firm"] : [] }));
-      const parsed = parseCardCommand({ instruction, current, companies, now: new Date() });
-      if (parsed.clarification) return responseJson(response, 200, { handled: true, updated: workItemById(id), changes: [], remainingIntent: "", clarification: parsed.clarification, message: parsed.clarification, undoToken: "" });
-      if (!parsed.handled) return responseJson(response, 200, { handled: false, updated: workItemById(id), changes: [], remainingIntent: instruction, clarification: "", message: "", undoToken: "" });
-
-      const commandId = randomUUID();
-      const now = nowIso();
-      const fields = Object.keys(parsed.patch);
-      const previous = cardCommandSnapshot(current, fields);
-      if (parsed.patch.status === "done") {
-        previous.projectPlanItems = db.prepare(`SELECT p.id,p.status FROM project_plan_items p
-          JOIN project_action_links l ON l.project_plan_item_id=p.id WHERE l.work_item_id=?`).all(id);
-      }
-      applyCardCommandPatch(id, parsed.patch);
-      db.prepare(`INSERT INTO card_commands(id,work_item_id,instruction,previous_json,next_json,status,created_at)
-        VALUES(?,?,?,?,?,'applied',?)`).run(commandId, id, instruction, JSON.stringify(previous), JSON.stringify(parsed.patch), now);
-      const labels = [...new Set(parsed.changes.map((change) => change.label))];
-      const message = `Updated ${labels.join(", ")}.`;
-      eventFor(id, "command_applied", `${message} Jake wrote: ${instruction}`);
-      if (Object.hasOwn(parsed.patch, "company_slug")) {
-        const linkedMail = db.prepare("SELECT id FROM mail_messages WHERE action_work_item_id=? LIMIT 1").get(id);
-        if (linkedMail) db.prepare("UPDATE mail_messages SET company_slug=?,updated_at=? WHERE id=?").run(parsed.patch.company_slug, now, linkedMail.id);
-      }
-      if (parsed.patch.status === "done") {
-        db.prepare(`UPDATE project_plan_items SET status='complete',updated_at=? WHERE id IN
-          (SELECT project_plan_item_id FROM project_action_links WHERE work_item_id=?)`).run(now,id);
-      }
-      return responseJson(response, 200, { handled: true, updated: workItemById(id), changes: parsed.changes, remainingIntent: parsed.remainingIntent, clarification: "", message, undoToken: commandId });
+      return responseJson(response, 200, applyCardInstruction(id, body.instruction));
     }
 
     const undoCardCommandMatch = url.pathname.match(/^\/api\/card-commands\/([^/]+)\/undo$/);
@@ -3258,7 +3595,7 @@ const server = createServer(async (request, response) => {
       const current = db.prepare("SELECT * FROM work_items WHERE id = ?").get(id);
       if (!current) throw new Error("Unknown work item.");
       const body = await readJsonBody(request);
-      const allowedStatus = ["to_review", "queued", "working", "waiting_on_user", "waiting_external", "back_for_review", "done", "dismissed", "error"];
+      const allowedStatus = ["to_review", "queued", "working", "waiting_on_user", "waiting_external", "needs_attention", "back_for_review", "done", "dismissed", "error"];
       const requestedCompany = body.companySlug === undefined ? current.company_slug : body.companySlug || null;
       const companySlug = requestedCompany && !db.prepare("SELECT slug FROM companies WHERE slug=? AND active=1").get(requestedCompany) ? current.company_slug : requestedCompany;
       const next = {
@@ -3464,18 +3801,13 @@ const server = createServer(async (request, response) => {
 
     return responseJson(response, 404, { error: "Not found." });
   } catch (error) {
-    return responseJson(response, 400, { error: error instanceof Error ? error.message : "Request failed." });
+    return responseJson(response, Number(error?.statusCode || 400), { error: error instanceof Error ? error.message : "Request failed." });
   }
 });
 
 server.listen(port, host, () => {
   console.log(`Serent Command Center control server listening at http://${host}:${port}`);
-  void reconcilePersistentTasks();
-  const reconciliationTimer=setInterval(()=>void reconcilePersistentTasks(),15000);
+  reconcileAssignmentAttention();
+  const reconciliationTimer=setInterval(()=>reconcileAssignmentAttention(),15000);
   reconciliationTimer.unref();
-  if (localWorkflowsEnabled) {
-    const pmTimer = setInterval(() => void maybeRunPmAgent(), 60000);
-    pmTimer.unref();
-    setTimeout(() => void maybeRunPmAgent(), 5000).unref();
-  }
 });
