@@ -109,26 +109,6 @@ export default function PmAgentWorkspace({ onNotice, onOpenWorkItem }: { onNotic
     return () => { cancelled = true; };
   }, [onNotice]);
 
-  const run = async () => {
-    setBusy(true);
-    try {
-      const next = await api<PmPayload>("/api/pm-agent/run", { method: "POST", body: JSON.stringify({ kind: "manual" }) });
-      setData(next);
-      onNotice(`PM check complete: ${next.summary.autoStarted} new preparation task${next.summary.autoStarted === 1 ? "" : "s"} started, ${next.summary.underway} already linked or underway.`);
-    } catch (error) { onNotice(error instanceof Error ? error.message : "The PM check failed."); }
-    finally { setBusy(false); }
-  };
-
-  const openPmChat = async () => {
-    setBusy(true);
-    try {
-      const next = await api<PmPayload>("/api/pm-agent/chat/open", { method: "POST", body: "{}" });
-      setData(next);
-      onNotice(next.config.chatThreadId ? "Opened the continuing PM Agent chat in Codex." : "The PM Agent chat is still being created.");
-    } catch (error) { onNotice(error instanceof Error ? error.message : "The PM Agent chat could not be opened."); }
-    finally { setBusy(false); }
-  };
-
   const confirmLink = async (recommendation: PmRecommendation) => {
     if (!recommendation.threadId || !recommendation.workItemId) return;
     setBusy(true);
@@ -138,11 +118,6 @@ export default function PmAgentWorkspace({ onNotice, onOpenWorkItem }: { onNotic
       onNotice("Task linked. Future PM checks will continue this task instead of proposing duplicate work.");
     } catch (error) { onNotice(error instanceof Error ? error.message : "The link could not be saved."); }
     finally { setBusy(false); }
-  };
-
-  const openThread = async (threadId: string) => {
-    try { await api(`/api/pm-agent/threads/${encodeURIComponent(threadId)}/open`, { method: "POST", body: "{}" }); }
-    catch (error) { onNotice(error instanceof Error ? error.message : "The Codex task could not be opened."); }
   };
 
   const groups = useMemo(() => {
@@ -161,22 +136,19 @@ export default function PmAgentWorkspace({ onNotice, onOpenWorkItem }: { onNotic
     <section className="pm-workspace">
       <header className="pm-hero">
         <div><p className="kicker">CEO + PM AGENT</p><h2>Your orchestration partner</h2><p>Protects the critical path, reads native-task receipts for overlap and new evidence, and brings delegation and decisions back to you.</p></div>
-        <div className="pm-hero-actions">
-          <button type="button" disabled={busy} onClick={() => void openPmChat()}>{data.config.chatThreadId ? "Open PM conversation in Codex" : "Create PM conversation"}</button>
-          <button type="button" disabled={busy} onClick={() => void run()}>{busy ? "Working..." : "Run PM check"}</button>
-        </div>
+        <div className="pm-hero-actions"><span>Read-only receipt view</span></div>
       </header>
 
       <div className="pm-mode-bar">
         <div><span className="pm-mode-dot" /><strong>Control-plane observer</strong><span>Prioritizes and prepares handoffs. Native Codex tasks own execution; external actions remain review-gated.</span></div>
-        <div><span>Persistent conversation</span><strong>{data.config.chatStatus.replaceAll("_", " ")}</strong><span>Deep plan</span><strong>{data.config.morningTime} every morning</strong><span>Pulse</span><strong>every {data.config.pulseMinutes} minutes</strong></div>
+        <div><span>Execution owner</span><strong>Native Codex parent tasks</strong><span>Recovery</span><strong>Owner-bound callbacks</strong></div>
       </div>
       {data.config.chatError ? <p className="pm-chat-error">PM chat needs attention: {data.config.chatError}</p> : null}
 
       <div className="pm-summary-grid">
         <article><span>Actually running</span><strong>{data.summary.underway}</strong><small>Codex turns active right now</small></article>
         <article><span>Matches to confirm</span><strong>{data.summary.likelyMatches}</strong><small>Prevents duplicate assignments</small></article>
-        <article><span>Started automatically</span><strong>{data.summary.autoStarted}</strong><small>{data.summary.wouldDispatch ? `${data.summary.wouldDispatch} ready to delegate` : "Native results return by callback"}</small></article>
+        <article><span>Prepared handoffs</span><strong>{data.summary.wouldDispatch}</strong><small>Nothing starts automatically</small></article>
         <article><span>Needs Jake</span><strong>{data.summary.needsJake}</strong><small>Review, accept, edit, or decide</small></article>
         <article><span>Waiting</span><strong>{data.summary.waiting}</strong><small>Monitor external dependencies</small></article>
       </div>
@@ -188,7 +160,7 @@ export default function PmAgentWorkspace({ onNotice, onOpenWorkItem }: { onNotic
             <article className="pm-thread" data-company={thread.companySlug || "unassigned"} key={thread.threadId}>
               <span className="pm-company-line"><i />{thread.companyName || "Unassigned"}</span>
               <div className="pm-thread-main"><div><h4>{thread.title}</h4><p>{thread.linkedWorkItemTitle || thread.rationale}</p></div><span className={`pm-thread-status status-${thread.status}`}>{threadStatusLabel(thread.status)}</span></div>
-              <div className="pm-thread-footer"><span>{thread.matchType === "likely" ? `${Math.round(thread.confidence * 100)}% likely match` : thread.matchType.replaceAll("_", " ")}</span><span>Updated {relativeTime(thread.updatedAt)}</span><button type="button" onClick={() => void openThread(thread.threadId)}>Open in Codex</button></div>
+              <div className="pm-thread-footer"><span>{thread.matchType === "likely" ? `${Math.round(thread.confidence * 100)}% likely match` : thread.matchType.replaceAll("_", " ")}</span><span>Updated {relativeTime(thread.updatedAt)}</span></div>
             </article>
           )) : <div className="pm-empty">No recent Codex tasks were available.</div>}
         </div>
@@ -208,7 +180,6 @@ export default function PmAgentWorkspace({ onNotice, onOpenWorkItem }: { onNotic
                   <footer>
                     {item.workItemId ? <button type="button" onClick={() => onOpenWorkItem(item.workItemId!)}>Open card</button> : null}
                     {item.action === "link" ? <button className="primary" type="button" disabled={busy} onClick={() => void confirmLink(item)}>Confirm link</button> : null}
-                    {item.threadId ? <button type="button" onClick={() => void openThread(item.threadId!)}>Open task</button> : null}
                   </footer>
                 </article>
               )) : <p className="pm-lane-empty">Nothing here right now.</p>}</div>

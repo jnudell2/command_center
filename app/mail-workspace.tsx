@@ -67,7 +67,7 @@ function tomorrowMorning() {
   return date.toISOString();
 }
 
-export default function MailWorkspace({ companies, selectedMessageId, onNotice, onPromoted }: { companies: Company[]; selectedMessageId?: string; onNotice: (message: string) => void; onPromoted: () => void }) {
+export default function MailWorkspace({ companies, selectedMessageId, onNotice, onPromoted, onOpenWorkItem }: { companies: Company[]; selectedMessageId?: string; onNotice: (message: string) => void; onPromoted: () => void; onOpenWorkItem: (id: string) => void }) {
   const [view, setView] = useState("needs_reply");
   const [mail, setMail] = useState<MailResponse>({ items: [], counts: {}, receipt: null });
   const [selectedId, setSelectedId] = useState("");
@@ -197,10 +197,15 @@ export default function MailWorkspace({ companies, selectedMessageId, onNotice, 
     if (!detail) return;
     setBusy(true);
     try {
-      await api(`/api/mail/${detail.id}/draft`, { method: "POST", body: "{}" });
-      onNotice("The Executive Email Draft skill is working in the background.");
+      const next = detail.actionWorkItemId ? detail : await api<Mail>(`/api/mail/${detail.id}`, { method: "PATCH", body: JSON.stringify({ promote: true, detail: "Promoted mail so Codex work can return to an owned card." }) });
+      setDetail(next);
       await loadList(true);
-    } catch (error) { onNotice(error instanceof Error ? error.message : "The reply could not be queued."); }
+      onPromoted();
+      if (next.actionWorkItemId) {
+        onOpenWorkItem(next.actionWorkItemId);
+        onNotice("Opened the mail card. Choose Ask Codex · Return here to prepare the reply; no task starts automatically.");
+      }
+    } catch (error) { onNotice(error instanceof Error ? error.message : "The mail card could not be opened."); }
     finally { setBusy(false); }
   };
 

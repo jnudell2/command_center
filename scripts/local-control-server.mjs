@@ -1719,10 +1719,6 @@ async function syncMail() {
     const coverage = payload.coverage.complete ? "complete" : "partial";
     const detail = `${payload.inbox.length} active messages synchronized across ${payload.coverage.pages} page${payload.coverage.pages === 1 ? "" : "s"}; coverage ${coverage}.`;
     db.prepare("UPDATE source_receipts SET status=?,checked_at=?,detail=?,result=?,error='' WHERE source='mail'").run(payload.coverage.complete ? "ready" : "partial", nowIso(), detail, JSON.stringify({ messages: payload.inbox.length, pages: payload.coverage.pages, complete: payload.coverage.complete }));
-    for (const id of draftCandidates.slice(0, 2)) {
-      if (activeProcesses.size >= 3) break;
-      void launchMailDraft(id, { automatic: true }).catch(() => {});
-    }
     return { status: payload.coverage.complete ? "ready" : "partial", messages: payload.inbox.length, draftCandidates: draftCandidates.length, coverage: payload.coverage };
   } catch (error) {
     const message = error instanceof Error ? error.message : "Mail refresh failed.";
@@ -2443,23 +2439,6 @@ async function launchClickUpCompletion(item) {
   return { id, status: "working", targetId };
 }
 
-async function relevantTranscriptPaths(companySlug, query = "") {
-  const companiesDir = path.join(transcriptRoot, "companies");
-  try {
-    const entries = await readdir(companiesDir, { recursive: true, withFileTypes: true });
-    const paths = entries.filter((entry) => entry.isFile() && entry.name.endsWith(".summary.md")).map((entry) => path.join(entry.parentPath || entry.path || companiesDir, entry.name));
-    const terms=[...new Set(String(query).toLowerCase().split(/[^a-z0-9]+/).filter((term)=>term.length>=5&&!['prepare','meeting','agenda','separate','codex','documents'].includes(term)))];
-    const scored=[];
-    for(const filePath of paths){
-      const content=(await readFile(filePath,"utf8").catch(()=>"")).slice(0,40000).toLowerCase();
-      const normalized=filePath.toLowerCase();
-      const score=(companySlug&&normalized.includes(`${path.sep}${companySlug}${path.sep}`)?4:0)+terms.reduce((total,term)=>total+(content.includes(term)||normalized.includes(term)?1:0),0);
-      if(score>0)scored.push({filePath,score});
-    }
-    return scored.sort((a,b)=>b.score-a.score||b.filePath.localeCompare(a.filePath)).slice(0,6).map((item)=>item.filePath);
-  } catch { return []; }
-}
-
 function mapPmConfig(row) {
   return {
     mode: row?.mode || "observer",
@@ -2595,11 +2574,6 @@ async function runPmAgent(kind = "manual") {
   return pmRunPromise;
 }
 
-function pacificClock() {
-  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-US", { timeZone: "America/Los_Angeles", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(new Date()).filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
-  return { date: `${parts.year}-${parts.month}-${parts.day}`, time: `${parts.hour}:${parts.minute}` };
-}
-
 function requestError(message, statusCode = 400) {
   const error = new Error(message);
   error.statusCode = statusCode;
@@ -2666,22 +2640,21 @@ function prepareAssignment(item, { destination, instruction, includeScratchpad =
   const safeInstruction = String(instruction || "").trim().slice(0, 4000);
   if (!safeInstruction) throw requestError("Describe what Codex should prepare.");
   const scopeHash = assignmentScopeHash({ workItemId: item.id, destination: safeDestination, instruction: safeInstruction });
-  const existing = db.prepare(`SELECT * FROM assignments WHERE work_item_id=?
-    AND status IN ('prepared','accepted','working','needs_input','needs_attention') ORDER BY updated_at DESC LIMIT 1`).get(item.id);
-  if (existing) {
-    if (existing.scope_hash !== scopeHash || existing.destination !== safeDestination) {
-      throw requestError("This card already has an active Codex assignment with a different outcome. Cancel the unowned preparation or wait for the current owner to release it before replacing it.", 409);
-    }
-    return { outcome: "assignment_reused", assignment: mapAssignment(existing, { includeEvents: true }), handoffPacket: null, reused: true };
-  }
-  if (revisionOf) {
-    const prior = db.prepare("SELECT id,work_item_id,status FROM assignments WHERE id=?").get(revisionOf);
-    if (!prior || prior.work_item_id !== item.id || !["completed", "failed", "ownership_released"].includes(prior.status)) {
-      throw requestError("Choose a terminal result from this card to revise.", 409);
-    }
-  }
-
   return withImmediateTransaction(() => {
+    const existing = db.prepare(`SELECT * FROM assignments WHERE work_item_id=?
+      AND status IN ('prepared','accepted','working','needs_input','needs_attention') ORDER BY updated_at DESC LIMIT 1`).get(item.id);
+    if (existing) {
+      if (existing.scope_hash !== scopeHash || existing.destination !== safeDestination) {
+        throw requestError("This card already has an active Codex assignment with a different outcome. Cancel the unowned preparation or wait for the current owner to release it before replacing it.", 409);
+      }
+      return { outcome: "assignment_reused", assignment: mapAssignment(existing, { includeEvents: true }), handoffPacket: null, reused: true };
+    }
+    if (revisionOf) {
+      const prior = db.prepare("SELECT id,work_item_id,status FROM assignments WHERE id=?").get(revisionOf);
+      if (!prior || prior.work_item_id !== item.id || !["completed", "failed", "ownership_released"].includes(prior.status)) {
+        throw requestError("Choose a terminal result from this card to revise.", 409);
+      }
+    }
     const { id, assignmentKey } = createAssignmentIdentity(item.id);
     const capability = createCallbackCapability();
     const now = nowIso();
@@ -3192,11 +3165,6 @@ async function launchTranscriptRoute({ item, intent, contextManifest }) {
   return mapRun(row);
 }
 
-if (localWorkflowsEnabled) setInterval(() => {
-    const waiting = db.prepare("SELECT * FROM agent_runs WHERE skill_id='zoom-transcript-router' AND status='waiting_on_user'").all();
-    for (const row of waiting) void resumeTranscriptRun(row);
-  }, 60_000).unref();
-
 function proposeDraftLearning(mailMessageId) {
   const row = db.prepare(`${mailSelect} WHERE m.id=?`).get(mailMessageId);
   if (!row?.draft_id || !row.generated_body || !row.current_body || row.generated_body.trim() === row.current_body.trim()) return null;
@@ -3279,9 +3247,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/api/health") return responseJson(response, 200, { status: "ready", checkedAt: nowIso(), activeJobs: activeProcesses.size, database: databasePath });
     if (request.method === "GET" && url.pathname === "/api/pm-agent") return responseJson(response, 200, pmAgentPayload());
     if (request.method === "POST" && url.pathname === "/api/pm-agent/run") {
-      const body = await readJsonBody(request);
-      const kind = ["manual", "morning", "pulse"].includes(body.kind) ? body.kind : "manual";
-      return responseJson(response, 200, await runPmAgent(kind));
+      throw requestError("Command Center no longer polls or runs native Codex work. Refresh this view from the owning CEO/PM task instead.", 410);
     }
     if (request.method === "PATCH" && url.pathname === "/api/pm-agent/config") {
       const body = await readJsonBody(request); const current = db.prepare("SELECT * FROM pm_agent_config WHERE id='default'").get(); const now = nowIso();
@@ -3298,7 +3264,7 @@ const server = createServer(async (request, response) => {
       if (!db.prepare("SELECT id FROM work_items WHERE id=?").get(workItemId)) throw new Error("The work item no longer exists.");
       db.prepare(`INSERT INTO pm_thread_links(thread_id,work_item_id,title,status,created_at,updated_at) VALUES(?,?,?,'confirmed',?,?)
         ON CONFLICT(thread_id) DO UPDATE SET work_item_id=excluded.work_item_id,title=excluded.title,status='confirmed',updated_at=excluded.updated_at`).run(threadId, workItemId, String(body.title || "").slice(0,240), now, now);
-      return responseJson(response, 200, await runPmAgent("manual"));
+      return responseJson(response, 200, pmAgentPayload());
     }
     if (request.method === "GET" && url.pathname === "/api/bootstrap") return responseJson(response, 200, bootstrapPayload(Object.fromEntries(url.searchParams)));
     if (request.method === "GET" && url.pathname === "/api/work-items") return responseJson(response, 200, queryWorkItems(Object.fromEntries(url.searchParams)));
@@ -3376,10 +3342,7 @@ const server = createServer(async (request, response) => {
 
     const mailDraftMatch = url.pathname.match(/^\/api\/mail\/([^/]+)\/draft$/);
     if (mailDraftMatch && request.method === "POST") {
-      const id = decodeURIComponent(mailDraftMatch[1]);
-      const body = await readJsonBody(request);
-      const run = await launchMailDraft(id, { automatic: false, feedback: String(body.feedback || "").slice(0, 2000) });
-      return responseJson(response, 202, run);
+      throw requestError("Command Center no longer launches Codex draft workers. Create or link a card, then use Ask Codex and return here.", 410);
     }
     if (mailDraftMatch && request.method === "PATCH") {
       const id = decodeURIComponent(mailDraftMatch[1]);
@@ -3448,8 +3411,7 @@ const server = createServer(async (request, response) => {
         db.prepare("UPDATE meeting_workflows SET state=?,error='',updated_at=? WHERE id=?").run(state, nowIso(), workflow.id);
         return responseJson(response, 200, await meetingWorkflowDetail(workItemId));
       }
-      await launchMeetingProcessing(workflow, event, sourcePath);
-      return responseJson(response, 202, await meetingWorkflowDetail(workItemId));
+      throw requestError("The transcript was found, but Command Center no longer launches a worker. Use Ask Codex and return here on this card.", 409);
     }
     const meetingSuggestionMatch = url.pathname.match(/^\/api\/meeting-workflows\/([^/]+)\/suggestions\/([^/]+)$/);
     if (request.method === "PATCH" && meetingSuggestionMatch) {
@@ -3496,9 +3458,7 @@ const server = createServer(async (request, response) => {
 
     const clickUpCompleteMatch = url.pathname.match(/^\/api\/work-items\/([^/]+)\/complete-clickup$/);
     if (request.method === "POST" && clickUpCompleteMatch) {
-      const item = db.prepare(`SELECT w.*,c.display_name AS company_name FROM work_items w LEFT JOIN companies c ON c.slug=w.company_slug WHERE w.id=?`).get(decodeURIComponent(clickUpCompleteMatch[1]));
-      if (!item) throw new Error("Unknown work item.");
-      return responseJson(response, 202, await launchClickUpCompletion(item));
+      throw requestError("Command Center records approvals and receipts but no longer launches a Codex worker to change ClickUp.", 410);
     }
     const instructionMatch = url.pathname.match(/^\/api\/work-items\/([^/]+)\/instructions$/);
     if (request.method === "POST" && instructionMatch) {
@@ -3663,12 +3623,7 @@ const server = createServer(async (request, response) => {
     }
     const noteCodexEditMatch = url.pathname.match(/^\/api\/notes\/([^/]+)\/codex-edit$/);
     if (request.method === "POST" && noteCodexEditMatch) {
-      const note = db.prepare("SELECT * FROM notes WHERE id=?").get(decodeURIComponent(noteCodexEditMatch[1]));
-      if (!note) throw new Error("Unknown note.");
-      const body = await readJsonBody(request);
-      const instruction = String(body.instruction || "").trim().slice(0,4000);
-      if (!instruction) throw new Error("Tell Codex what to change in this document.");
-      return responseJson(response, 202, await launchNoteEditProposal(note,instruction));
+      throw requestError("Command Center no longer launches note-edit workers. Link the note to a card and use Ask Codex and return here.", 410);
     }
     const noteProposalMatch = url.pathname.match(/^\/api\/notes\/([^/]+)\/proposals\/([^/]+)$/);
     if (request.method === "PATCH" && noteProposalMatch) {
@@ -3729,6 +3684,9 @@ const server = createServer(async (request, response) => {
 
     if (request.method === "GET" && url.pathname === "/api/agent-runs") return responseJson(response, 200, db.prepare("SELECT * FROM agent_runs ORDER BY created_at DESC").all().map(mapRun));
     if (request.method === "POST" && url.pathname === "/api/agent-runs") {
+      throw requestError("This launch endpoint is retired. Prepare an owner-bound assignment from the originating card.", 410);
+    }
+    if (request.method === "LEGACY_DISABLED" && url.pathname === "/api/agent-runs") {
       const body = await readJsonBody(request);
       const item = body.workItemId ? db.prepare(`SELECT w.*,c.display_name AS company_name FROM work_items w LEFT JOIN companies c ON c.slug=w.company_slug WHERE w.id=?`).get(body.workItemId) : null;
       if (body.workItemId && !item) throw new Error("Unknown work item.");
@@ -3756,6 +3714,15 @@ const server = createServer(async (request, response) => {
         if (!mailRefreshPromise) mailRefreshPromise = syncMail().catch(() => null).finally(() => { mailRefreshPromise = null; });
         return responseJson(response, 202, { status: "working" });
       }
+      if (source === "calendar") {
+        if (!calendarRefreshPromise) calendarRefreshPromise = syncCalendar().catch(() => null).finally(() => { calendarRefreshPromise = null; });
+        return responseJson(response, 202, { status: "working" });
+      }
+      throw requestError("This source refresh requires work from its owning native task; Command Center will not launch or poll it.", 410);
+    }
+    if (request.method === "LEGACY_DISABLED" && url.pathname === "/api/source-refresh") {
+      const body = await readJsonBody(request);
+      const source = String(body.source || "");
       if (!sourcePrompts[source]) throw new Error("Unknown source.");
       const active = db.prepare("SELECT * FROM agent_runs WHERE scope='source' AND status IN ('queued','working') AND intent LIKE ? ORDER BY created_at DESC LIMIT 1").get(`%${source}%`);
       if (active) return responseJson(response, 200, mapRun(active));

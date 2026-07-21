@@ -6,6 +6,10 @@ import CalendarWorkspace from "./calendar-workspace";
 import MarkdownEditor from "./markdown-editor";
 import PmAgentWorkspace from "./pm-agent-workspace";
 import ProjectWorkspace from "./project-workspace";
+import CardActionComposer from "./card-action-composer";
+import CardResultPanel from "./card-result-panel";
+import AssignmentReceiptList from "./assignment-receipt-list";
+import { activeAssignmentStatuses, latestActionableAssignment, type Assignment, type CardActionMode } from "./card-workbench-model";
 import { dueDateEndOfLocalDayIso, dueDateInputValue } from "./due-date";
 import { workViewFor, workViews, type WorkView } from "./work-view";
 
@@ -15,6 +19,7 @@ type WorkStatus =
   | "working"
   | "waiting_on_user"
   | "waiting_external"
+  | "needs_attention"
   | "back_for_review"
   | "done"
   | "dismissed"
@@ -135,6 +140,7 @@ type WorkItem = {
   agentRuns: AgentRun[];
   externalActions: Array<{ id: string; provider: string; actionType: string; targetId: string; status: string; receipt: string; error: string; createdAt: string; updatedAt: string }>;
   codexTasks: CodexTaskReceipt[];
+  assignments: Assignment[];
   projectContext: null | {
     projectId: string;
     projectTitle: string;
@@ -234,6 +240,7 @@ const statusMeta: Record<WorkStatus, { label: string; short: string }> = {
   working: { label: "Working", short: "Working" },
   waiting_on_user: { label: "Waiting on Jake", short: "Waiting" },
   waiting_external: { label: "Waiting", short: "Waiting" },
+  needs_attention: { label: "Needs attention", short: "Attention" },
   back_for_review: { label: "Back for review", short: "Returned" },
   done: { label: "Done", short: "Done" },
   dismissed: { label: "Dismissed", short: "Dismissed" },
@@ -268,15 +275,6 @@ async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.error || "The local runner could not complete the request.");
   return payload as T;
-}
-
-function openDeepLink(href: string) {
-  const link = document.createElement("a");
-  link.href = href;
-  link.style.display = "none";
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
 }
 
 function relativeTime(value: string | null) {
@@ -358,6 +356,7 @@ function cardState(item: WorkItem) {
   if (item.status === "error") return { owner: "You", label: "Needs attention" };
   if (item.status === "waiting_on_user") return { owner: "You", label: "Needs input" };
   if (item.status === "waiting_external") return { owner: "Someone else", label: "Waiting" };
+  if (item.status === "needs_attention") return { owner: "You", label: "Check progress" };
   if (item.status === "done") return { owner: "—", label: "Done" };
   if (item.status === "dismissed") return { owner: "—", label: "Not needed" };
   if (item.decisionState === "proposed") return { owner: "You", label: "Needs decision" };
@@ -368,18 +367,6 @@ function requestedOutcome(run: AgentRun) {
   const marker = "Jake's request:";
   const value = run.intent.includes(marker) ? run.intent.split(marker).at(-1) : run.intent;
   return String(value || run.title).trim();
-}
-
-function codexTaskPresentation(task: CodexTaskReceipt) {
-  if (task.status === "waiting_on_user" && !task.threadId) return { label: "Ready to open", detail: "No Codex task is running yet. Open this handoff when you are ready to start the work." };
-  if (task.status === "accepted") return { label: "Accepted", detail: "A verified native Codex task accepted this assignment and is waiting to report that work started." };
-  if (["starting", "working"].includes(task.status)) return { label: "Working", detail: "The native Codex task reports that it is actively working on this assignment." };
-  if (task.status === "needs_input") return { label: "Needs input", detail: task.result || "The native Codex task needs input before it can continue." };
-  if (task.status === "needs_attention") return { label: "Needs attention", detail: task.result || "The linked Codex task has not reported recent progress." };
-  if (task.status === "complete") return { label: "Completed", detail: task.result || "The native Codex task completed this assignment." };
-  if (task.status === "error") return { label: "Failed", detail: task.error || "The native Codex task reported a failure." };
-  if (task.status === "ownership_released") return { label: "Released", detail: task.result || "The native Codex task released this assignment." };
-  return { label: task.status.replaceAll("_", " "), detail: task.result || task.error || "No activity has been reported." };
 }
 
 function sourceName(source: string) {
@@ -411,7 +398,9 @@ export default function Home() {
   const [mobileWorkbenchOpen, setMobileWorkbenchOpen] = useState(false);
   const [quickCapture, setQuickCapture] = useState("");
   const [composer, setComposer] = useState("");
-  const [codexDestination, setCodexDestination] = useState<"card" | "task">("card");
+  const [composerItemId, setComposerItemId] = useState("");
+  const [cardActionMode, setCardActionMode] = useState<CardActionMode>("update");
+  const [revisionOf, setRevisionOf] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [draftItemId, setDraftItemId] = useState("");
   const [notice, setNotice] = useState("");
@@ -571,14 +560,16 @@ export default function Home() {
   const effectiveSelectedId = items.some((item) => item.id === selectedId) ? selectedId : filteredItems[0]?.id || "";
   const selected = items.find((item) => item.id === effectiveSelectedId) || null;
   const selectedWorkingSurface = selected ? workingSurface(selected) : null;
-  const selectedActiveRun = selected?.agentRuns.find((run) => ["queued", "working", "waiting_on_user"].includes(run.status)) || null;
   const selectedLatestResult = selected?.agentRuns.filter((run) => ["review", "error"].includes(run.status)).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0] || null;
-  const selectedPreparedTask = selected?.codexTasks.find((task) => task.status === "waiting_on_user" && !task.threadId) || null;
-  const selectedActiveTask = selected?.codexTasks.find((task) => Boolean(task.threadId) && ["accepted", "starting", "working"].includes(task.status)) || null;
+  const selectedLatestAssignment = selected ? latestActionableAssignment(selected.assignments || []) : null;
+  const selectedActiveAssignment = selected?.assignments.find((assignment) => activeAssignmentStatuses.has(assignment.status)) || null;
   const selectedMeetingId = selected?.type === "meeting_follow_up" ? selected.id : "";
   const activeMeetingWorkflow = meetingWorkflow?.workItemId === selectedMeetingId ? meetingWorkflow : null;
   const visibleDraft = selected && draftItemId === selected.id ? draft : selected?.draft || "";
   const allRuns = items.flatMap((item) => item.agentRuns).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const visibleComposer = selected && composerItemId === selected.id ? composer : "";
+  const visibleCardActionMode = selected && composerItemId === selected.id ? cardActionMode : "update";
+  const visibleRevisionOf = selected && composerItemId === selected.id ? revisionOf : null;
 
   useEffect(() => {
     if (!selectedMeetingId) return;
@@ -749,68 +740,76 @@ export default function Home() {
     finally { setBusy(false); }
   };
 
-  const openCodexTask = async (instructionOverride = "") => {
-    if (!selected) return;
-    setBusy(true);
-    try {
-      const instruction = instructionOverride.trim() || composer.trim() || selected.suggestedAction;
-      const task = await api<{ reused: boolean; deepLink?: string; threadId?: string; status: string }>(`/api/work-items/${encodeURIComponent(selected.id)}/codex-task`, { method: "POST", body: JSON.stringify({ instruction }) });
-      setComposer("");
-      if (task.deepLink) openDeepLink(task.deepLink);
-      else if (task.threadId) await reopenCodexTask(task.threadId);
-      setNotice(task.reused ? `Reopened the existing "${selected.companyName} - ${selected.title}" native Codex handoff.` : `Handed "${selected.companyName} - ${selected.title}" to a native Codex task. Progress returns through its receipt.`);
-      await load(true);
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : "The separate Codex task could not be created.");
-    } finally { setBusy(false); }
-  };
-
-  const reopenCodexTask = async (threadId: string) => {
-    try {
-      await api(`/api/pm-agent/threads/${encodeURIComponent(threadId)}/open`, { method: "POST", body: JSON.stringify({}) });
-      setNotice("Opened the linked Codex task. Continue refining there; its next callback will return the result to this card.");
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : "The linked Codex task could not be opened.");
-    }
-  };
-
   const acceptAction = async () => {
     await patchItem({ decisionState: "accepted", eventDetail: "Jake accepted this recommended action." });
     setNotice("Kept in your action stream. Command Center will continue tracking it.");
   };
 
-  const submitCodexChoice = async () => {
-    if (codexDestination === "task") return openCodexTask();
+  const submitCardAction = async () => {
     if (!selected) return;
-    const instruction = composer.trim() || selected.suggestedAction;
+    const mode = visibleCardActionMode;
+    const instruction = visibleComposer.trim();
     if (!instruction) return;
     setBusy(true);
     try {
-      const command = await api<CardCommandResponse>(`/api/work-items/${encodeURIComponent(selected.id)}/command`, { method: "POST", body: JSON.stringify({ instruction }) });
-      if (command.handled) {
-        setData((current) => current ? { ...current, items: current.items.map((item) => item.id === command.updated.id ? command.updated : item) } : current);
-        setUndoCommandId(command.undoToken || "");
-        setComposer("");
-        if (command.clarification) {
-          setNotice(command.clarification);
+      const response = await api<(CardCommandResponse & { outcome: string }) | { outcome: string; assignment: Assignment; handoffPacket: { prompt: string } | null; reused: boolean }>(`/api/work-items/${encodeURIComponent(selected.id)}/instructions`, {
+        method: "POST",
+        body: JSON.stringify({
+          mode,
+          instruction,
+          revisionOf: visibleRevisionOf,
+          clientRequestId: `${selected.id}:${mode}:${Date.now()}`,
+        }),
+      });
+      if (mode === "update") {
+        const command = response as CardCommandResponse & { outcome: string };
+        if (!command.handled) {
+          setNotice("That does not look like a card update. Choose Ask Codex if you want work prepared.");
           return;
         }
-        if (command.remainingIntent) {
-          await openCodexTask(command.remainingIntent);
-          setNotice(`${command.message} The remaining work was handed to a native Codex task.`);
-        } else {
-          setNotice(command.message);
-        }
+        setData((current) => current ? { ...current, items: current.items.map((item) => item.id === command.updated.id ? command.updated : item) } : current);
+        setUndoCommandId(command.undoToken || "");
+        setNotice(command.clarification || command.message);
       } else {
-        await openCodexTask(instruction);
-        setNotice("This needs real Codex work, so Command Center handed it to a native task linked to this card.");
+        const prepared = response as { outcome: string; assignment: Assignment; handoffPacket: { prompt: string } | null; reused: boolean };
+        setNotice(prepared.reused
+          ? "This exact assignment is already active. Command Center kept the existing owner and did not create a duplicate."
+          : mode === "return_here"
+            ? "Prepared. No task is running yet; copy the handoff packet when you are ready. The result will return to this card."
+            : "Separate task prepared. No task is running yet; copy the handoff packet when you are ready.");
       }
+      setComposer("");
+      setComposerItemId("");
+      setRevisionOf(null);
       await load(true);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "The instruction could not be completed.");
+      setNotice(error instanceof Error ? error.message : "The card action could not be completed.");
     } finally {
       setBusy(false);
     }
+  };
+
+  const copyAssignmentPacket = async (assignment: Assignment) => {
+    setBusy(true);
+    try {
+      const response = await api<{ assignment: Assignment; handoffPacket: { prompt: string } }>(`/api/assignments/${encodeURIComponent(assignment.id)}/packet`, { method: "POST", body: JSON.stringify({}) });
+      await navigator.clipboard.writeText(response.handoffPacket.prompt);
+      setNotice("Handoff packet copied. Paste it into a user-owned Codex task; preparation alone does not start work.");
+      await load(true);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The handoff packet could not be copied.");
+    } finally { setBusy(false); }
+  };
+
+  const cancelAssignment = async (assignment: Assignment) => {
+    setBusy(true);
+    try {
+      await api(`/api/assignments/${encodeURIComponent(assignment.id)}/cancel`, { method: "POST", body: JSON.stringify({}) });
+      setNotice("Cancelled the unowned preparation. No Codex task was stopped because none had accepted it.");
+      await load(true);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The preparation could not be cancelled.");
+    } finally { setBusy(false); }
   };
 
   const undoCardCommand = async () => {
@@ -1004,7 +1003,7 @@ export default function Home() {
           />
         ) : null}
 
-        {view === "mail" ? <MailWorkspace companies={data.companies} selectedMessageId={mailTargetId} onNotice={setNotice} onPromoted={() => void load(true)} /> : null}
+        {view === "mail" ? <MailWorkspace companies={data.companies} selectedMessageId={mailTargetId} onNotice={setNotice} onPromoted={() => void load(true)} onOpenWorkItem={(id) => { setSelectedId(id); setView("inbox"); setMobileWorkbenchOpen(true); }} /> : null}
         {view === "calendar" ? <CalendarWorkspace items={items} onNotice={setNotice} onUpdated={() => void load(true)} /> : null}
         {view === "projects" ? <ProjectWorkspace companyFilter={companyFilter} onNotice={setNotice} onUpdated={() => void load(true)} onOpenWorkItem={(id) => {
           const item = items.find((candidate) => candidate.id === id);
@@ -1145,7 +1144,7 @@ export default function Home() {
 
             <section className="why-card"><span>Why Command Center surfaced this</span><p>{selected.whyNow}</p><small>{Math.round(selected.confidence * 100)}% confidence · {relativeTime(selected.dueAt)}</small>{selected.activeRules.length ? <div className="rule-chips">{selected.activeRules.map((rule) => <span key={rule.id}>{rule.title}</span>)}</div> : null}</section>
 
-            {selectedLatestResult ? <section className={`returned-result returned-${selectedLatestResult.status}`}>
+            {selectedLatestAssignment ? <CardResultPanel assignment={selectedLatestAssignment} formatDate={fullDate} onRevise={(assignment) => { setComposerItemId(selected.id); setCardActionMode("return_here"); setRevisionOf(assignment.id); setComposer("Revise this result with the following feedback: "); }} /> : selectedLatestResult ? <section className={`returned-result returned-${selectedLatestResult.status}`}>
               <div><span>{selectedLatestResult.status === "review" ? "Ready for your review" : "Codex needs attention"}</span><time>{fullDate(selectedLatestResult.updatedAt)}</time></div>
               <h3>{selectedLatestResult.title}</h3>
               <p>{selectedLatestResult.result || selectedLatestResult.error}</p>
@@ -1197,16 +1196,15 @@ export default function Home() {
               {selected.agentRuns.length ? selected.agentRuns.map((run) => <article className={`agent-result agent-${run.status}`} key={run.id}>
                 <div><strong>{run.status === "review" ? "Ready for your review" : run.status === "error" ? "Needs attention" : run.status === "waiting_on_user" ? "Waiting for you" : "Codex is working"}</strong><time>{fullDate(run.updatedAt)}</time></div>
                 {["queued", "working"].includes(run.status) ? <div className="activity-receipt"><p><span>Working on</span>{requestedOutcome(run)}</p><p><span>Using</span>{run.allowedSources.map(sourceName).join(", ") || "card context"}</p><p><span>Returns to</span>This card for your review</p><p><span>External actions</span>None</p><small>Started {relativeTime(run.createdAt)}</small></div> : <p>{run.result || run.error || run.waitingReason || "No result was returned."}</p>}
-                {run.status === "review" ? <button type="button" onClick={() => setComposer("Revise this result: ")}>Revise with feedback</button> : null}
+                {run.status === "review" ? <button type="button" onClick={() => { setComposerItemId(selected.id); setCardActionMode("return_here"); setComposer("Revise this result with the following feedback: "); }}>Revise with feedback</button> : null}
               </article>) : <p className="muted-copy">Codex has not worked on this item yet.</p>}
             </details>
 
-            {selected.codexTasks.length ? <details className="workbench-section" open>
-              <summary>Separate Codex tasks ({selected.codexTasks.length})</summary>
-               {selected.codexTasks.map((task) => {
-                 const presentation = codexTaskPresentation(task);
-                 return <article className={`codex-task-receipt task-${task.status}`} key={task.id}><div><strong>{task.title}</strong><span>{presentation.label}</span></div><p>{presentation.detail}</p>{task.threadId ? <footer><small>Verified native task receipt; Command Center does not control execution</small><button type="button" onClick={() => void reopenCodexTask(task.threadId)}>Open task</button></footer> : task.status === "waiting_on_user" ? <footer><small>Prepared only; no task is running</small><button type="button" onClick={() => void openCodexTask(task.instruction)}>Open in Codex</button></footer> : null}</article>;
-               })}
+            <AssignmentReceiptList assignments={selected.assignments || []} busy={busy} formatDate={fullDate} onCopyPacket={(assignment) => void copyAssignmentPacket(assignment)} onCancel={(assignment) => void cancelAssignment(assignment)} />
+
+            {selected.codexTasks.length ? <details className="workbench-section legacy-receipts">
+              <summary>Legacy task receipts ({selected.codexTasks.length})</summary>
+              {selected.codexTasks.map((task) => <article className="codex-task-receipt" key={task.id}><div><strong>{task.title}</strong><span>{task.status.replaceAll("_", " ")}</span></div><p>{task.result || task.error || task.instruction}</p><small>Historical receipt only. New work uses the owner-bound assignment lifecycle.</small></article>)}
             </details> : null}
 
             {selected.externalActions.length ? <details className="workbench-section" open>
@@ -1229,14 +1227,9 @@ export default function Home() {
               {!['queued','working','done','dismissed'].includes(selected.status) ? <button disabled={busy} type="button" onClick={() => void patchItem({ status: "dismissed", eventDetail: "Jake marked this item as not needed." })}>Not needed</button> : null}
             </div>
 
-            {selectedPreparedTask ? <section className="codex-active-banner codex-ready-banner"><strong>Ready to open in Codex</strong><p>{selectedPreparedTask.instruction}</p><small>This handoff is prepared, but no Codex task is running yet.</small><button type="button" disabled={busy} onClick={() => void openCodexTask(selectedPreparedTask.instruction)}>Open native Codex task</button></section> : null}
-            {selectedActiveRun || selectedActiveTask ? <section className="codex-active-banner"><strong>{selectedActiveRun?.status === "waiting_on_user" ? "Waiting for your input" : selectedActiveTask?.status === "accepted" ? "Accepted by Codex; waiting to start" : "Codex is working on this"}</strong><p>{selectedActiveRun ? selectedActiveRun.waitingReason || requestedOutcome(selectedActiveRun) : selectedActiveTask?.instruction}</p><small>{selectedActiveTask ? "This status comes from a verified native task callback." : "The result will return to this card. No external action will be taken."}</small></section> : null}
-            <form className="codex-composer" onSubmit={(event) => { event.preventDefault(); void submitCodexChoice(); }}>
-              {selected.preparationMode === "auto" ? <p className="auto-prep-note">PM agent: this preparation is ready to delegate. A native Codex task starts only when you open the handoff.</p> : null}
-              <div><span>Change this card or ask Codex to work on it</span><select value={codexDestination} onChange={(event) => setCodexDestination(event.target.value as "card" | "task")} aria-label="Where Codex should work"><option value="card">Smart: update card or open Codex task</option><option value="task">Always open a separate Codex task</option></select></div>
-              <textarea value={composer} onChange={(event) => setComposer(event.target.value)} placeholder="Try: Move this to Friday, set priority high, or draft the follow-up email..." aria-label="Card instruction" />
-              <div className="composer-actions"><button className="open-codex-task" type="submit" disabled={busy}>{codexDestination === "task" ? "Open native Codex task" : "Apply or open"}</button></div>
-            </form>
+            {selectedActiveAssignment ? <section className={`codex-active-banner assignment-${selectedActiveAssignment.status}`}><strong>{selectedActiveAssignment.status === "needs_input" ? "Codex needs your decision" : selectedActiveAssignment.status === "needs_attention" ? "Check the existing Codex owner" : selectedActiveAssignment.status === "accepted" ? "Accepted; waiting to start" : "Codex is working"}</strong><p>{selectedActiveAssignment.result || selectedActiveAssignment.instruction}</p><small>Owner: {selectedActiveAssignment.ownerId || "not yet reported"}. Command Center will not create a replacement task automatically.</small></section> : null}
+            {visibleRevisionOf ? <div className="revision-notice">Revising a returned result. Your feedback will create a linked assignment after you submit.</div> : null}
+            <CardActionComposer mode={visibleCardActionMode} instruction={visibleComposer} busy={busy} onMode={(mode) => { setComposerItemId(selected.id); setCardActionMode(mode); if (mode !== "return_here") setRevisionOf(null); }} onInstruction={(value) => { setComposerItemId(selected.id); setComposer(value); }} onSubmit={() => void submitCardAction()} />
           </>
         ) : (
           <div className="workbench-placeholder"><p className="kicker">WORKBENCH</p><h2>{view === "notes" ? "Write alongside the work" : "Select an action to begin"}</h2><p>Your sources, notes, drafts, approvals, and Codex assignments stay together here.</p></div>
