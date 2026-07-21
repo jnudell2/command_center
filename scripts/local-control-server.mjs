@@ -1,12 +1,18 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
+import { appendFile, copyFile, mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { clearSerentTokenCache, fetchActiveMail, fetchCalendarEvents, fetchMailAttachments, fetchMailBody, htmlToText } from "./graph-mail.mjs";
+import { codexTaskLaunchMode } from "./codex-task-routing.mjs";
+import { isDirectlyAddressedToJake, isLikelyAutomatedMail, normalizedSubject } from "./mail-triage.mjs";
+import { isAllowedTranscriptPath, isEligibleCompletedMeeting, normalizeMeetingAction, safeMeetingName, scoreTranscriptCandidate } from "./meeting-workflow.mjs";
+import { buildPmChatPrompt, buildPmSnapshot, isPmThreadActive } from "./pm-orchestrator.mjs";
+import { classifyProjectPlanItem, parseDependencies, projectExecutionGuidance, projectFollowUpBucket } from "./project-execution.mjs";
+import { parseCardCommand } from "./card-command.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const appRoot = path.resolve(scriptDir, "..");
@@ -21,9 +27,12 @@ const allowedOrigin = "http://localhost:3000";
 const activeProcesses = new Map();
 let mailRefreshPromise = null;
 let calendarRefreshPromise = null;
+let pmRunPromise = null;
+let pmChatPromise = null;
 const localWorkflowsEnabled = process.env.SERENT_TEND_DISABLE_LOCAL_WORKFLOWS !== "1";
 const transcriptRoot = path.join(homedir(), "Projects", "ai-operating-system-transcripts");
 const transcriptInbox = path.join(transcriptRoot, "inbox");
+const downloadsDir = path.join(homedir(), "Downloads");
 const transcriptStageScript = path.resolve(appRoot, "../../../06_workflows/scripts/stage_zoom_transcripts_from_downloads.ps1");
 const transcriptProcessScript = path.resolve(appRoot, "../../../06_workflows/scripts/process_zoom_transcript_inbox.ps1");
 
@@ -66,6 +75,74 @@ const schemaStatements = [
   )`,
   `CREATE UNIQUE INDEX IF NOT EXISTS work_items_source_identity
     ON work_items(source_provider, source_key) WHERE source_key <> ''`,
+  `CREATE TABLE IF NOT EXISTS projects (
+    id TEXT PRIMARY KEY,
+    company_slug TEXT NOT NULL REFERENCES companies(slug),
+    title TEXT NOT NULL,
+    objective TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active',
+    start_date TEXT,
+    target_date TEXT,
+    source_provider TEXT NOT NULL DEFAULT 'box',
+    source_id TEXT NOT NULL DEFAULT '',
+    source_label TEXT NOT NULL DEFAULT '',
+    source_url TEXT NOT NULL DEFAULT '',
+    approved_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS project_phases (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    start_date TEXT,
+    end_date TEXT,
+    status TEXT NOT NULL DEFAULT 'planned',
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS project_milestones (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    scheduled_date TEXT,
+    decision TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'upcoming',
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS project_plan_items (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    phase_id TEXT REFERENCES project_phases(id) ON DELETE SET NULL,
+    workstream TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    owner_label TEXT NOT NULL DEFAULT 'Jake',
+    start_date TEXT,
+    due_date TEXT,
+    status TEXT NOT NULL DEFAULT 'planned',
+    suggested_action TEXT NOT NULL DEFAULT '',
+    why_now TEXT NOT NULL DEFAULT '',
+    priority TEXT NOT NULL DEFAULT 'normal',
+    create_action INTEGER NOT NULL DEFAULT 0,
+    surface_days INTEGER NOT NULL DEFAULT 21,
+    dedupe_terms TEXT NOT NULL DEFAULT '[]',
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS project_action_links (
+    project_plan_item_id TEXT NOT NULL REFERENCES project_plan_items(id) ON DELETE CASCADE,
+    work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    relation TEXT NOT NULL DEFAULT 'executes',
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(project_plan_item_id, work_item_id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS project_plan_due_idx ON project_plan_items(project_id, due_date, status)`,
   `CREATE TABLE IF NOT EXISTS source_references (
     id TEXT PRIMARY KEY,
     work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
@@ -83,6 +160,16 @@ const schemaStatements = [
     event_type TEXT NOT NULL,
     detail TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS card_commands (
+    id TEXT PRIMARY KEY,
+    work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    instruction TEXT NOT NULL,
+    previous_json TEXT NOT NULL,
+    next_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'applied',
+    created_at TEXT NOT NULL,
+    undone_at TEXT
   )`,
   `CREATE TABLE IF NOT EXISTS notes (
     id TEXT PRIMARY KEY,
@@ -202,6 +289,37 @@ const schemaStatements = [
     updated_at TEXT NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS calendar_start_idx ON calendar_events(start_at ASC)`,
+  `CREATE TABLE IF NOT EXISTS meeting_workflows (
+    id TEXT PRIMARY KEY,
+    calendar_event_id TEXT NOT NULL UNIQUE REFERENCES calendar_events(id) ON DELETE CASCADE,
+    work_item_id TEXT NOT NULL UNIQUE REFERENCES work_items(id) ON DELETE CASCADE,
+    state TEXT NOT NULL DEFAULT 'waiting_for_transcript',
+    candidate_path TEXT NOT NULL DEFAULT '',
+    transcript_path TEXT NOT NULL DEFAULT '',
+    note_id TEXT REFERENCES notes(id) ON DELETE SET NULL,
+    agent_run_id TEXT REFERENCES agent_runs(id) ON DELETE SET NULL,
+    error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS meeting_action_suggestions (
+    id TEXT PRIMARY KEY,
+    meeting_workflow_id TEXT NOT NULL REFERENCES meeting_workflows(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    company_slug TEXT REFERENCES companies(slug),
+    type TEXT NOT NULL DEFAULT 'follow_up',
+    priority TEXT NOT NULL DEFAULT 'normal',
+    owner_state TEXT NOT NULL DEFAULT 'jake',
+    suggested_action TEXT NOT NULL DEFAULT '',
+    evidence_timestamp TEXT NOT NULL DEFAULT '',
+    due_at TEXT,
+    existing_work_item_id TEXT REFERENCES work_items(id) ON DELETE SET NULL,
+    decision TEXT NOT NULL DEFAULT 'proposed',
+    created_work_item_id TEXT REFERENCES work_items(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
   `CREATE TABLE IF NOT EXISTS mail_drafts (
     id TEXT PRIMARY KEY,
     mail_message_id TEXT NOT NULL UNIQUE REFERENCES mail_messages(id) ON DELETE CASCADE,
@@ -307,6 +425,68 @@ const schemaStatements = [
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS pm_agent_config (
+    id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL DEFAULT 'observer',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    morning_time TEXT NOT NULL DEFAULT '08:00',
+    pulse_minutes INTEGER NOT NULL DEFAULT 30,
+    max_concurrent INTEGER NOT NULL DEFAULT 2,
+    last_run_at TEXT,
+    last_morning_date TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS pm_runs (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'working',
+    summary TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    thread_count INTEGER NOT NULL DEFAULT 0,
+    recommendation_count INTEGER NOT NULL DEFAULT 0,
+    started_at TEXT NOT NULL,
+    finished_at TEXT
+  )`,
+  `CREATE TABLE IF NOT EXISTS pm_thread_observations (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES pm_runs(id) ON DELETE CASCADE,
+    thread_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    preview TEXT NOT NULL DEFAULT '',
+    thread_status TEXT NOT NULL DEFAULT 'unknown',
+    company_slug TEXT REFERENCES companies(slug),
+    linked_work_item_id TEXT REFERENCES work_items(id) ON DELETE SET NULL,
+    linked_work_item_title TEXT NOT NULL DEFAULT '',
+    match_type TEXT NOT NULL DEFAULT 'unmatched',
+    confidence REAL NOT NULL DEFAULT 0,
+    rationale TEXT NOT NULL DEFAULT '',
+    thread_updated_at TEXT,
+    cwd TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS pm_recommendations (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES pm_runs(id) ON DELETE CASCADE,
+    action TEXT NOT NULL,
+    work_item_id TEXT REFERENCES work_items(id) ON DELETE SET NULL,
+    work_item_title TEXT NOT NULL DEFAULT '',
+    thread_id TEXT,
+    thread_title TEXT NOT NULL DEFAULT '',
+    company_slug TEXT REFERENCES companies(slug),
+    rationale TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'proposed',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS pm_thread_links (
+    thread_id TEXT PRIMARY KEY,
+    work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    title TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'confirmed',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
 ];
 for (const statement of schemaStatements) db.prepare(statement).run();
 
@@ -324,10 +504,49 @@ ensureColumn("notes", "file_path", "TEXT NOT NULL DEFAULT ''");
 ensureColumn("work_items", "decision_state", "TEXT NOT NULL DEFAULT 'proposed'");
 ensureColumn("work_items", "planned_at", "TEXT");
 ensureColumn("work_items", "planned_minutes", "INTEGER NOT NULL DEFAULT 0");
+ensureColumn("work_items", "preparation_mode", "TEXT NOT NULL DEFAULT 'manual'");
+ensureColumn("work_items", "preparation_skill", "TEXT NOT NULL DEFAULT ''");
+ensureColumn("work_items", "preparation_instruction", "TEXT NOT NULL DEFAULT ''");
+ensureColumn("codex_tasks", "last_checked_at", "TEXT");
+ensureColumn("codex_tasks", "resume_attempts", "INTEGER NOT NULL DEFAULT 0");
+ensureColumn("codex_tasks", "heartbeat_at", "TEXT");
+ensureColumn("pm_agent_config", "chat_thread_id", "TEXT NOT NULL DEFAULT ''");
+ensureColumn("pm_agent_config", "chat_status", "TEXT NOT NULL DEFAULT 'not_created'");
+ensureColumn("pm_agent_config", "chat_updated_at", "TEXT");
+ensureColumn("pm_agent_config", "chat_error", "TEXT NOT NULL DEFAULT ''");
 ensureColumn("mail_messages", "reply_override", "TEXT NOT NULL DEFAULT ''");
 ensureColumn("mail_drafts", "origin_mode", "TEXT NOT NULL DEFAULT 'manual'");
+ensureColumn("project_plan_items", "depends_on", "TEXT NOT NULL DEFAULT '[]'");
+ensureColumn("project_plan_items", "execution_mode", "TEXT NOT NULL DEFAULT 'auto'");
+ensureColumn("project_plan_items", "follow_up_days", "INTEGER NOT NULL DEFAULT 3");
 db.prepare("UPDATE work_items SET decision_state='committed' WHERE source_provider='clickup' AND decision_state='proposed'").run();
 db.prepare("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(3,datetime('now'))").run();
+db.prepare("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(4,datetime('now'))").run();
+db.prepare("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(5,datetime('now'))").run();
+db.prepare("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(6,datetime('now'))").run();
+db.prepare("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(7,datetime('now'))").run();
+db.prepare(`INSERT OR IGNORE INTO pm_agent_config(id,mode,enabled,morning_time,pulse_minutes,max_concurrent,created_at,updated_at)
+  VALUES('default','observer',1,'08:00',30,2,datetime('now'),datetime('now'))`).run();
+if (!db.prepare("SELECT version FROM schema_migrations WHERE version=8").get()) {
+  db.prepare("UPDATE pm_agent_config SET mode='autonomous_prep',updated_at=datetime('now') WHERE id='default'").run();
+  db.prepare("INSERT INTO schema_migrations(version,applied_at) VALUES(8,datetime('now'))").run();
+}
+if (!db.prepare("SELECT version FROM schema_migrations WHERE version=9").get()) {
+  db.prepare(`UPDATE work_items SET preparation_mode='auto',preparation_skill='draft-executive-email',
+    preparation_instruction='Draft a concise deal-team update summarizing the completed kickoff deck, confirmed kickoff timing, and immediate next steps. Draft only; do not send.',updated_at=datetime('now')
+    WHERE company_slug='govworx' AND title='Send the GovWorX kickoff update to the deal team' AND preparation_mode='manual'`).run();
+  db.prepare("INSERT INTO schema_migrations(version,applied_at) VALUES(9,datetime('now'))").run();
+}
+if (!db.prepare("SELECT version FROM schema_migrations WHERE version=10").get()) {
+  db.prepare(`UPDATE work_items SET preparation_mode='auto',preparation_skill='draft-executive-email',
+    preparation_instruction='Draft a concise deal-team update summarizing the completed kickoff deck, confirmed kickoff timing, and immediate next steps. Draft only; do not send.',updated_at=datetime('now')
+    WHERE company_slug='govworx' AND lower(title)=lower('Send the GovWorx kickoff update to the deal team') AND preparation_mode='manual'`).run();
+  db.prepare("INSERT INTO schema_migrations(version,applied_at) VALUES(10,datetime('now'))").run();
+}
+if (!db.prepare("SELECT version FROM schema_migrations WHERE version=11").get()) {
+  db.prepare("UPDATE pm_agent_config SET mode='observer',updated_at=datetime('now') WHERE id='default'").run();
+  db.prepare("INSERT INTO schema_migrations(version,applied_at) VALUES(11,datetime('now'))").run();
+}
 
 const nowIso = () => new Date().toISOString();
 const localDateKey = () =>
@@ -337,6 +556,17 @@ const localDateKey = () =>
     month: "2-digit",
     day: "2-digit",
   }).format(new Date());
+
+function defaultPreparationPolicy({ type = "", title = "", suggestedAction = "", preparationMode, preparationSkill, preparationInstruction } = {}) {
+  const normalizedType = String(type).trim().toLowerCase();
+  const explicitMode = ["manual", "auto", "none"].includes(preparationMode) ? preparationMode : "";
+  const autoTypes = new Set(["artifact", "analysis", "deck", "email", "outreach", "meeting_prep", "agenda", "memo", "draft"]);
+  const mode = explicitMode || (autoTypes.has(normalizedType) ? "auto" : "manual");
+  const skill = String(preparationSkill || (/[\s_-]*(email|outreach|reply)/i.test(normalizedType) ? "draft-executive-email" : "")).trim().slice(0, 120);
+  const fallback = String(suggestedAction || title || "Prepare this deliverable for Jake to review.").trim();
+  const instruction = String(preparationInstruction || (mode === "auto" ? `${fallback}\n\nPrepare the deliverable only. Do not send messages or write to shared systems.` : "")).trim().slice(0, 4000);
+  return { mode, skill, instruction };
+}
 
 function seedDatabase() {
   const count = db.prepare("SELECT COUNT(*) AS count FROM companies").get().count;
@@ -436,6 +666,145 @@ function seedDatabase() {
   }
 }
 
+function seedProjectPlans() {
+  const now = nowIso();
+  db.prepare(`INSERT OR IGNORE INTO projects
+    (id,company_slug,title,objective,status,start_date,target_date,source_provider,source_id,source_label,source_url,approved_at,created_at,updated_at)
+    VALUES('stockiq-2026-vci','stockiq','StockIQ 2026 Pricing, Packaging, and Product Marketing VCI',
+    'Improve new-logo conversion and value capture while defining the monetization path for Edison, API/MCP, and StockIQ 2.0.',
+    'active','2026-07-06','2026-09-21','box','2316599730929','StockIQ_2026_P&P_VCI_Kickoff.pptx',
+    'https://app.box.com/file/2316599730929',?,?,?)`).run(now, now, now);
+
+  const phases = [
+    ['stockiq-phase-1','Phase 1 · Internal information gathering','Build the fact base, identify buyer friction, and define viable pricing and packaging concepts.','2026-07-06','2026-08-02','active',1],
+    ['stockiq-phase-2','Phase 2 · Market research','Test pricing and packaging concepts with the market and synthesize willingness-to-pay and usability evidence.','2026-08-03','2026-09-06','planned',2],
+    ['stockiq-phase-3','Phase 3 · Recommendation and implementation','Align on the recommendation, define the pilot, and prepare rollout and enablement.','2026-09-07','2026-09-21','planned',3],
+  ];
+  const insertPhase = db.prepare(`INSERT OR IGNORE INTO project_phases
+    (id,project_id,title,summary,start_date,end_date,status,sort_order,created_at,updated_at)
+    VALUES(?,'stockiq-2026-vci',?,?,?,?,?,?,?,?)`);
+  for (const phase of phases) insertPhase.run(...phase, now, now);
+
+  const milestones = [
+    ['stockiq-kickoff','Kickoff','2026-07-06','Confirm the workplan and scope.','complete',1],
+    ['stockiq-steerco-1','SteerCo 1','2026-08-03','Align on the concepts to test in research.','upcoming',2],
+    ['stockiq-steerco-2','SteerCo 2','2026-09-07','Align on the recommended pricing and packaging direction.','upcoming',3],
+    ['stockiq-steerco-3','SteerCo 3','2026-09-21','Align on the pilot and rollout plan.','upcoming',4],
+  ];
+  const insertMilestone = db.prepare(`INSERT OR IGNORE INTO project_milestones
+    (id,project_id,title,scheduled_date,decision,status,sort_order,created_at,updated_at)
+    VALUES(?,'stockiq-2026-vci',?,?,?,?,?,?,?)`);
+  for (const milestone of milestones) insertMilestone.run(...milestone, now, now);
+
+  const items = [
+    ['stockiq-inputs','stockiq-phase-1','Project kickoff and fact base','Get the outstanding StockIQ data, product demo, credentials, and source access','The initial data request, demo, and access package were expected after kickoff.','StockIQ team','2026-07-06','2026-07-10','blocked','Follow up with Kyle on the missing data request, demo, and required access.','The planned inputs are overdue and block the internal analyses.','high',1,30,['kyle','data request','credential','product demo'],1],
+    ['stockiq-interviews','stockiq-phase-1','Project kickoff and fact base','Schedule internal interviews','Schedule sales, customer success, product, engineering, finance, RevOps, and API/MCP interviews.','Jake + StockIQ team','2026-07-13','2026-07-17','active','Identify the interview owners and put the first working sessions on the calendar.','The kickoff workplan calls for interviews during the current fact-base phase.','high',1,21,['internal interview','working session'],2],
+    ['stockiq-steerco-schedule','stockiq-phase-1','Project governance','Schedule SteerCo 1','Confirm the SteerCo 1 date, audience, and decisions required.','Jake + Kavya','2026-07-13','2026-07-24','active','Coordinate a SteerCo 1 meeting for the week of August 3.','The next decision milestone needs a confirmed audience and calendar date.','high',1,21,['steerco 1','steerco #1'],3],
+    ['stockiq-data-review','stockiq-phase-1','Project kickoff and fact base','Review customer, pricing, funnel, and usage data','Build the customer, pricing, funnel, and product-usage fact base once the requested inputs arrive.','Jake','2026-07-13','2026-07-24','blocked','Begin the fact-base review as each usable data source arrives.','The analysis cannot be completed until StockIQ provides the planned inputs.','normal',0,21,['customer data','funnel data','usage data'],4],
+    ['stockiq-analysis-setup','stockiq-phase-1','Project kickoff and fact base','Prepare the StockIQ analysis workspace','Set up the input checklist, file map, validation checks, and analysis templates so each source can be processed as soon as it arrives.','Jake + Codex','2026-07-14','2026-07-17','active','Create the data-receipt checklist and the sales-friction, outcomes, and product-usage analysis templates.','This work can begin before the remaining StockIQ data arrives and shortens the path from receipt to analysis.','high',1,21,['analysis workspace','data receipt checklist','analysis template'],5],
+    ['stockiq-competitive-proof','stockiq-phase-1','Outcomes pricing and value proof','Reconcile Atomic and Netstock pricing evidence','Resolve the inconsistent Atomic pricing ranges and obtain written support for the current Netstock quote.','Jake + Codex','2026-07-14','2026-07-17','active','Reconcile the Atomic evidence and secure a source-backed Netstock pricing reference.','The competitive evidence can advance now and is needed for the SteerCo 1 concept story.','high',1,21,['atomic pricing','netstock quote','competitive evidence'],6],
+    ['stockiq-product-benchmark','stockiq-phase-1','Product monetization and package concepting','Benchmark StockIQ execution and entitlements','Benchmark scenario speed, data cadence, integration and write-back, Edison jobs, and StockIQ 2.0 entitlements.','Jake + Codex','2026-07-14','2026-07-20','active','Build a source-backed benchmark of the capabilities and entitlement boundaries that matter for packaging.','Product monetization concepts need a clear fact base before SteerCo 1.','high',1,21,['scenario speed','data cadence','write-back','2.0 entitlements'],7],
+    ['stockiq-friction','stockiq-phase-1','Outcomes pricing and value proof','Assess sales friction and no-decision drivers','Analyze closed-lost reasons, funnel stalls, objections, discounts, and exceptions.','Jake','2026-07-20','2026-07-31','planned','Prepare the sales-friction analysis needed to define concepts for SteerCo 1.','SteerCo 1 must decide which concepts are credible enough to test.','normal',1,14,['sales friction','no-decision','closed-lost'],5],
+    ['stockiq-outcomes','stockiq-phase-1','Outcomes pricing and value proof','Identify outcome metrics and ROI proof points','Evaluate measurable customer outcomes and score them for materiality, attribution, auditability, and buyer trust.','Jake','2026-07-20','2026-07-31','planned','Build an outcome-metric feasibility scorecard and select the strongest ROI proof points.','Outcome-linked pricing should not advance without measurable and defensible outcomes.','normal',0,14,['outcome metric','roi proof'],6],
+    ['stockiq-monetization','stockiq-phase-1','Product monetization and package concepting','Review Edison, API/MCP readiness, and cost drivers','Understand target users, access patterns, beta usage, support requirements, and cost drivers.','Jake + StockIQ team','2026-07-20','2026-07-31','planned','Collect and synthesize the product evidence needed for Edison and API/MCP monetization.','The next milestone needs concepts that are commercially and operationally feasible.','normal',0,14,['edison','api/mcp','mcp access'],7],
+    ['stockiq-steerco-story','stockiq-phase-1','Product monetization and package concepting','Build the SteerCo 1 concept story','Turn the competitive evidence and internal fact base into clear concepts to test.','Jake + Codex','2026-07-20','2026-07-31','active','Develop the SteerCo 1 storyline, decision slides, and concepts to take into research.','SteerCo 1 is the next major decision gate in the approved workplan.','high',1,21,['steerco 1 story','competitive perspective','concepts to test'],8],
+    ['stockiq-research-design','stockiq-phase-2','Market validation and concept testing','Finalize the market-validation design','Align the research objectives, audience, method, and final pricing and packaging concepts.','Jake + SteerCo','2026-08-03','2026-08-10','planned','Convert the SteerCo 1 decisions into a fieldable research design.','This begins after SteerCo 1 approves the concepts to test.','normal',1,14,['market validation','research design'],9],
+    ['stockiq-field-research','stockiq-phase-2','Market validation and concept testing','Field market-validation research','Test the approved concepts and capture willingness-to-pay, preference, and sales-usability evidence.','Jake + research team','2026-08-10','2026-08-31','planned','Launch and manage the approved market-validation research.','This is the primary evidence source for the recommended direction.','normal',0,14,['field research','willingness to pay'],10],
+    ['stockiq-recommendation','stockiq-phase-3','Initial answer, pilot design, and rollout','Align on the initial pricing and packaging direction','Synthesize the evidence into a recommended pricing, packaging, and monetization direction.','Jake + SteerCo','2026-08-31','2026-09-07','planned','Prepare the SteerCo 2 recommendation and decision materials.','SteerCo 2 is the recommendation decision gate.','high',1,14,['steerco 2','pricing direction','packaging direction'],11],
+    ['stockiq-pilot','stockiq-phase-3','Initial answer, pilot design, and rollout','Define the pilot and rollout plan','Define eligibility, guardrails, success metrics, enablement, and rollout implications.','Jake + StockIQ team','2026-09-07','2026-09-21','planned','Prepare the pilot design, rollout plan, and final recommendation for SteerCo 3.','The final milestone requires an executable implementation path.','normal',1,14,['pilot design','rollout plan','steerco 3'],12],
+  ];
+  const insertItem = db.prepare(`INSERT OR IGNORE INTO project_plan_items
+    (id,project_id,phase_id,workstream,title,description,owner_label,start_date,due_date,status,suggested_action,why_now,priority,create_action,surface_days,dedupe_terms,sort_order,created_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  for (const item of items) {
+    const values = [...item];
+    values[14] = JSON.stringify(values[14]);
+    insertItem.run(values[0], 'stockiq-2026-vci', ...values.slice(1), now, now);
+  }
+  db.prepare(`UPDATE project_plan_items SET description=?,suggested_action=?,why_now=?,execution_mode='auto',updated_at=? WHERE id='stockiq-inputs'`).run(
+    "Obtain and verify the CRM funnel export, Attention recordings, customer census and billing data, SKU and price book, Planhat or usage export, Edison/API/MCP/2.0 materials, customer outcome data, and Hugo competitive archive.",
+    "Check the complete data-request checklist, identify what is still missing, and follow up with Kyle and Mark on the gaps.",
+    "The input package is overdue and blocks the customer, sales-friction, outcomes, usage, and monetization analyses.",now,
+  );
+  const stockiqSortOrder = ["stockiq-inputs","stockiq-analysis-setup","stockiq-interviews","stockiq-steerco-schedule","stockiq-data-review","stockiq-competitive-proof","stockiq-product-benchmark","stockiq-friction","stockiq-outcomes","stockiq-monetization","stockiq-steerco-story","stockiq-research-design","stockiq-field-research","stockiq-recommendation","stockiq-pilot"];
+  for (const [index,id] of stockiqSortOrder.entries()) db.prepare("UPDATE project_plan_items SET sort_order=? WHERE id=?").run(index+1,id);
+  const stockiqDependencies = {
+    "stockiq-data-review": ["stockiq-inputs"],
+    "stockiq-friction": ["stockiq-data-review"],
+    "stockiq-outcomes": ["stockiq-data-review"],
+    "stockiq-monetization": ["stockiq-inputs"],
+    "stockiq-research-design": ["stockiq-steerco-story"],
+    "stockiq-field-research": ["stockiq-research-design"],
+    "stockiq-recommendation": ["stockiq-field-research"],
+    "stockiq-pilot": ["stockiq-recommendation"],
+  };
+  for (const [id, dependencies] of Object.entries(stockiqDependencies)) {
+    db.prepare("UPDATE project_plan_items SET depends_on=?,execution_mode='auto' WHERE id=?").run(JSON.stringify(dependencies),id);
+  }
+
+  db.prepare(`INSERT OR IGNORE INTO projects
+    (id,company_slug,title,objective,status,start_date,target_date,source_provider,source_id,source_label,source_url,approved_at,created_at,updated_at)
+    VALUES('govworx-2026-vci','govworx','GovWorx 2026 Pricing and Packaging VCI',
+    'Create a future-state packaging architecture, pricing metric and tier recommendations, and a practical implementation roadmap for GovWorx.',
+    'active','2026-07-13','2026-09-18','box','2345257521399','GovWorx_2026_Pricing_Packaging_VCI_Kickoff_v3.pptx',
+    'https://app.box.com/file/2345257521399',?,?,?)`).run(now,now,now);
+
+  const govworxPhases = [
+    ['govworx-phase-a','A · Build the fact base and diagnose the current state','Align the decisions and data needs, collect the evidence, interview the team, and diagnose the current commercial architecture.','2026-07-13','2026-08-09','active',1],
+    ['govworx-phase-b','B · Develop and align on future-state options','Set design principles and compare packaging architectures, upgrade paths, pricing metrics, tiers, and bands.','2026-07-27','2026-08-09','planned',2],
+    ['govworx-phase-c','C · Validate and refine the preferred direction','Validate the preferred direction with targeted customers and prospects, then pressure-test the implications.','2026-08-10','2026-09-06','planned',3],
+    ['govworx-phase-d','D · Finalize recommendation and implementation priorities','Finalize the architecture, metrics, tiers, upgrade paths, migration priorities, and enablement plan.','2026-09-07','2026-09-18','planned',4],
+  ];
+  const insertGovworxPhase = db.prepare(`INSERT OR IGNORE INTO project_phases
+    (id,project_id,title,summary,start_date,end_date,status,sort_order,created_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?)`);
+  for (const phase of govworxPhases) insertGovworxPhase.run(phase[0],'govworx-2026-vci',...phase.slice(1),now,now);
+
+  const govworxMilestones = [
+    ['govworx-kickoff','govworx-2026-vci','Kickoff','2026-07-17','Confirm the scope, decisions, and data needs.','upcoming',1],
+    ['govworx-steerco-1','govworx-2026-vci','SteerCo 1','2026-08-10','Choose the preferred direction and validation scope.','upcoming',2],
+    ['govworx-steerco-2','govworx-2026-vci','SteerCo 2','2026-09-14','Align on the final recommendation and implementation priorities.','upcoming',3],
+  ];
+  const insertGovworxMilestone = db.prepare(`INSERT OR IGNORE INTO project_milestones
+    (id,project_id,title,scheduled_date,decision,status,sort_order,created_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?)`);
+  for (const milestone of govworxMilestones) insertGovworxMilestone.run(...milestone,now,now);
+
+  const govworxItems = [
+    ['govworx-kickoff-deck','govworx-2026-vci','govworx-phase-a','Project kickoff','Finalize the kickoff plan and deck','Review the v3 kickoff deck, confirm the final scope, decision owner, data owner, attendees, and timeline-driving milestone.','Jake','2026-07-13','2026-07-17','active','Review the v3 plan with the final attendee names, owners, scope, and timeline before kickoff.','The kickoff decision gate is this week and establishes the operating baseline for the VCI.','high',1,21,['kickoff deck','kickoff plan'],1],
+    ['govworx-kickoff-meeting','govworx-2026-vci','govworx-phase-a','Project kickoff','Schedule and hold the GovWorx kickoff','Coordinate the kickoff with Kevin, Scott, Kavya, and the required working-team leaders.','Jake + GovWorx','2026-07-13','2026-07-17','active','Reply to Kevin with the kickoff timing once the deck is ready, then schedule the meeting.','The workplan begins with a kickoff decision gate during the current week.','high',1,21,['kickoff meeting','schedule a govworx kickoff','schedule govworx kickoff'],2],
+    ['govworx-product-demo','govworx-2026-vci','govworx-phase-a','Build the fact base and diagnose the current state','Obtain the GovWorx product demo','Receive a live product demo or an existing recording covering the current and upcoming product set.','GovWorx','2026-07-13','2026-07-17','active','Ask Kevin to provide or schedule the product demo before the fact-base analysis begins.','The product map and future-state architecture depend on understanding the actual workflows and dependencies.','normal',1,21,['product demo','demo recording'],3],
+    ['govworx-interview-roster','govworx-2026-vci','govworx-phase-a','Build the fact base and diagnose the current state','Confirm the working team and interview roster','Confirm the product and sales leads plus the names and availability of the leaders to interview.','GovWorx','2026-07-13','2026-07-17','active','Get the interview roster and availability from Kevin and schedule the first sessions.','The deck still contains placeholders for the product and sales leads.','high',1,21,['leaders to interview','interview roster','product lead','sales lead'],4],
+    ['govworx-data-request','govworx-2026-vci','govworx-phase-a','Build the fact base and diagnose the current state','Collect the initial GovWorx data request','Collect customer ARR, packages, contracted pricing, volume, deals, usage, contracts, quotes, cost-to-serve, outcomes, and competitive evidence.','GovWorx','2026-07-20','2026-07-24','planned','Send or confirm the data request with Kevin and track unavailable inputs explicitly.','The fact base and pricing architecture cannot be completed without customer-level commercial and usage evidence.','high',1,21,['requested data','data request','customer-level arr','pricing support'],5],
+    ['govworx-interviews','govworx-2026-vci','govworx-phase-a','Build the fact base and diagnose the current state','Conduct management interviews','Assess sales, quoting, product, implementation, and expansion workflows with the working team.','Jake','2026-07-20','2026-07-31','planned','Conduct the prioritized interviews and capture decisions, friction points, and source gaps.','Interview evidence is needed before setting the future-state design principles.','normal',1,14,['management interview','working team interview'],6],
+    ['govworx-current-map','govworx-2026-vci','govworx-phase-a','Build the fact base and diagnose the current state','Map the current product and commercial architecture','Map CommsCoach, TRAIN, ASSIST, HIRE, CAPTURE, PRR, Research, Media Index, Flock, and MedAssist across packages, metrics, tiers, prices, and roadmap roles.','Jake + Codex','2026-07-20','2026-08-03','planned','Build the current-state product, package, metric, tier, and roadmap map from the received evidence.','The design work needs a shared current-state architecture and explicit product roles.','high',1,21,['product map','package map','commercial architecture'],7],
+    ['govworx-price-realization','govworx-2026-vci','govworx-phase-a','Build the fact base and diagnose the current state','Analyze price realization and customer patterns','Reconcile commercial, initiative, grant, channel, contracted, and standard prices and analyze customer and usage patterns.','Jake + Codex','2026-07-27','2026-08-07','planned','Compare list, quoted, and contracted pricing and identify discounts, exceptions, band cliffs, and common product combinations.','The preferred architecture should address observed leakage and buying behavior rather than theory alone.','normal',0,14,['price realization','contracted pricing','pricing reconciliation'],8],
+    ['govworx-future-options','govworx-2026-vci','govworx-phase-b','Develop and align on future-state options','Develop future-state packaging and pricing options','Create and compare two to three architectures covering core packages, add-ons, upgrade paths, pricing metrics, tiers, and bands.','Jake + Codex','2026-07-27','2026-08-07','planned','Develop the SteerCo 1 option set and decision materials using the fact base and relevant market analogies.','SteerCo 1 must select the preferred direction and validation scope.','high',1,21,['future-state options','packaging architecture','steerco 1'],9],
+    ['govworx-validation-design','govworx-2026-vci','govworx-phase-c','Validate and refine the preferred direction','Finalize the validation design','Confirm the research questions, concepts, participants, method, and timing after SteerCo 1.','Jake + SteerCo','2026-08-10','2026-08-14','planned','Translate the SteerCo 1 decision into a targeted customer and prospect validation plan.','The deck expects a three-to-four-week validation period whose exact scope is set at SteerCo 1.','normal',1,14,['validation design','research questions','validation scope'],10],
+    ['govworx-field-validation','govworx-2026-vci','govworx-phase-c','Validate and refine the preferred direction','Conduct customer and prospect validation','Test the preferred architecture, pricing logic, and upgrade paths with the agreed customers and prospects.','Jake + research team','2026-08-17','2026-09-04','planned','Run the targeted validation and synthesize buying, usability, and willingness-to-pay evidence.','Validation is the primary external pressure test before the final recommendation.','normal',0,14,['customer validation','prospect validation'],11],
+    ['govworx-final-recommendation','govworx-2026-vci','govworx-phase-d','Finalize recommendation and implementation priorities','Finalize the recommendation and implementation priorities','Finalize the architecture, metric, tiers, upgrade paths, rollout priorities, migration approach, and enablement needs.','Jake + SteerCo','2026-09-07','2026-09-14','planned','Prepare the SteerCo 2 recommendation and implementation-priority decision materials.','SteerCo 2 is the final decision gate in the approved VCI plan.','high',1,14,['steerco 2','final recommendation','implementation priorities'],12],
+  ];
+  const insertGovworxItem = db.prepare(`INSERT OR IGNORE INTO project_plan_items
+    (id,project_id,phase_id,workstream,title,description,owner_label,start_date,due_date,status,suggested_action,why_now,priority,create_action,surface_days,dedupe_terms,sort_order,created_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  for (const item of govworxItems) {
+    const values = [...item];
+    values[15] = JSON.stringify(values[15]);
+    insertGovworxItem.run(...values,now,now);
+  }
+  const govworxDependencies = {
+    "govworx-current-map": ["govworx-product-demo"],
+    "govworx-price-realization": ["govworx-data-request"],
+    "govworx-future-options": ["govworx-current-map", "govworx-price-realization"],
+    "govworx-validation-design": ["govworx-future-options"],
+    "govworx-field-validation": ["govworx-validation-design"],
+    "govworx-final-recommendation": ["govworx-field-validation"],
+  };
+  for (const [id, dependencies] of Object.entries(govworxDependencies)) {
+    db.prepare("UPDATE project_plan_items SET depends_on=?,execution_mode='auto' WHERE id=?").run(JSON.stringify(dependencies),id);
+  }
+}
+
 async function importLegacyReceipts() {
   try {
     const entries = await readdir(legacyJobsDir, { withFileTypes: true });
@@ -460,6 +829,9 @@ async function importLegacyReceipts() {
 }
 
 seedDatabase();
+db.prepare(`INSERT OR IGNORE INTO companies(slug,display_name,description,ai_os_path,box_folder,active,created_at,updated_at)
+  VALUES('edulog','Edulog','Pricing, quoting tools, and ongoing VCI work','04_company_context/edulog.md','Growth Team / 32. Pricing / 00 Projects',1,?,?)`).run(nowIso(),nowIso());
+seedProjectPlans();
 await importLegacyReceipts();
 
 function seedAdaptiveSystem() {
@@ -489,6 +861,19 @@ seedAdaptiveSystem();
 db.prepare("UPDATE companies SET ai_os_path='05_projects/stockiq-packaging-product-marketing-vci.md',updated_at=? WHERE slug='stockiq'").run(nowIso());
 await persistAllNotes();
 
+function repairPreparedCodexTaskStates() {
+  const prepared = db.prepare(`SELECT t.id AS task_id,t.work_item_id,w.status
+    FROM codex_tasks t JOIN work_items w ON w.id=t.work_item_id
+    WHERE t.status='waiting_on_user' AND t.thread_id='' AND w.status IN ('queued','working')`).all();
+  const repairedAt = nowIso();
+  for (const receipt of prepared) {
+    const hasPriorResult = db.prepare("SELECT 1 FROM agent_runs WHERE work_item_id=? AND status IN ('review','error') LIMIT 1").get(receipt.work_item_id);
+    const restoredStatus = hasPriorResult ? "back_for_review" : "to_review";
+    db.prepare("UPDATE work_items SET status=?,updated_at=? WHERE id=?").run(restoredStatus, repairedAt, receipt.work_item_id);
+    eventFor(receipt.work_item_id, "codex_task_state_repaired", "The prepared native Codex task has not started. This card remains in Open Work until a verified task reports that it started.");
+  }
+}
+
 function recoverInterruptedRuns() {
   const interrupted = db.prepare("SELECT * FROM agent_runs WHERE status IN ('queued','working')").all();
   const now = nowIso();
@@ -514,7 +899,26 @@ function recoverInterruptedRuns() {
   }
 }
 
+repairPreparedCodexTaskStates();
 recoverInterruptedRuns();
+
+function repairMisroutedTranscriptRuns() {
+  const candidates = db.prepare(`SELECT r.id,r.work_item_id,w.type,w.title,w.source_provider
+    FROM agent_runs r
+    JOIN work_items w ON w.id=r.work_item_id
+    WHERE r.skill_id='zoom-transcript-router' AND r.status='waiting_on_user'`).all();
+  const repairedAt = nowIso();
+  for (const candidate of candidates) {
+    if (resolveSkillRoute({ item: candidate }).id === "zoom-transcript-router") continue;
+    const detail = "This card was incorrectly routed to transcript processing. No transcript is required for this assignment.";
+    db.prepare("UPDATE agent_runs SET status='error',error=?,updated_at=? WHERE id=?").run(detail, repairedAt, candidate.id);
+    const stillActive = db.prepare("SELECT 1 FROM agent_runs WHERE work_item_id=? AND id<>? AND status IN ('queued','working','waiting_on_user') LIMIT 1").get(candidate.work_item_id, candidate.id);
+    if (!stillActive) db.prepare("UPDATE work_items SET status='back_for_review',updated_at=? WHERE id=?").run(repairedAt, candidate.work_item_id);
+    eventFor(candidate.work_item_id, "skill_route_repaired", detail);
+  }
+}
+
+repairMisroutedTranscriptRuns();
 
 function responseJson(response, status, payload) {
   response.writeHead(status, {
@@ -542,6 +946,24 @@ async function readJsonBody(request) {
 function eventFor(workItemId, eventType, detail) {
   db.prepare(`INSERT INTO work_item_events(id, work_item_id, event_type, detail, created_at)
     VALUES (?, ?, ?, ?, ?)`).run(randomUUID(), workItemId, eventType, detail || "", nowIso());
+}
+
+const cardCommandFields = ["title", "due_at", "priority", "company_slug", "status", "resolution", "resolved_at"];
+
+function cardCommandSnapshot(row, fields = cardCommandFields) {
+  return Object.fromEntries(fields.map((field) => [field, row[field] ?? null]));
+}
+
+function applyCardCommandPatch(workItemId, patch) {
+  const entries = Object.entries(patch).filter(([field]) => cardCommandFields.includes(field));
+  if (!entries.length) return;
+  const assignments = entries.map(([field]) => `${field}=?`).join(",");
+  db.prepare(`UPDATE work_items SET ${assignments},updated_at=? WHERE id=?`).run(...entries.map(([, value]) => value), nowIso(), workItemId);
+}
+
+function workItemById(id) {
+  const row = db.prepare(`SELECT w.*,c.display_name AS company_name FROM work_items w LEFT JOIN companies c ON c.slug=w.company_slug WHERE w.id=?`).get(id);
+  return row ? hydrateWorkItem(row) : null;
 }
 
 function safeSegment(value, fallback = "note") {
@@ -681,6 +1103,21 @@ function recordFeedback({ eventType, workItemId = null, mailMessageId = null, co
   return id;
 }
 
+function proposeCompanyRoutingRule(mail, companySlug) {
+  if (!mail?.sender_email || !companySlug) return null;
+  const company = db.prepare("SELECT display_name FROM companies WHERE slug=? AND active=1").get(companySlug);
+  if (!company) return null;
+  const senderEmail = String(mail.sender_email).toLowerCase();
+  const duplicate = db.prepare("SELECT id FROM preference_rules WHERE category='company_routing' AND status IN ('proposed','accepted') AND evidence_json LIKE ? AND evidence_json LIKE ? LIMIT 1")
+    .get(`%${senderEmail.replaceAll("%", "")}%`, `%${companySlug.replaceAll("%", "")}%`);
+  if (duplicate) return duplicate.id;
+  const id = randomUUID(); const now = nowIso();
+  db.prepare(`INSERT INTO preference_rules(id,title,rationale,instruction,scope_type,scope_value,category,status,evidence_json,created_at,updated_at)
+    VALUES(?,?,?,?, 'source','outlook','company_routing','proposed',?,?,?)`)
+    .run(id, `Route ${mail.sender_name || senderEmail} mail to ${company.display_name}`, `Jake corrected the company on “${mail.subject}.”`, `When Outlook mail is from ${senderEmail}, assign it to ${company.display_name}.`, JSON.stringify([{ senderEmail, companySlug, mailMessageId: mail.id }]), now, now);
+  return id;
+}
+
 function mailNotes(mailMessageId, companySlug) {
   const linked = db.prepare(`SELECT n.* FROM notes n JOIN mail_note_links l ON l.note_id=n.id WHERE l.mail_message_id=?`).all(mailMessageId);
   const contextual = companySlug ? db.prepare("SELECT * FROM notes WHERE company_slug=? AND type IN ('project','decision') ORDER BY updated_at DESC LIMIT 12").all(companySlug) : [];
@@ -763,6 +1200,22 @@ function hydrateWorkItem(row) {
     id: task.id, threadId: task.thread_id, title: task.title, instruction: task.instruction,
     status: task.status, result: task.result, error: task.error, createdAt: task.created_at, updatedAt: task.updated_at,
   }));
+  const projectContextRow = db.prepare(`SELECT p.id AS project_id,p.title AS project_title,pi.id AS plan_item_id,
+      pi.title AS plan_item_title,pi.workstream,pi.due_date,ph.title AS phase_title
+    FROM project_action_links l
+    JOIN project_plan_items pi ON pi.id=l.project_plan_item_id
+    JOIN projects p ON p.id=pi.project_id
+    LEFT JOIN project_phases ph ON ph.id=pi.phase_id
+    WHERE l.work_item_id=? ORDER BY pi.due_date LIMIT 1`).get(row.id);
+  const projectContext = projectContextRow ? {
+    projectId: projectContextRow.project_id,
+    projectTitle: projectContextRow.project_title,
+    planItemId: projectContextRow.plan_item_id,
+    planItemTitle: projectContextRow.plan_item_title,
+    workstream: projectContextRow.workstream,
+    phaseTitle: projectContextRow.phase_title || "",
+    dueDate: projectContextRow.due_date,
+  } : null;
   const rules = activeRules({ companySlug: row.company_slug, source: row.source_provider, workType: row.type });
   return {
     id: row.id,
@@ -781,6 +1234,9 @@ function hydrateWorkItem(row) {
     dueAt: row.due_at,
     plannedAt: row.planned_at || null,
     plannedMinutes: Number(row.planned_minutes || 0),
+    preparationMode: row.preparation_mode || "manual",
+    preparationSkill: row.preparation_skill || "",
+    preparationInstruction: row.preparation_instruction || "",
     resolution: row.resolution,
     decisionState: row.decision_state || (row.source_provider === "clickup" ? "committed" : "proposed"),
     createdAt: row.created_at,
@@ -792,6 +1248,7 @@ function hydrateWorkItem(row) {
     agentRuns: runs,
     externalActions,
     codexTasks,
+    projectContext,
     activeRules: rules,
   };
 }
@@ -834,10 +1291,6 @@ function queryWorkItems(filters = {}) {
   return rows.map(hydrateWorkItem);
 }
 
-function normalizedSubject(value) {
-  return String(value || "").toLowerCase().replace(/^\s*((re|fw|fwd):\s*)+/i, "").replace(/\s+/g, " ").trim();
-}
-
 function addresses(recipients) {
   return (Array.isArray(recipients) ? recipients : []).map((item) => ({
     name: item?.emailAddress?.name || "",
@@ -847,31 +1300,44 @@ function addresses(recipients) {
 
 function inferCompany(message) {
   const haystack = `${message.subject || ""} ${message.bodyPreview || ""} ${message.from?.emailAddress?.address || ""}`.toLowerCase();
+  const senderEmail = String(message.from?.emailAddress?.address || "").toLowerCase();
+  if (senderEmail) {
+    const rules = db.prepare("SELECT evidence_json FROM preference_rules WHERE status='accepted' AND category='company_routing' ORDER BY updated_at DESC").all();
+    for (const rule of rules) {
+      try {
+        const evidence = JSON.parse(rule.evidence_json || "[]");
+        const match = evidence.find((item) => String(item.senderEmail || "").toLowerCase() === senderEmail && db.prepare("SELECT slug FROM companies WHERE slug=? AND active=1").get(item.companySlug));
+        if (match) return match.companySlug;
+      } catch { /* Ignore malformed rule evidence. */ }
+    }
+  }
   const candidates = [
     ["avionte", ["aviont", "avionte"]],
     ["stockiq", ["stockiq", "stock iq"]],
     ["govworx", ["govworx"]],
+    ["edulog", ["edulog"]],
   ];
   return candidates.find(([, keys]) => keys.some((key) => haystack.includes(key)))?.[0] || null;
 }
 
-function classifyMail(message, sentByConversation, sentBySubject, companySlug = null) {
+function classifyMail(message, sentByConversation, sentBySubject, companySlug = null, directRecipientRuleEnabled = false) {
   const subject = String(message.subject || "");
   const preview = String(message.bodyPreview || "");
   const text = `${subject}\n${preview}`.toLowerCase();
   const inboundAt = Date.parse(message.receivedDateTime || 0);
   const laterSent = Math.max(sentByConversation.get(message.conversationId) || 0, sentBySubject.get(normalizedSubject(subject)) || 0);
-  const automatic = /newsletter|unsubscribe|no[- ]?reply|notification|alert|digest|calendar|invitation|accepted:|declined:|out of office|automatic reply|do not reply|webinar|survey|event feedback|challenge results|sent a message in teams|see how .* delivers|demo session|placeholder:|gold star/.test(text);
+  const automatic = isLikelyAutomatedMail(message);
   const question = /could you|can you|would you|please (review|send|confirm|share|let|advise)|let me know|your thoughts|your feedback|need your|are you able|when can|do you have|your reaction|please opine|please respond/.test(text);
+  const directlyAddressed = directRecipientRuleEnabled && isDirectlyAddressedToJake(message);
   const blocking = /urgent|today|tomorrow|deadline|blocked|need (this|your|an answer)|waiting on|approval|sign[- ]?off|decision/.test(text);
   const responded = laterSent > inboundAt;
-  const needsReply = !automatic && question && !responded;
+  const needsReply = !automatic && (question || directlyAddressed) && !responded;
   const ageHours = Math.max(0, (Date.now() - inboundAt) / 3_600_000);
-  const confidence = responded ? 0.98 : needsReply ? Math.min(0.96, 0.72 + (blocking ? 0.14 : 0) + (message.importance === "high" ? 0.08 : 0)) : automatic ? 0.95 : 0.67;
+  const confidence = responded ? 0.98 : needsReply ? Math.min(0.96, (directlyAddressed ? 0.86 : 0.72) + (blocking ? 0.08 : 0) + (message.importance === "high" ? 0.06 : 0)) : automatic ? 0.95 : 0.67;
   const reason = responded
     ? "A later message from Jake appears in Sent Items on this conversation or subject."
     : needsReply
-      ? `${question ? "The message asks Jake for a response or decision." : "The message appears actionable."}${blocking ? " Timing or dependency language raises its urgency." : ""}`
+      ? `${directlyAddressed ? "The message is addressed directly to Jake." : "The message asks Jake for a response or decision."}${blocking ? " Timing or dependency language raises its urgency." : ""}`
       : automatic
         ? "The message looks automated or informational."
         : "No clear response request was detected.";
@@ -975,9 +1441,10 @@ async function syncMail() {
        reply_state=CASE WHEN mail_messages.reply_override<>'' THEN mail_messages.reply_override ELSE excluded.reply_state END,
       reply_confidence=excluded.reply_confidence,reply_reason=excluded.reply_reason,freshness='live',last_synced_at=excluded.last_synced_at,updated_at=excluded.updated_at`);
     const draftCandidates = [];
+    const directRecipientRuleEnabled = Boolean(db.prepare("SELECT id FROM preference_rules WHERE status='accepted' AND category='mail_direct_recipient' LIMIT 1").get());
     for (const message of payload.inbox) {
       const companySlug = inferCompany(message);
-      const classification = classifyMail(message, sentByConversation, sentBySubject, companySlug);
+      const classification = classifyMail(message, sentByConversation, sentBySubject, companySlug, directRecipientRuleEnabled);
       const existing = db.prepare("SELECT id FROM mail_messages WHERE graph_id=?").get(message.id);
       const id = existing?.id || randomUUID();
       const now = nowIso();
@@ -1055,6 +1522,7 @@ async function syncCalendar() {
       upsert.run(id,event.id,String(event.subject||"(No title)").slice(0,500),startAt,endAt,isAllDay?1:0,String(event.organizer?.name||""),String(event.organizer?.email||""),JSON.stringify(event.attendees||[]),String(event.location?.display_name||event.location?.address||""),String(event.web_link||""),now,now,now);
     }
     db.prepare("UPDATE calendar_events SET freshness='cached' WHERE last_synced_at < ?").run(started);
+    ensureCompletedMeetingCards();
     db.prepare("UPDATE source_receipts SET status='ready',checked_at=?,detail=?,result=?,error='' WHERE source='calendar'").run(now,`${events.length} calendar events synchronized for the next 14 days.`,JSON.stringify({events:events.length,startIso,endIso}));
     return { status: "ready", events: events.length };
   } catch (error) {
@@ -1071,11 +1539,131 @@ function queryCalendar(filters = {}) {
   return db.prepare("SELECT * FROM calendar_events WHERE freshness='live' AND end_at>? AND start_at<? ORDER BY start_at").all(start,end).map(mapCalendarEvent);
 }
 
+function meetingCompany(subject = "") {
+  const value = String(subject).toLowerCase();
+  const aliases = [
+    ["avionte", ["avionte"]],
+    ["stockiq", ["stockiq", "stock iq"]],
+    ["govworx", ["govworx", "gov works", "govworks"]],
+  ];
+  return aliases.find(([, terms]) => terms.some((term) => value.includes(term)))?.[0] || "firm";
+}
+
+function existingMeetingNoteFor(event) {
+  const ignored = new Set(["meeting", "notes", "follow", "with", "team", "session", "pricing", "packaging", "weekly", "planning", "jake"]);
+  const tokens = [...new Set(String(event.subject || "").toLowerCase().split(/[^a-z0-9]+/).filter((token) => token.length >= 4 && !ignored.has(token)))];
+  if (tokens.length < 2) return null;
+  const earliest = new Date(Date.parse(event.start_at) - 2 * 60 * 60 * 1000).toISOString();
+  const rows = db.prepare("SELECT * FROM notes WHERE type='meeting' AND created_at>=? ORDER BY created_at DESC LIMIT 30").all(earliest);
+  const scored = rows.map((note) => {
+    const text = `${note.title} ${note.body.slice(0, 1000)}`.toLowerCase();
+    return { note, score: tokens.filter((token) => text.includes(token)).length };
+  }).sort((a,b) => b.score - a.score);
+  return scored[0]?.score >= 2 ? scored[0].note : null;
+}
+
+function ensureCompletedMeetingCards() {
+  const rows = db.prepare("SELECT * FROM calendar_events WHERE freshness='live' AND end_at <= ? AND end_at >= ? ORDER BY end_at DESC")
+    .all(nowIso(), new Date(Date.now() - 8 * 60 * 60 * 1000).toISOString());
+  let created = 0;
+  for (const event of rows) {
+    const mapped = mapCalendarEvent(event);
+    if (!isEligibleCompletedMeeting(mapped, { nowMs: Date.now(), graceMs: 10 * 60_000, lookbackMs: 8 * 60 * 60_000 })) continue;
+    const existingWorkflow = db.prepare("SELECT * FROM meeting_workflows WHERE calendar_event_id=?").get(event.id);
+    if (existingWorkflow) {
+      if (["waiting_for_transcript", "candidate_review"].includes(existingWorkflow.state)) {
+        const existingNote = existingMeetingNoteFor(event);
+        if (existingWorkflow.note_id && existingWorkflow.note_id !== existingNote?.id) db.prepare("DELETE FROM note_links WHERE note_id=? AND work_item_id=?").run(existingWorkflow.note_id, existingWorkflow.work_item_id);
+        if (existingWorkflow.note_id !== (existingNote?.id || null)) db.prepare("UPDATE meeting_workflows SET note_id=?,updated_at=? WHERE id=?").run(existingNote?.id || null, nowIso(), existingWorkflow.id);
+        if (existingNote) {
+          db.prepare("INSERT OR IGNORE INTO note_links(note_id,work_item_id) VALUES(?,?)").run(existingNote.id, existingWorkflow.work_item_id);
+          db.prepare("UPDATE work_items SET summary='The meeting note is already saved. Process the transcript to extract reviewable follow-up actions.',suggested_action='Process the transcript, then review the proposed follow-ups.',updated_at=? WHERE id=?").run(nowIso(), existingWorkflow.work_item_id);
+        } else {
+          db.prepare("UPDATE work_items SET summary='Turn the completed meeting into a durable note and reviewable follow-up actions.',suggested_action='Download the transcript, then click Process transcript.',updated_at=? WHERE id=?").run(nowIso(), existingWorkflow.work_item_id);
+        }
+      }
+      continue;
+    }
+    const now = nowIso();
+    const workflowId = randomUUID();
+    const workItemId = randomUUID();
+    const companySlug = meetingCompany(event.subject);
+    const existingNote = existingMeetingNoteFor(event);
+    db.prepare(`INSERT INTO work_items(id,type,company_slug,title,summary,why_now,priority,confidence,status,suggested_action,owner,due_at,source_provider,source_key,decision_state,created_at,updated_at)
+      VALUES(?, 'meeting_follow_up', ?, ?, ?, ?, 'normal', 0.98, 'waiting_on_user', ?, 'Jake', ?, 'calendar', ?, 'accepted', ?, ?)`)
+      .run(workItemId, companySlug, `Process transcript: ${event.subject}`.slice(0, 240), `Turn the completed meeting into a durable note and reviewable follow-up actions.`, `The meeting ended ${relativeMeetingTime(event.end_at)}. Command Center is waiting for your downloaded transcript before it does anything.`, `Download the transcript, then click Process transcript.`, event.end_at, `post-meeting:${event.graph_id}`, now, now);
+    db.prepare(`INSERT INTO source_references(id,work_item_id,provider,label,source_id,source_url,retrieved_at,freshness)
+      VALUES(?,?, 'calendar', ?, ?, ?, ?, ?)`)
+      .run(randomUUID(), workItemId, event.subject, event.graph_id, event.web_link, event.last_synced_at || now, event.freshness);
+    db.prepare(`INSERT INTO meeting_workflows(id,calendar_event_id,work_item_id,state,note_id,created_at,updated_at)
+      VALUES(?,?,?,'waiting_for_transcript',?,?,?)`).run(workflowId, event.id, workItemId, existingNote?.id || null, now, now);
+    if (existingNote) {
+      db.prepare("INSERT OR IGNORE INTO note_links(note_id,work_item_id) VALUES(?,?)").run(existingNote.id, workItemId);
+      db.prepare("UPDATE work_items SET summary='The meeting note is already saved. Process the transcript to extract reviewable follow-up actions.',suggested_action='Process the transcript, then review the proposed follow-ups.',updated_at=? WHERE id=?").run(now, workItemId);
+    }
+    eventFor(workItemId, "meeting_finished", "The meeting ended. Download the transcript when it is available, then process it from this card.");
+    created += 1;
+  }
+  return created;
+}
+
+function relativeMeetingTime(value) {
+  const minutes = Math.max(0, Math.round((Date.now() - Date.parse(value)) / 60000));
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? "" : "s"} ago`;
+  const hours = Math.round(minutes / 60);
+  return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+}
+
+function mapMeetingSuggestion(row) {
+  return {
+    id: row.id, title: row.title, summary: row.summary, companySlug: row.company_slug,
+    type: row.type, priority: row.priority, ownerState: row.owner_state,
+    suggestedAction: row.suggested_action, evidenceTimestamp: row.evidence_timestamp,
+    dueAt: row.due_at, existingWorkItemId: row.existing_work_item_id,
+    decision: row.decision, createdWorkItemId: row.created_work_item_id,
+  };
+}
+
+async function transcriptCandidatesFor(event) {
+  const candidates = [];
+  for (const root of [downloadsDir, transcriptInbox]) {
+    let entries = [];
+    try { entries = await readdir(root, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      if (!entry.isFile() || !/\.(vtt|srt|txt)$/i.test(entry.name)) continue;
+      const filePath = path.join(root, entry.name);
+      const details = await stat(filePath).catch(() => null);
+      if (!details) continue;
+      const match = scoreTranscriptCandidate({ name: entry.name, mtimeMs: details.mtimeMs }, mapCalendarEvent(event));
+      if (match.score < 8) continue;
+      candidates.push({ path: filePath, name: entry.name, modifiedAt: details.mtime.toISOString(), size: details.size, score: match.score, reasons: match.reasons });
+    }
+  }
+  return candidates.sort((a, b) => b.score - a.score || Date.parse(b.modifiedAt) - Date.parse(a.modifiedAt)).slice(0, 8);
+}
+
+async function meetingWorkflowDetail(workItemId) {
+  const row = db.prepare(`SELECT mw.*, ce.graph_id,ce.subject,ce.start_at,ce.end_at,ce.organizer_name,ce.organizer_email,ce.attendees_json,ce.location,ce.web_link,
+      n.title AS note_title,n.file_path AS note_file_path
+    FROM meeting_workflows mw JOIN calendar_events ce ON ce.id=mw.calendar_event_id
+    LEFT JOIN notes n ON n.id=mw.note_id WHERE mw.work_item_id=?`).get(workItemId);
+  if (!row) return null;
+  const event = { id: row.calendar_event_id, graph_id: row.graph_id, subject: row.subject, start_at: row.start_at, end_at: row.end_at, organizer_name: row.organizer_name, organizer_email: row.organizer_email, attendees_json: row.attendees_json, location: row.location, web_link: row.web_link, freshness: "live", last_synced_at: row.updated_at, is_all_day: 0 };
+  return {
+    id: row.id, workItemId: row.work_item_id, state: row.state, candidatePath: row.candidate_path,
+    transcriptPath: row.transcript_path, noteId: row.note_id, noteTitle: row.note_title || "",
+    noteFilePath: row.note_file_path || "", agentRunId: row.agent_run_id, error: row.error,
+    event: mapCalendarEvent(event), candidates: await transcriptCandidatesFor(event),
+    suggestions: db.prepare("SELECT * FROM meeting_action_suggestions WHERE meeting_workflow_id=? ORDER BY created_at,id").all(row.id).map(mapMeetingSuggestion),
+    createdAt: row.created_at, updatedAt: row.updated_at,
+  };
+}
+
 function queryMail(filters = {}) {
   const clauses = ["1=1"];
   const params = [];
   const view = filters.view || "needs_reply";
-  if (view === "needs_reply") clauses.push("m.freshness='live' AND m.reply_state='needs_reply' AND (m.snoozed_until IS NULL OR datetime(m.snoozed_until) <= datetime('now'))");
+  if (view === "needs_reply") clauses.push("m.freshness='live' AND m.reply_state='needs_reply' AND m.review_state='unreviewed' AND (m.snoozed_until IS NULL OR datetime(m.snoozed_until) <= datetime('now'))");
   if (view === "unread") clauses.push("m.freshness='live' AND m.is_read=0");
   if (view === "drafts") clauses.push("d.id IS NOT NULL");
   if (view === "snoozed") clauses.push("datetime(m.snoozed_until) > datetime('now')");
@@ -1105,6 +1693,193 @@ async function mailDetail(id) {
   return mapMail(row, true);
 }
 
+function projectDateAtEndOfDay(value) {
+  return value ? new Date(`${value}T17:00:00-07:00`).toISOString() : null;
+}
+
+function projectHealth(projectId) {
+  const today = localDateKey();
+  const rows = db.prepare("SELECT status,due_date FROM project_plan_items WHERE project_id=?").all(projectId);
+  const incomplete = rows.filter((item) => item.status !== "complete");
+  const blocked = incomplete.filter((item) => item.status === "blocked").length;
+  const overdue = incomplete.filter((item) => item.due_date && item.due_date < today).length;
+  if (blocked || overdue) {
+    const parts = [];
+    if (overdue) parts.push(`${overdue} overdue plan ${overdue === 1 ? "item" : "items"}`);
+    if (blocked) parts.push(`${blocked} blocked`);
+    return { status: "at_risk", label: "At risk", reason: `${parts.join(" and ")} need attention.` };
+  }
+  const next = db.prepare("SELECT * FROM project_milestones WHERE project_id=? AND status!='complete' ORDER BY scheduled_date LIMIT 1").get(projectId);
+  if (!next) return { status: "complete", label: "Complete", reason: "All planned milestones are complete." };
+  return { status: "on_track", label: "On track", reason: `The next decision gate is ${next.title} on ${next.scheduled_date}.` };
+}
+
+function findExistingPlanAction(planItem, project, relation = "executes") {
+  const linked = db.prepare(`SELECT w.* FROM project_action_links l JOIN work_items w ON w.id=l.work_item_id
+    WHERE l.project_plan_item_id=? AND l.relation=? ORDER BY w.updated_at DESC LIMIT 1`).get(planItem.id,relation);
+  if (linked) return linked;
+  if (relation !== "executes") return null;
+  let terms = [];
+  try { terms = JSON.parse(planItem.dedupe_terms || "[]"); } catch { terms = []; }
+  if (!terms.length) return null;
+  const candidates = db.prepare(`SELECT * FROM work_items WHERE company_slug=? AND status NOT IN ('dismissed')
+    AND source_key NOT LIKE 'project-plan:%' ORDER BY updated_at DESC`).all(project.company_slug);
+  return candidates.find((item) => {
+    const text = `${item.title}\n${item.summary}\n${item.suggested_action}`.toLowerCase();
+    return terms.some((term) => text.includes(String(term).toLowerCase()));
+  }) || null;
+}
+
+function linkPlanAction(planItem, project, item, detail, relation = "executes") {
+  const now = nowIso();
+  db.prepare("INSERT OR IGNORE INTO project_action_links(project_plan_item_id,work_item_id,relation,created_at) VALUES(?,?,?,?)").run(planItem.id,item.id,relation,now);
+  db.prepare(`INSERT OR IGNORE INTO source_references(id,work_item_id,provider,label,source_id,source_path,source_url,retrieved_at,freshness)
+    SELECT ?,?,'project_plan',?,?, '',?,?, 'cached'
+    WHERE NOT EXISTS (SELECT 1 FROM source_references WHERE work_item_id=? AND provider='project_plan' AND source_id=?)`)
+    .run(randomUUID(),item.id,`${project.title} workplan`,planItem.id,project.source_url,now,item.id,planItem.id);
+  eventFor(item.id,"project_plan_linked",detail);
+}
+
+function approvedPlanPreparation(planItem, project, execution) {
+  const enabled = Boolean(project.approved_at) && planItem.execution_mode !== "manual" && execution.state === "do_now" && /codex/i.test(planItem.owner_label || "");
+  const instruction = `${planItem.suggested_action || `Prepare ${planItem.title} for Jake to review.`}\n\nDefinition of done: ${planItem.description || planItem.title}. Use the approved project plan and linked local sources. Produce review-ready local work only. Do not send messages or write to shared systems.`.slice(0,4000);
+  return { enabled, instruction, skill: "generic-codex" };
+}
+
+function createPlanExecutionAction(planItem, project, execution) {
+  const id = randomUUID();
+  const now = nowIso();
+  const waiting = execution.state === "waiting";
+  const status = waiting ? execution.ownerState === "external" ? "waiting_external" : "waiting_on_user" : "to_review";
+  const owner = execution.ownerState === "external" ? "External" : planItem.owner_label;
+  const preparation = approvedPlanPreparation(planItem,project,execution);
+  db.prepare(`INSERT INTO work_items
+    (id,type,company_slug,title,summary,why_now,priority,confidence,status,suggested_action,owner,due_at,source_provider,source_key,decision_state,preparation_mode,preparation_skill,preparation_instruction,created_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(id,waiting ? "project_input" : "project_action",project.company_slug,planItem.title,planItem.description,planItem.why_now || execution.reason,planItem.priority,0.95,status,planItem.suggested_action,owner,projectDateAtEndOfDay(planItem.due_date),"project_plan",`project-plan:${planItem.id}`,waiting || preparation.enabled ? "accepted" : "proposed",preparation.enabled ? "auto" : "manual",preparation.enabled ? preparation.skill : "",preparation.enabled ? preparation.instruction : "",now,now);
+  linkPlanAction(planItem,project,{ id },`Surfaced by the execution engine: ${execution.reason}`);
+  return db.prepare("SELECT * FROM work_items WHERE id=?").get(id);
+}
+
+function ensureProjectFollowUp(planItem, project, today) {
+  const bucket = projectFollowUpBucket(planItem,today);
+  if (bucket === null) return null;
+  const canonical = findExistingPlanAction(planItem,project,"executes");
+  if (canonical) return canonical;
+  const sourceKey = `project-follow-up:${planItem.id}`;
+  let item = db.prepare(`SELECT * FROM work_items WHERE source_provider='project_plan'
+    AND (source_key=? OR source_key LIKE ?) ORDER BY updated_at DESC LIMIT 1`).get(sourceKey,`${sourceKey}:%`);
+  if (item) return item;
+  const id = randomUUID();
+  const now = nowIso();
+  db.prepare(`INSERT INTO work_items
+    (id,type,company_slug,title,summary,why_now,priority,confidence,status,suggested_action,owner,due_at,source_provider,source_key,decision_state,created_at,updated_at)
+    VALUES(?,'project_follow_up',?,?,?,?,?,0.98,'to_review',?,'Jake',?,'project_plan',?,'proposed',?,?)`)
+    .run(id,project.company_slug,`Follow up: ${planItem.title}`,`The project is still waiting on ${planItem.owner_label}.`,`${planItem.title} was due ${planItem.due_date} and still blocks the approved plan.`,planItem.priority === "low" ? "normal" : planItem.priority,planItem.suggested_action || `Follow up with ${planItem.owner_label}.`,projectDateAtEndOfDay(today),sourceKey,now,now);
+  linkPlanAction(planItem,project,{ id },`Created a dated follow-up because the external input is still outstanding.`,"follow_up");
+  return db.prepare("SELECT * FROM work_items WHERE id=?").get(id);
+}
+
+function reconcileProject(projectId) {
+  const project = db.prepare("SELECT * FROM projects WHERE id=? AND status='active'").get(projectId);
+  if (!project) return null;
+  const today = localDateKey();
+  const planItems = db.prepare("SELECT * FROM project_plan_items WHERE project_id=? ORDER BY sort_order").all(projectId);
+  for (const planItem of planItems) {
+    const execution = classifyProjectPlanItem(planItem,planItems,today);
+    let linked = findExistingPlanAction(planItem,project,"executes");
+    if (linked && !db.prepare("SELECT 1 FROM project_action_links WHERE project_plan_item_id=? AND work_item_id=?").get(planItem.id,linked.id)) {
+      linkPlanAction(planItem,project,linked,`Linked to ${project.title}: ${planItem.title}.`);
+    }
+    if (linked?.status === "done" && planItem.status !== "complete") {
+      db.prepare("UPDATE project_plan_items SET status='complete',updated_at=? WHERE id=?").run(nowIso(),planItem.id);
+      continue;
+    }
+    if (planItem.status === "complete") {
+      const linkedActions = db.prepare(`SELECT w.* FROM project_action_links l JOIN work_items w ON w.id=l.work_item_id WHERE l.project_plan_item_id=?`).all(planItem.id);
+      for (const linkedAction of linkedActions) if (!["done","dismissed"].includes(linkedAction.status)) {
+        const now = nowIso();
+        db.prepare("UPDATE work_items SET status='done',resolution=?,resolved_at=?,updated_at=? WHERE id=?")
+          .run(`Completed through the ${project.title} project plan.`,now,now,linkedAction.id);
+        eventFor(linkedAction.id,"project_plan_complete",`Marked complete from the project plan: ${planItem.title}.`);
+      }
+      continue;
+    }
+    if (["do_now","waiting"].includes(execution.state) && !linked) linked = createPlanExecutionAction(planItem,project,execution);
+    if (linked && !linked.due_at && planItem.due_date) db.prepare("UPDATE work_items SET due_at=?,updated_at=? WHERE id=?").run(projectDateAtEndOfDay(planItem.due_date),nowIso(),linked.id);
+    const preparation = approvedPlanPreparation(planItem,project,execution);
+    if (linked && preparation.enabled && linked.source_provider === "project_plan" && !["done","dismissed","working","queued"].includes(linked.status) && (linked.decision_state !== "accepted" || linked.preparation_mode !== "auto")) {
+      db.prepare("UPDATE work_items SET decision_state='accepted',preparation_mode='auto',preparation_skill=?,preparation_instruction=?,updated_at=? WHERE id=?").run(preparation.skill,preparation.instruction,nowIso(),linked.id);
+      eventFor(linked.id,"pm_autonomy_enabled",`Approved project-plan preparation can start automatically: ${planItem.title}.`);
+      linked = db.prepare("SELECT * FROM work_items WHERE id=?").get(linked.id);
+    }
+    if (linked && execution.state === "waiting" && execution.ownerState === "external" && linked.source_provider === "project_plan" && linked.status === "to_review" && linked.decision_state === "proposed") {
+      db.prepare("UPDATE work_items SET status='waiting_external',decision_state='accepted',owner='External',updated_at=? WHERE id=?").run(nowIso(),linked.id);
+      eventFor(linked.id,"waiting_external",`Waiting on ${planItem.owner_label} according to the approved project plan.`);
+    }
+    ensureProjectFollowUp(planItem,project,today);
+  }
+  return projectDetail(projectId,{ reconcile: false });
+}
+
+function projectDetail(projectId, options = {}) {
+  if (options.reconcile !== false) reconcileProject(projectId);
+  const project = db.prepare(`SELECT p.*,c.display_name AS company_name FROM projects p JOIN companies c ON c.slug=p.company_slug WHERE p.id=?`).get(projectId);
+  if (!project) return null;
+  const phases = db.prepare("SELECT * FROM project_phases WHERE project_id=? ORDER BY sort_order").all(projectId).map((phase) => ({
+    id: phase.id, title: phase.title, summary: phase.summary, startDate: phase.start_date, endDate: phase.end_date, status: phase.status,
+  }));
+  const milestones = db.prepare("SELECT * FROM project_milestones WHERE project_id=? ORDER BY sort_order").all(projectId).map((milestone) => ({
+    id: milestone.id, title: milestone.title, scheduledDate: milestone.scheduled_date, decision: milestone.decision, status: milestone.status,
+  }));
+  const rawPlanItems = db.prepare(`SELECT pi.*,ph.title AS phase_title FROM project_plan_items pi
+    LEFT JOIN project_phases ph ON ph.id=pi.phase_id WHERE pi.project_id=? ORDER BY pi.sort_order`).all(projectId);
+  const executionGuide = projectExecutionGuidance(rawPlanItems,localDateKey());
+  const links = db.prepare(`SELECT l.project_plan_item_id,l.relation,w.id,w.status,w.decision_state,w.updated_at
+    FROM project_action_links l JOIN work_items w ON w.id=l.work_item_id
+    JOIN project_plan_items pi ON pi.id=l.project_plan_item_id WHERE pi.project_id=? ORDER BY w.updated_at DESC`).all(projectId);
+  const planItems = executionGuide.items.map((item) => {
+    const itemLinks = links.filter((link) => link.project_plan_item_id === item.id);
+    const executionAction = itemLinks.find((link) => link.relation === "executes") || null;
+    const linkedFollowUp = itemLinks.find((link) => link.relation === "follow_up" && !["done","dismissed"].includes(link.status)) || null;
+    const followUpAction = linkedFollowUp || (projectFollowUpBucket(item,localDateKey()) !== null && executionAction && !["done","dismissed"].includes(executionAction.status) ? executionAction : null);
+    return {
+      id: item.id, phaseId: item.phase_id, phaseTitle: item.phase_title || "", workstream: item.workstream, title: item.title,
+      description: item.description, owner: item.owner_label, startDate: item.start_date, dueDate: item.due_date, status: item.status,
+      suggestedAction: item.suggested_action, whyNow: item.why_now, priority: item.priority, dependsOn: parseDependencies(item.depends_on),
+      executionState: item.execution.state, executionReason: item.execution.reason, ownerState: item.execution.ownerState,
+      blockedBy: item.execution.blockedBy, daysUntilDue: item.execution.daysUntilDue,
+      workItemId: executionAction?.id || null, workItemStatus: executionAction?.status || null, workItemDecision: executionAction?.decision_state || null,
+      followUpWorkItemId: followUpAction?.id || null,
+    };
+  });
+  const activePhase = phases.find((phase) => phase.status === "active") || phases.find((phase) => phase.status !== "complete") || null;
+  const nextMilestone = milestones.find((milestone) => milestone.status !== "complete") || null;
+  const completed = planItems.filter((item) => item.status === "complete").length;
+  const doNow = planItems.filter((item) => item.executionState === "do_now");
+  for (const waitingItem of planItems.filter((item) => item.executionState === "waiting" && item.followUpWorkItemId)) {
+    doNow.push({ ...waitingItem, guidanceKind: "follow_up", title: `Follow up: ${waitingItem.title}`, executionReason: `${waitingItem.title} is still outstanding and now needs a follow-up.`, workItemId: waitingItem.followUpWorkItemId });
+  }
+  const waiting = planItems.filter((item) => item.executionState === "waiting");
+  const upNext = planItems.filter((item) => item.executionState === "up_next").sort((a,b) => String(a.startDate || a.dueDate || "9999").localeCompare(String(b.startDate || b.dueDate || "9999")));
+  return {
+    id: project.id, companySlug: project.company_slug, companyName: project.company_name, title: project.title, objective: project.objective,
+    status: project.status, startDate: project.start_date, targetDate: project.target_date, source: { provider: project.source_provider, id: project.source_id, label: project.source_label, url: project.source_url },
+    approvedAt: project.approved_at, health: projectHealth(project.id), activePhase, nextMilestone, phases, milestones, planItems,
+    progress: { completed, total: planItems.length, percent: planItems.length ? Math.round((completed / planItems.length) * 100) : 0 },
+    guidance: { doNow, waiting, upNext },
+    stayAhead: [...doNow,...waiting].filter((item,index,array) => item.workItemId && array.findIndex((candidate) => candidate.id === item.id && candidate.workItemId === item.workItemId) === index),
+  };
+}
+
+function queryProjects() {
+  return db.prepare("SELECT id FROM projects WHERE status!='archived' ORDER BY target_date").all().map((row) => projectDetail(row.id));
+}
+
+function reconcileAllProjects() {
+  for (const row of db.prepare("SELECT id FROM projects WHERE status='active'").all()) reconcileProject(row.id);
+}
+
 function sourceReceipts() {
   return db.prepare("SELECT * FROM source_receipts ORDER BY source").all().map((row) => ({
     source: row.source,
@@ -1117,6 +1892,7 @@ function sourceReceipts() {
 }
 
 function bootstrapPayload(filters = {}) {
+  ensureCompletedMeetingCards();
   const companies = db.prepare("SELECT * FROM companies WHERE active = 1 ORDER BY display_name").all().map(mapCompany);
   const items = queryWorkItems(filters);
   const counts = Object.fromEntries(
@@ -1127,7 +1903,7 @@ function bootstrapPayload(filters = {}) {
   );
   const mailCounts = {
     all: db.prepare("SELECT COUNT(*) AS count FROM mail_messages").get().count,
-    needs_reply: db.prepare("SELECT COUNT(*) AS count FROM mail_messages WHERE freshness='live' AND reply_state='needs_reply' AND (snoozed_until IS NULL OR datetime(snoozed_until) <= datetime('now'))").get().count,
+    needs_reply: db.prepare("SELECT COUNT(*) AS count FROM mail_messages WHERE freshness='live' AND reply_state='needs_reply' AND review_state='unreviewed' AND (snoozed_until IS NULL OR datetime(snoozed_until) <= datetime('now'))").get().count,
     unread: db.prepare("SELECT COUNT(*) AS count FROM mail_messages WHERE freshness='live' AND is_read=0").get().count,
     drafts: db.prepare("SELECT COUNT(*) AS count FROM mail_drafts").get().count,
     snoozed: db.prepare("SELECT COUNT(*) AS count FROM mail_messages WHERE datetime(snoozed_until) > datetime('now')").get().count,
@@ -1165,6 +1941,10 @@ const sourcePrompts = {
 function sourceOutputContract(source) {
   const existingKeys = db.prepare("SELECT source_key FROM work_items WHERE source_provider=? AND status NOT IN ('done','dismissed') AND source_key<>'' LIMIT 100").all(source).map((row) => row.source_key);
   const reconciliation = existingKeys.length ? ` Re-check these currently active local source keys and return any that are now complete or no longer active with resolutionState=resolved: ${existingKeys.join(", ")}.` : "";
+  if (source === "box") {
+    const registeredProjects = db.prepare("SELECT company_slug,title,source_id,source_label FROM projects WHERE status='active' AND source_provider='box'").all();
+    return `${sourcePrompts[source]} Registered active project baselines: ${JSON.stringify(registeredProjects)}. For an approved kickoff deck or workplan that is new or materially changed, compile it through an execution lens. Preserve every meaningful deliverable, input, analysis, decision gate, and owner; break broad rows into concrete leaf actions; infer dependencies; and distinguish Jake-owned work from external inputs. Return one JSON object only: {"summary":"coverage note","items":[{"sourceKey":"stable source id","resolutionState":"active|resolved","companySlug":"known company slug or null","type":"decision|follow_up|research|artifact","title":"action title","summary":"what changed","whyNow":"why it matters","priority":"urgent|high|normal|low","confidence":0.0,"suggestedAction":"next action","sourceLabel":"evidence label","sourceUrl":"Box link"}],"projects":[{"approved":true,"sourceId":"Box file id","sourceLabel":"file name","sourceUrl":"Box link","companySlug":"known company slug","projectKey":"stable short key","title":"project title","objective":"outcome","startDate":"YYYY-MM-DD","targetDate":"YYYY-MM-DD","phases":[{"sourceKey":"stable phase key","title":"phase","summary":"purpose","startDate":"YYYY-MM-DD","endDate":"YYYY-MM-DD","status":"planned|active|complete"}],"milestones":[{"sourceKey":"stable milestone key","title":"decision gate","scheduledDate":"YYYY-MM-DD","decision":"decision required","status":"upcoming|complete"}],"planItems":[{"sourceKey":"stable item key","phaseKey":"phase key","workstream":"workstream","title":"one concrete executable step","description":"definition of done or required output","owner":"Jake, Jake + Codex, or named external owner","startDate":"YYYY-MM-DD","dueDate":"YYYY-MM-DD","status":"planned|active|blocked|complete","suggestedAction":"literal next move","whyNow":"dependency or deadline reason","priority":"high|normal|low","dependsOn":["other item source keys"],"surfaceDays":21,"followUpDays":3}]}]}. Only include projects when the underlying plan is approved and source-backed. Read only; do not alter Box.`;
+  }
   return `${sourcePrompts[source]}${reconciliation} Return one JSON object only with this shape: {"summary":"coverage note","items":[{"sourceKey":"stable source id","resolutionState":"active|resolved","companySlug":"one of avionte, stockiq, govworx, firm or null","type":"email|meeting|task|decision|follow_up|research|artifact","title":"short action-oriented title","summary":"what happened","whyNow":"why it matters now","priority":"urgent|high|normal|low","confidence":0.0,"suggestedAction":"next action","sourceLabel":"human-readable evidence","sourcePath":"optional local path","sourceUrl":"optional source link"}]}. Use an empty items array when nothing consequential changed. Read only. Do not send, create, update, move, or delete anything.`;
 }
 
@@ -1226,6 +2006,66 @@ function upsertNormalizedItems(source, payload) {
   return changed;
 }
 
+function sourceDate(value) {
+  const next = String(value || "").slice(0,10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(next) ? next : null;
+}
+
+function upsertSourceProjects(source, payload) {
+  if (source !== "box" || !Array.isArray(payload?.projects)) return 0;
+  let changed = 0;
+  for (const incoming of payload.projects.slice(0,10)) {
+    if (incoming?.approved !== true || !incoming.sourceId || !incoming.companySlug || !incoming.title || !Array.isArray(incoming.planItems)) continue;
+    const company = db.prepare("SELECT slug FROM companies WHERE slug=?").get(String(incoming.companySlug));
+    if (!company) continue;
+    const sourceId = String(incoming.sourceId).slice(0,240);
+    const existing = db.prepare("SELECT * FROM projects WHERE source_provider=? AND source_id=?").get(source,sourceId);
+    const projectId = existing?.id || `${safeSegment(incoming.companySlug)}-${safeSegment(incoming.projectKey || sourceId)}-project`;
+    const now = nowIso();
+    if (existing) {
+      db.prepare(`UPDATE projects SET company_slug=?,title=?,objective=?,start_date=?,target_date=?,source_label=?,source_url=?,updated_at=? WHERE id=?`)
+        .run(company.slug,String(incoming.title).slice(0,240),String(incoming.objective || "").slice(0,2000),sourceDate(incoming.startDate),sourceDate(incoming.targetDate),String(incoming.sourceLabel || incoming.title).slice(0,500),String(incoming.sourceUrl || `https://app.box.com/file/${sourceId}`).slice(0,1000),now,projectId);
+    } else {
+      db.prepare(`INSERT INTO projects(id,company_slug,title,objective,status,start_date,target_date,source_provider,source_id,source_label,source_url,approved_at,created_at,updated_at)
+        VALUES(?,?,?,?,'active',?,?,?,?,?,?,?, ?,?)`).run(projectId,company.slug,String(incoming.title).slice(0,240),String(incoming.objective || "").slice(0,2000),sourceDate(incoming.startDate),sourceDate(incoming.targetDate),source,sourceId,String(incoming.sourceLabel || incoming.title).slice(0,500),String(incoming.sourceUrl || `https://app.box.com/file/${sourceId}`).slice(0,1000),now,now,now);
+    }
+
+    const phaseIds = new Map();
+    for (const [index,phase] of (incoming.phases || []).slice(0,30).entries()) {
+      if (!phase?.title) continue;
+      const key = safeSegment(phase.sourceKey || phase.title,`phase-${index+1}`);
+      const id = `${projectId}-${key}`;
+      phaseIds.set(String(phase.sourceKey || phase.title),id);
+      db.prepare(`INSERT INTO project_phases(id,project_id,title,summary,start_date,end_date,status,sort_order,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,summary=excluded.summary,start_date=excluded.start_date,end_date=excluded.end_date,status=CASE WHEN project_phases.status='complete' THEN 'complete' ELSE excluded.status END,sort_order=excluded.sort_order,updated_at=excluded.updated_at`)
+        .run(id,projectId,String(phase.title).slice(0,240),String(phase.summary || "").slice(0,1600),sourceDate(phase.startDate),sourceDate(phase.endDate),["planned","active","complete"].includes(phase.status) ? phase.status : "planned",index+1,now,now);
+    }
+    for (const [index,milestone] of (incoming.milestones || []).slice(0,30).entries()) {
+      if (!milestone?.title) continue;
+      const id = `${projectId}-${safeSegment(milestone.sourceKey || milestone.title,`milestone-${index+1}`)}`;
+      db.prepare(`INSERT INTO project_milestones(id,project_id,title,scheduled_date,decision,status,sort_order,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,scheduled_date=excluded.scheduled_date,decision=excluded.decision,status=CASE WHEN project_milestones.status='complete' THEN 'complete' ELSE excluded.status END,sort_order=excluded.sort_order,updated_at=excluded.updated_at`)
+        .run(id,projectId,String(milestone.title).slice(0,240),sourceDate(milestone.scheduledDate),String(milestone.decision || "").slice(0,1600),milestone.status === "complete" ? "complete" : "upcoming",index+1,now,now);
+    }
+    const itemIds = new Map((incoming.planItems || []).slice(0,100).map((item,index) => [String(item.sourceKey || item.title),`${projectId}-${safeSegment(item.sourceKey || item.title,`item-${index+1}`)}`]));
+    for (const [index,item] of incoming.planItems.slice(0,100).entries()) {
+      if (!item?.title) continue;
+      const itemKey = String(item.sourceKey || item.title);
+      const id = itemIds.get(itemKey);
+      const dependencies = Array.isArray(item.dependsOn) ? item.dependsOn.map((dependency) => itemIds.get(String(dependency))).filter(Boolean) : [];
+      const phaseId = phaseIds.get(String(item.phaseKey || "")) || null;
+      const status = ["planned","active","blocked","complete"].includes(item.status) ? item.status : "planned";
+      db.prepare(`INSERT INTO project_plan_items(id,project_id,phase_id,workstream,title,description,owner_label,start_date,due_date,status,suggested_action,why_now,priority,create_action,surface_days,dedupe_terms,sort_order,created_at,updated_at,depends_on,execution_mode,follow_up_days)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,'[]',?,?,?,?, 'auto',?)
+        ON CONFLICT(id) DO UPDATE SET phase_id=excluded.phase_id,workstream=excluded.workstream,title=excluded.title,description=excluded.description,owner_label=excluded.owner_label,start_date=excluded.start_date,due_date=excluded.due_date,status=CASE WHEN project_plan_items.status='complete' THEN 'complete' ELSE excluded.status END,suggested_action=excluded.suggested_action,why_now=excluded.why_now,priority=excluded.priority,surface_days=excluded.surface_days,sort_order=excluded.sort_order,depends_on=excluded.depends_on,execution_mode='auto',follow_up_days=excluded.follow_up_days,updated_at=excluded.updated_at`)
+        .run(id,projectId,phaseId,String(item.workstream || "Project execution").slice(0,240),String(item.title).slice(0,240),String(item.description || "").slice(0,2400),String(item.owner || "Jake").slice(0,240),sourceDate(item.startDate),sourceDate(item.dueDate),status,String(item.suggestedAction || `Begin ${item.title}.`).slice(0,1600),String(item.whyNow || "Required by the approved project plan.").slice(0,1600),["high","normal","low"].includes(item.priority) ? item.priority : "normal",Math.max(1,Number(item.surfaceDays || 21)),index+1,now,now,JSON.stringify(dependencies),Math.max(1,Number(item.followUpDays || 3)));
+    }
+    changed += 1;
+  }
+  if (changed) reconcileAllProjects();
+  return changed;
+}
+
 function routeById(id) {
   return db.prepare("SELECT * FROM skill_routes WHERE id=? AND enabled=1").get(id);
 }
@@ -1237,8 +2077,13 @@ function resolveSkillRoute({ item = null, mail = null, override = "" } = {}) {
     return selected;
   }
   if (mail || item?.type === "email") return routeById("draft-executive-email");
-  const text = `${item?.type || ""} ${item?.title || ""} ${item?.source_provider || ""}`.toLowerCase();
-  if (text.includes("transcript")) return routeById("zoom-transcript-router");
+  const type = String(item?.type || "").toLowerCase();
+  const title = String(item?.title || "").toLowerCase();
+  const explicitTranscriptTask = ["transcript", "meeting_transcript"].includes(type)
+    || /\bwaiting\s+(?:on|for)\s+(?:the\s+)?transcript\b/.test(title)
+    || /\b(?:download|process|route|file|save)\b.{0,32}\btranscript\b|\btranscript\b.{0,32}\b(?:download|process|route|file|save)\b/.test(title);
+  if (explicitTranscriptTask) return routeById("zoom-transcript-router");
+  const text = `${type} ${title}`;
   if (text.includes("morning") || text.includes("daily priorit")) return routeById("morning-briefing");
   return routeById("generic-codex");
 }
@@ -1359,47 +2204,247 @@ async function relevantTranscriptPaths(companySlug, query = "") {
   } catch { return []; }
 }
 
-function threadOutcome(thread) {
-  const turns = Array.isArray(thread?.turns) ? thread.turns : [];
-  const turn = turns.at(-1);
-  const status = String(turn?.status || "");
-  const items = Array.isArray(turn?.items) ? turn.items : [];
-  const messages = items.filter((item) => item?.type === "agentMessage" && typeof item.text === "string");
-  const final = [...messages].reverse().find((item) => item.phase === "final_answer")?.text || (status === "completed" ? messages.at(-1)?.text || "" : "");
-  return { status, final, error: turn?.error?.message || "" };
-}
-
-async function readCodexThread(threadId) {
+async function deliverPmChatUpdate(kind, payload) {
+  const config = db.prepare("SELECT * FROM pm_agent_config WHERE id='default'").get();
+  const prompt = buildPmChatPrompt({ kind, payload, generatedAt: nowIso() });
   const cli = await resolveCodexCli();
   return new Promise((resolve, reject) => {
-    const child = spawn(cli,["app-server","--stdio"],{cwd:aiOsRoot,env:process.env,windowsHide:true});
-    let buffer=""; let finished=false;
-    const stop=(error,value)=>{if(finished)return;finished=true;clearTimeout(timeout);if(!child.killed)child.kill();if(error)reject(error);else resolve(value);};
-    const send=(message)=>{
-      if(finished||child.killed||!child.stdin.writable)return false;
-      try{child.stdin.write(`${JSON.stringify(message)}\n`,(error)=>{if(error)stop(error);});return true;}
-      catch(error){stop(error);return false;}
+    const child = spawn(cli, ["app-server", "--stdio"], { cwd: aiOsRoot, env: process.env, windowsHide: true });
+    let buffer = ""; let stderr = ""; let finished = false; let threadId = config?.chat_thread_id || ""; const creating = !threadId; let timeout;
+    const finish = (error = null) => {
+      if (finished) return;
+      finished = true; clearTimeout(timeout);
+      const now = nowIso();
+      db.prepare("UPDATE pm_agent_config SET chat_status=?,chat_error=?,chat_updated_at=?,updated_at=? WHERE id='default'")
+        .run(error ? "error" : "ready", error ? String(error.message || error).slice(0,4000) : "", now, now);
+      setTimeout(() => { if (!child.killed) child.kill(); }, 100);
+      if (error) reject(error); else resolve({ threadId, status: "ready" });
     };
-    const timeout=setTimeout(()=>stop(new Error("Timed out while reading the Codex task.")),8000);
-    child.stdout.setEncoding("utf8"); child.stdout.on("data",(chunk)=>{buffer+=chunk;const lines=buffer.split(/\r?\n/);buffer=lines.pop()||"";for(const line of lines)try{const event=JSON.parse(line);if(event.id===1){send({method:"initialized",params:{}});send({id:2,method:"thread/read",params:{threadId,includeTurns:true}});}if(event.id===2){if(event.error)stop(new Error(event.error.message||"Could not read Codex task."));else stop(null,event.result?.thread||null);}}catch{}});
-    child.stdin.on("error",(error)=>stop(error));
-    child.on("error",stop); child.on("close",()=>{if(!finished)stop(new Error("Codex task reader stopped."));});
-    send({id:1,method:"initialize",params:{clientInfo:{name:"serent-command-center-reconciler",title:"Serent Command Center",version:"1.0.0"},capabilities:{experimentalApi:true}}});
+    const send = (message) => {
+      if (finished || child.killed || !child.stdin.writable) return false;
+      try { child.stdin.write(`${JSON.stringify(message)}\n`, (error) => { if (error) finish(error); }); return true; }
+      catch (error) { finish(error); return false; }
+    };
+    timeout = setTimeout(() => finish(new Error("The PM pulse delivery did not finish within 12 minutes.")), 12 * 60 * 1000);
+    child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      buffer += chunk; const lines = buffer.split(/\r?\n/); buffer = lines.pop() || "";
+      for (const line of lines) try {
+        const event = JSON.parse(line);
+        if (event.id === 1) { send({ method: "initialized", params: {} }); send(threadId ? { id: 2, method: "thread/resume", params: { threadId } } : { id: 2, method: "thread/start", params: { cwd: aiOsRoot, approvalPolicy: "never", sandbox: "workspace-write", ephemeral: false, threadSource: "app", runtimeWorkspaceRoots: [aiOsRoot] } }); }
+        if (event.id === 2 && event.result?.thread?.id) {
+          threadId = event.result.thread.id;
+          if (creating) {
+            const now = nowIso();
+            db.prepare("UPDATE pm_agent_config SET chat_thread_id=?,chat_status='working',chat_error='',chat_updated_at=?,updated_at=? WHERE id='default'").run(threadId, now, now);
+            send({ id: 4, method: "thread/name/set", params: { threadId, name: "Command Center PM Agent" } });
+          }
+          send({ id: 3, method: "turn/start", params: { threadId, input: [{ type: "text", text: prompt }] } });
+        }
+        if (event.id === 2 && event.error) finish(new Error(event.error.message || "The PM conversation could not be opened."));
+        if (event.id === 3 && event.error) finish(new Error(event.error.message || "The PM pulse could not be delivered."));
+        if (event.method === "turn/completed") {
+          const status = String(event.params?.turn?.status || "");
+          if (status === "completed") finish();
+          else if (["failed", "cancelled", "interrupted"].includes(status)) finish(new Error(`The PM pulse ended as ${status}.`));
+        }
+      } catch { /* Ignore non-protocol output. */ }
+    });
+    child.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-8000); });
+    child.stdin.on("error", finish); child.on("error", finish);
+    child.on("close", () => { if (!finished) finish(new Error(stderr.trim() || "The PM pulse connection stopped.")); });
+    send({ id: 1, method: "initialize", params: { clientInfo: { name: "serent-command-center-pm-delivery", title: "Command Center PM Pulse Delivery", version: "1.0.0" }, capabilities: { experimentalApi: true } } });
   });
 }
 
+function queuePmChatUpdate(kind, payload) {
+  if (!localWorkflowsEnabled || pmChatPromise) return false;
+  pmChatPromise = deliverPmChatUpdate(kind, payload).catch(() => null).finally(() => { pmChatPromise = null; });
+  return true;
+}
+
+async function ensurePmChatOpen() {
+  const config = db.prepare("SELECT * FROM pm_agent_config WHERE id='default'").get();
+  if (!config?.chat_thread_id) throw new Error("The scheduled PM pulse has not created the persistent CEO/PM conversation yet.");
+  openCodexThreadInApp(config.chat_thread_id);
+  return pmAgentPayload();
+}
+
+function mapPmConfig(row) {
+  return {
+    mode: row?.mode || "observer",
+    enabled: Boolean(row?.enabled),
+    morningTime: row?.morning_time || "08:00",
+    pulseMinutes: Number(row?.pulse_minutes || 30),
+    maxConcurrent: Number(row?.max_concurrent || 2),
+    lastRunAt: row?.last_run_at || "",
+    lastMorningDate: row?.last_morning_date || "",
+    chatThreadId: row?.chat_thread_id || "",
+    chatStatus: row?.chat_status || "not_created",
+    chatUpdatedAt: row?.chat_updated_at || "",
+    chatError: row?.chat_error || "",
+  };
+}
+
+function mapPmRun(row) {
+  if (!row) return null;
+  return { id: row.id, kind: row.kind, status: row.status, summary: row.summary, error: row.error, threadCount: row.thread_count, recommendationCount: row.recommendation_count, startedAt: row.started_at, finishedAt: row.finished_at || "" };
+}
+
+function pmStrategicContext() {
+  const projects = db.prepare("SELECT id FROM projects WHERE status='active' ORDER BY target_date").all().map((row) => projectDetail(row.id,{ reconcile: false })).filter(Boolean).map((project) => ({
+    id: project.id,
+    companySlug: project.companySlug,
+    companyName: project.companyName,
+    title: project.title,
+    objective: project.objective,
+    targetDate: project.targetDate,
+    health: `${project.health.label}: ${project.health.reason}`,
+    progress: project.progress,
+    activePhase: project.activePhase?.title || "",
+    nextMilestone: project.nextMilestone ? `${project.nextMilestone.title} on ${project.nextMilestone.scheduledDate}${project.nextMilestone.decision ? ` — ${project.nextMilestone.decision}` : ""}` : "",
+    criticalPath: project.guidance.doNow.slice(0,8).map((item) => ({ title: item.title, companyName: project.companyName, dueAt: item.dueDate || "", status: item.workItemStatus || item.executionState, owner: item.owner, reason: item.executionReason })),
+    blocked: project.guidance.waiting.slice(0,8).map((item) => ({ title: item.title, companyName: project.companyName, dueAt: item.dueDate || "", status: item.workItemStatus || item.executionState, owner: item.owner, reason: item.executionReason, blockedBy: item.blockedBy })),
+    upNext: project.guidance.upNext.slice(0,6).map((item) => ({ title: item.title, companyName: project.companyName, dueAt: item.dueDate || "", status: item.executionState, owner: item.owner, reason: item.executionReason })),
+  }));
+  const now = new Date();
+  const horizon = new Date(now.getTime() + 3 * 86400000).toISOString();
+  const calendar = db.prepare(`SELECT subject AS title,start_at AS startAt,end_at AS endAt,organizer_name AS organizer
+    FROM calendar_events WHERE end_at>=? AND start_at<=? ORDER BY start_at LIMIT 12`).all(now.toISOString(),horizon).map((item) => ({ ...item, companyName: meetingCompany(item.title) ? db.prepare("SELECT display_name FROM companies WHERE slug=?").get(meetingCompany(item.title))?.display_name || "" : "" }));
+  const mail = db.prepare(`SELECT subject AS title,sender_name AS sender,received_at AS receivedAt,company_slug AS companySlug,reply_reason AS reason
+    FROM mail_messages WHERE reply_state IN ('needs_reply','likely_needs_reply') AND review_state!='reviewed'
+      AND (snoozed_until IS NULL OR snoozed_until<=?) ORDER BY received_at DESC LIMIT 10`).all(now.toISOString()).map((item) => ({ ...item, companyName: item.companySlug ? db.prepare("SELECT display_name FROM companies WHERE slug=?").get(item.companySlug)?.display_name || "" : "" }));
+  return { projects, calendar, mail, generatedAt: nowIso() };
+}
+
+function pmAgentPayload() {
+  const config = db.prepare("SELECT * FROM pm_agent_config WHERE id='default'").get();
+  const latest = db.prepare("SELECT * FROM pm_runs ORDER BY started_at DESC LIMIT 1").get();
+  const companyNames = new Map(db.prepare("SELECT slug,display_name FROM companies").all().map((row) => [row.slug, row.display_name]));
+  const observations = latest ? db.prepare("SELECT * FROM pm_thread_observations WHERE run_id=? ORDER BY thread_updated_at DESC,title").all(latest.id).map((row) => ({
+    threadId: row.thread_id, title: row.title, preview: row.preview, status: row.thread_status,
+    companySlug: row.company_slug, companyName: companyNames.get(row.company_slug) || "Unassigned",
+    linkedWorkItemId: row.linked_work_item_id, linkedWorkItemTitle: row.linked_work_item_title,
+    matchType: row.match_type, confidence: row.confidence, rationale: row.rationale,
+    updatedAt: row.thread_updated_at || "", cwd: row.cwd,
+  })) : [];
+  const recommendations = latest ? db.prepare("SELECT * FROM pm_recommendations WHERE run_id=? ORDER BY created_at,id").all(latest.id).map((row) => ({
+    id: row.id, action: row.action, workItemId: row.work_item_id, workItemTitle: row.work_item_title,
+    threadId: row.thread_id, threadTitle: row.thread_title, companySlug: row.company_slug,
+    companyName: companyNames.get(row.company_slug) || "Unassigned", rationale: row.rationale, status: row.status,
+  })) : [];
+  const count = (actions, statuses = null) => recommendations.filter((item) => actions.includes(item.action) && (!statuses || statuses.includes(item.status))).length;
+  const activeWorkItems = new Set(observations.filter((item) => item.linkedWorkItemId && isPmThreadActive(item.status)).map((item) => item.linkedWorkItemId));
+  return {
+    config: mapPmConfig(config), latestRun: mapPmRun(latest), observations, recommendations, strategy: pmStrategicContext(),
+    summary: {
+      underway: activeWorkItems.size,
+      likelyMatches: observations.filter((item) => item.matchType === "likely").length,
+      wouldDispatch: count(["dispatch"], ["proposed"]),
+      autoStarted: count(["dispatch"], ["executed"]),
+      needsJake: count(["needs_jake", "link", "review"]),
+      waiting: count(["wait"]),
+    },
+  };
+}
+
+async function runPmAgent(kind = "manual") {
+  if (pmRunPromise) return pmRunPromise;
+  pmRunPromise = (async () => {
+    const id = randomUUID(); const started = nowIso();
+    db.prepare("INSERT INTO pm_runs(id,kind,status,started_at) VALUES(?,?, 'working',?)").run(id, kind, started);
+    try {
+      reconcileAllProjects();
+      const threads = db.prepare(`SELECT t.*,w.company_slug FROM codex_tasks t
+        JOIN work_items w ON w.id=t.work_item_id ORDER BY t.updated_at DESC LIMIT 20`).all().map((task) => ({
+        id: task.thread_id || `receipt:${task.id}`,
+        name: task.title,
+        preview: task.instruction,
+        status: task.status === "working" ? "working" : task.status === "complete" ? "completed" : task.status,
+        latestSummary: task.result || task.error || "",
+        updatedAt: task.updated_at,
+        cwd: aiOsRoot,
+      }));
+      const workItems = db.prepare(`SELECT w.*,c.display_name AS company_name FROM work_items w LEFT JOIN companies c ON c.slug=w.company_slug
+        WHERE w.status NOT IN ('done','dismissed') ORDER BY COALESCE(w.due_at,'9999-12-31'),w.updated_at DESC`).all();
+      const explicitLinks = [
+        ...db.prepare("SELECT CASE WHEN t.thread_id<>'' THEN t.thread_id ELSE 'receipt:'||t.id END AS threadId,t.work_item_id AS workItemId,'codex_task' AS type FROM codex_tasks t JOIN work_items w ON w.id=t.work_item_id WHERE w.status NOT IN ('done','dismissed')").all(),
+        ...db.prepare("SELECT l.thread_id AS threadId,l.work_item_id AS workItemId,'confirmed' AS type FROM pm_thread_links l JOIN work_items w ON w.id=l.work_item_id WHERE l.status='confirmed' AND w.status NOT IN ('done','dismissed')").all(),
+      ];
+      const snapshot = buildPmSnapshot({ threads, workItems, explicitLinks, recentAwarenessLimit: 20 });
+      const created = nowIso();
+      const insertObservation = db.prepare(`INSERT INTO pm_thread_observations(id,run_id,thread_id,title,preview,thread_status,company_slug,linked_work_item_id,linked_work_item_title,match_type,confidence,rationale,thread_updated_at,cwd,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+      for (const item of snapshot.observations) insertObservation.run(randomUUID(), id, item.threadId, item.title, item.preview, item.status, item.companySlug, item.linkedWorkItemId, item.linkedWorkItemTitle, item.matchType, item.confidence, item.rationale, item.updatedAt || null, item.cwd, created);
+      const insertRecommendation = db.prepare(`INSERT INTO pm_recommendations(id,run_id,action,work_item_id,work_item_title,thread_id,thread_title,company_slug,rationale,status,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,'proposed',?,?)`);
+      const savedRecommendations = [];
+      for (const item of snapshot.recommendations) {
+        const recommendationId = randomUUID();
+        insertRecommendation.run(recommendationId, id, item.action, item.workItemId, item.workItemTitle, item.threadId, item.threadTitle, item.companySlug, item.rationale, created, created);
+        savedRecommendations.push({ ...item, id: recommendationId });
+      }
+      let autoStarted = 0;
+      const dispatchCounts = db.prepare(`SELECT
+        SUM(CASE WHEN status='executed' THEN 1 ELSE 0 END) AS started,
+        SUM(CASE WHEN status='proposed' THEN 1 ELSE 0 END) AS remaining
+        FROM pm_recommendations WHERE run_id=? AND action='dispatch'`).get(id);
+      autoStarted = Number(dispatchCounts?.started || 0);
+      const remainingDispatch = Number(dispatchCounts?.remaining || 0);
+      const summary = `${snapshot.summary.underway} active Codex turn(s); ${autoStarted} preparation task(s) started; ${remainingDispatch} ready to start; ${snapshot.summary.needsJake} item(s) need Jake.`;
+      db.prepare("UPDATE pm_runs SET status='complete',summary=?,thread_count=?,recommendation_count=?,finished_at=? WHERE id=?").run(summary, snapshot.observations.length, snapshot.recommendations.length, created, id);
+      const morningDate = kind === "morning" ? localDateKey() : db.prepare("SELECT last_morning_date FROM pm_agent_config WHERE id='default'").get()?.last_morning_date || "";
+      db.prepare("UPDATE pm_agent_config SET last_run_at=?,last_morning_date=?,updated_at=? WHERE id='default'").run(created, morningDate, created);
+      const payload = pmAgentPayload();
+      queuePmChatUpdate(kind, payload);
+      return payload;
+    } catch (error) {
+      const finished = nowIso(); const message = error instanceof Error ? error.message : "The PM check failed.";
+      db.prepare("UPDATE pm_runs SET status='error',error=?,finished_at=? WHERE id=?").run(message.slice(0,4000), finished, id);
+      throw error;
+    } finally { pmRunPromise = null; }
+  })();
+  return pmRunPromise;
+}
+
+function pacificClock() {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-US", { timeZone: "America/Los_Angeles", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(new Date()).filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
+  return { date: `${parts.year}-${parts.month}-${parts.day}`, time: `${parts.hour}:${parts.minute}` };
+}
+
+async function maybeRunPmAgent() {
+  if (!localWorkflowsEnabled || pmRunPromise) return;
+  const row = db.prepare("SELECT * FROM pm_agent_config WHERE id='default'").get();
+  if (!row?.enabled) return;
+  const clock = pacificClock();
+  if (clock.time >= row.morning_time && row.last_morning_date !== clock.date) return void runPmAgent("morning").catch(() => {});
+  const last = row.last_run_at ? Date.parse(row.last_run_at) : 0;
+  if (!last || Date.now() - last >= Number(row.pulse_minutes || 30) * 60000) return void runPmAgent("pulse").catch(() => {});
+}
+
+function applyCodexTaskResult(task, result, eventType = "codex_task_returned") {
+  const now = nowIso();
+  const value = String(result || "").slice(0, 50000);
+  db.prepare("UPDATE codex_tasks SET status='complete',result=?,error='',last_checked_at=?,updated_at=? WHERE id=?").run(value, now, now, task.id);
+  const item = db.prepare("SELECT * FROM work_items WHERE id=?").get(task.work_item_id);
+  if (item?.preparation_skill === "draft-executive-email" && !String(item.draft || "").trim()) {
+    db.prepare("UPDATE work_items SET status='back_for_review',draft=?,updated_at=? WHERE id=?").run(value, now, task.work_item_id);
+  } else {
+    db.prepare("UPDATE work_items SET status='back_for_review',updated_at=? WHERE id=?").run(now, task.work_item_id);
+  }
+  eventFor(task.work_item_id, eventType, `Separate Codex task completed${task.thread_id ? ` (${task.thread_id})` : ""}. The result is ready on this card.`);
+}
+
 async function reconcilePersistentTasks() {
-  const tasks=db.prepare("SELECT * FROM codex_tasks WHERE status IN ('starting','working')").all();
+  const tasks=db.prepare(`SELECT t.* FROM codex_tasks t JOIN work_items w ON w.id=t.work_item_id
+    WHERE w.status NOT IN ('done','dismissed') AND t.status='working'
+      AND datetime(COALESCE(t.heartbeat_at,t.updated_at)) <= datetime('now','-10 minutes')`).all();
   for(const task of tasks){
-    if(!task.thread_id){
-      if(Date.now()-Date.parse(task.created_at)>60000){const now=nowIso();db.prepare("UPDATE codex_tasks SET status='error',error='The separate task did not create a Codex thread.',updated_at=? WHERE id=?").run(now,task.id);db.prepare("UPDATE work_items SET status='back_for_review',updated_at=? WHERE id=?").run(now,task.work_item_id);eventFor(task.work_item_id,"codex_task_error","The separate task did not create a Codex thread.");}
-      continue;
-    }
-    try{
-      const outcome=threadOutcome(await readCodexThread(task.thread_id));
-      if(outcome.status==="completed"&&outcome.final){const now=nowIso();db.prepare("UPDATE codex_tasks SET status='complete',result=?,error='',updated_at=? WHERE id=?").run(outcome.final.slice(0,50000),now,task.id);db.prepare("UPDATE work_items SET status='back_for_review',updated_at=? WHERE id=?").run(now,task.work_item_id);eventFor(task.work_item_id,"codex_task_returned",`Separate Codex task completed (${task.thread_id}).`);}
-      else if(["failed","cancelled"].includes(outcome.status)||(outcome.status==="interrupted"&&!activeProcesses.has(task.id)&&Date.now()-Date.parse(task.updated_at)>30000)){const now=nowIso();const error=outcome.error||`Codex task ended as ${outcome.status}.`;db.prepare("UPDATE codex_tasks SET status='error',error=?,updated_at=? WHERE id=?").run(error,now,task.id);db.prepare("UPDATE work_items SET status='back_for_review',updated_at=? WHERE id=?").run(now,task.work_item_id);eventFor(task.work_item_id,"codex_task_error",error);}
-    }catch{/* Preserve the receipt and retry on the next reconciliation. */}
+    const now=nowIso();
+    const attention="The native Codex task has not reported progress for 10 minutes. Open it directly in Codex to check its current state.";
+    db.prepare("UPDATE codex_tasks SET status='needs_attention',result=?,error='',last_checked_at=?,updated_at=? WHERE id=?").run(attention,now,now,task.id);
+    db.prepare("UPDATE work_items SET status='waiting_on_user',updated_at=? WHERE id=?").run(now,task.work_item_id);
+    eventFor(task.work_item_id,"codex_task_heartbeat_missed",attention);
   }
 }
 
@@ -1415,67 +2460,40 @@ Why now: ${item.why_now}
 Expected next action: ${item.suggested_action}
 Company context: ${item.ai_os_path ? path.resolve(aiOsRoot,item.ai_os_path) : "Read the relevant AI OS company and project context."}
 
-First, POST {"status":"working"} to http://127.0.0.1:4318/api/codex-tasks/${taskId}/callback. Read the live card and its linked notes, mail, and sources from GET http://127.0.0.1:4318/api/work-items before doing the work. Work independently, keep shared-system writes review-gated, and save local artifacts in the relevant project output convention. When finished, POST {"status":"complete","result":"a concise handoff with the answer and artifact paths"} to the same callback URL. If blocked, POST {"status":"error","error":"what is blocking the task"}.`;
+First, POST {"status":"started","threadId":"the native Codex task ID when available"} to http://127.0.0.1:4318/api/codex-tasks/${taskId}/callback. Read the live card and its linked notes, mail, and sources from GET http://127.0.0.1:4318/api/work-items/${item.id} before doing the work. If the work lasts more than five minutes, POST {"status":"heartbeat"} to the callback after each major step. If Jake or the owning PM must decide something, POST {"status":"needs_input","result":"the decision needed"} and keep ownership. Work independently, keep shared-system writes review-gated, and save local artifacts in the relevant project output convention. When finished, POST {"status":"completed","result":"a concise handoff with the answer and artifact paths"} to the same callback URL. If terminally blocked, POST {"status":"failed","error":"what is blocking the task"}. If handing the assignment back without completing it, POST {"status":"ownership_released","result":"why ownership was released"}.`;
+}
+
+function codexTaskDeepLink(item, taskId, instruction) {
+  const deepLink=new URL("codex://threads/new");
+  deepLink.searchParams.set("path",aiOsRoot);
+  deepLink.searchParams.set("prompt",userOwnedCodexTaskPrompt(item,taskId,instruction));
+  deepLink.searchParams.set("originUrl",`http://localhost:3000/?workItem=${encodeURIComponent(item.id)}`);
+  return deepLink.toString();
 }
 
 function prepareUserOwnedCodexTask(item, instruction) {
   const id=randomUUID(); const now=nowIso();
   const title=`${item.company_name || "Serent"} - ${item.title}`.slice(0,240);
-  const prompt=userOwnedCodexTaskPrompt(item,id,instruction);
-  const deepLink=new URL("codex://threads/new");
-  deepLink.searchParams.set("path",aiOsRoot);
-  deepLink.searchParams.set("prompt",prompt);
-  deepLink.searchParams.set("originUrl",`http://localhost:3000/?workItem=${encodeURIComponent(item.id)}`);
   db.prepare(`INSERT INTO codex_tasks(id,work_item_id,title,instruction,status,created_at,updated_at) VALUES(?,?,?,?, 'waiting_on_user',?,?)`).run(id,item.id,title,instruction,now,now);
   db.prepare("UPDATE work_items SET decision_state=CASE WHEN decision_state='proposed' THEN 'accepted' ELSE decision_state END,updated_at=? WHERE id=?").run(now,item.id);
   eventFor(item.id,"codex_task_prepared",`Prepared a normal Codex sidebar task: ${title}`);
-  return {id,threadId:"",status:"waiting_on_user",title,instruction,deepLink:deepLink.toString(),createdAt:now,updatedAt:now};
+  return {id,threadId:"",status:"waiting_on_user",title,instruction,deepLink:codexTaskDeepLink(item,id,instruction),createdAt:now,updatedAt:now};
 }
 
-async function launchPersistentCodexTask(item, instruction) {
-  const id=randomUUID(); const now=nowIso();
-  const company=item.company_slug ? db.prepare("SELECT * FROM companies WHERE slug=?").get(item.company_slug) : null;
-  const notes=contextualNotes({workItemId:item.id,companySlug:item.company_slug});
-  const sources=db.prepare("SELECT provider,label,source_path,source_url FROM source_references WHERE work_item_id=?").all(item.id);
-  const transcripts=await relevantTranscriptPaths(item.company_slug,`${item.title} ${instruction}`);
-  const linkedMail=db.prepare("SELECT subject,preview,attachments_json,web_link FROM mail_messages WHERE action_work_item_id=? LIMIT 1").get(item.id);
-  const title=`${item.company_name || "Serent"} - ${item.title}`.slice(0,240);
-  const prompt=`Create a durable Codex task for this Serent assignment.\n\nAssignment: ${instruction}\nCompany: ${item.company_name || "Unassigned"}\nOriginating Command Center item: ${item.title}\nWork item ID: ${item.id}\nSummary: ${item.summary}\nWhy now: ${item.why_now}\nExpected next action: ${item.suggested_action}\nCompany context: ${company?.ai_os_path ? path.resolve(aiOsRoot,company.ai_os_path) : "AI OS company context"}\nCard working draft: ${item.draft||"None"}\n\nRelevant notes:\n${notes.map((n)=>`## ${n.title}\n${n.body}`).join("\n\n")||"None"}\n\nLinked mail:\n${linkedMail?`Subject: ${linkedMail.subject}\nPreview: ${linkedMail.preview}\nAttachments: ${linkedMail.attachments_json}\nOutlook: ${linkedMail.web_link}`:"None"}\n\nRelevant transcript summaries:\n${transcripts.map((value)=>`- ${value}`).join("\n")||"None found"}\n\nSource manifest:\n${sources.map((s)=>`- ${s.provider}: ${s.label} ${s.source_path||s.source_url||""}`).join("\n")||"None"}\n\nRead the listed project and transcript sources before drafting. If Jake asks to place the output in Command Center Documents, create it through POST http://127.0.0.1:4318/api/notes with JSON fields title, body, type, origin='agent', companySlug='${item.company_slug||""}', and workItemId='${item.id}'. Do not edit the database directly. Work independently on the deliverable. Keep shared-system writes review-gated. Save any additional local artifacts in the relevant project output convention, verify them, and finish with a concise handoff including the Command Center document title, artifact paths, and remaining decisions.`;
-  db.prepare(`INSERT INTO codex_tasks(id,work_item_id,title,instruction,status,created_at,updated_at) VALUES(?,?,?,?, 'starting',?,?)`).run(id,item.id,title,instruction,now,now);
-  db.prepare("UPDATE work_items SET status='working',decision_state=CASE WHEN decision_state='proposed' THEN 'accepted' ELSE decision_state END,updated_at=? WHERE id=?").run(now,item.id);
-  eventFor(item.id,"codex_task_started",`Started a separate Codex task: ${title}`);
-  const cli=await resolveCodexCli();
-  const child=spawn(cli,["app-server","--stdio"],{cwd:aiOsRoot,env:process.env,windowsHide:true});
-  activeProcesses.set(id,child);
-  let buffer="";let finalMessage="";let stderr="";let threadId="";let finishedTask=false;let pollTimer=null;let taskTimeout=null;let pollId=20;let terminalPolls=0;
-  const finish=(success,error="")=>{
-    if(finishedTask)return; finishedTask=true; if(pollTimer)clearInterval(pollTimer);if(taskTimeout)clearTimeout(taskTimeout);activeProcesses.delete(id); const finished=nowIso();
-    if(success){db.prepare("UPDATE codex_tasks SET thread_id=?,status='complete',result=?,updated_at=? WHERE id=?").run(threadId,finalMessage.slice(0,50000),finished,id);db.prepare("UPDATE work_items SET status='back_for_review',updated_at=? WHERE id=?").run(finished,item.id);eventFor(item.id,"codex_task_returned",`Separate Codex task completed${threadId?` (${threadId})`:""}.`);}
-    else{const detail=error||stderr.trim()||"The separate Codex task stopped without a result.";db.prepare("UPDATE codex_tasks SET thread_id=?,status='error',error=?,updated_at=? WHERE id=?").run(threadId,detail,finished,id);db.prepare("UPDATE work_items SET status='back_for_review',updated_at=? WHERE id=?").run(finished,item.id);eventFor(item.id,"codex_task_error",detail.slice(0,1200));}
-    setTimeout(()=>{if(!child.killed)child.kill();},150);
-  };
-  const send=(message)=>{
-    if(finishedTask||child.killed||!child.stdin.writable)return false;
-    try{child.stdin.write(`${JSON.stringify(message)}\n`,(error)=>{if(error&&!finishedTask)finish(false,error.message);});return true;}
-    catch(error){finish(false,error.message);return false;}
-  };
-  child.stdout.setEncoding("utf8");child.stderr.setEncoding("utf8");
-  child.stdout.on("data",(chunk)=>{buffer+=chunk;const lines=buffer.split(/\r?\n/);buffer=lines.pop()||"";for(const line of lines)try{const event=JSON.parse(line);
-    if(event.id===1){send({method:"initialized",params:{}});send({id:2,method:"thread/start",params:{cwd:aiOsRoot,approvalPolicy:"never",sandbox:"workspace-write",ephemeral:false,threadSource:"app",runtimeWorkspaceRoots:[aiOsRoot]}});}
-    if(event.id===2&&event.result?.thread?.id){threadId=event.result.thread.id;db.prepare("UPDATE codex_tasks SET thread_id=?,status='working',updated_at=? WHERE id=?").run(threadId,nowIso(),id);send({id:4,method:"thread/name/set",params:{threadId,name:title}});send({id:3,method:"turn/start",params:{threadId,input:[{type:"text",text:prompt}]}});pollTimer=setInterval(()=>{if(!finishedTask)send({id:pollId++,method:"thread/read",params:{threadId,includeTurns:true}});},5000);}
-    if(event.method==="item/completed"&&event.params?.item?.type==="agentMessage")finalMessage=event.params.item.text||"";
-    if(event.method==="turn/completed"&&event.params?.turn?.status==="completed"&&finalMessage)finish(true);
-    if(event.id>=20&&event.result?.thread){const outcome=threadOutcome(event.result.thread);if(outcome.status==="completed"&&outcome.final){finalMessage=outcome.final;finish(true);}else if(["failed","cancelled"].includes(outcome.status)){terminalPolls+=1;if(terminalPolls>=3)finish(false,outcome.error||`Codex task ended as ${outcome.status}.`);}else terminalPolls=0;}
-    if(event.id===4&&event.error)eventFor(item.id,"codex_task_naming_warning",event.error.message||"The Codex task was created but could not be named in the sidebar.");
-    if(event.id&&event.error&&event.id<20&&event.id!==4)finish(false,event.error.message||"Codex app-server request failed.");
-  }catch{}});
-  child.stderr.on("data",(chunk)=>{stderr=`${stderr}${chunk}`.slice(-8000);});
-  child.stdin.on("error",(error)=>{if(!finishedTask)finish(false,error.message);});
-  child.on("error",(error)=>finish(false,error.message));
-  child.on("close",()=>{if(!finishedTask)finish(false);});
-  taskTimeout=setTimeout(()=>finish(false,"The separate Codex task exceeded 15 minutes without returning a result."),15*60*1000);
-  send({id:1,method:"initialize",params:{clientInfo:{name:"serent-command-center",title:"Serent Command Center",version:"1.0.0"},capabilities:{experimentalApi:true}}});
-  return {id,threadId,status:"starting",title,instruction,createdAt:now,updatedAt:now};
+function openCodexThreadInApp(threadId) {
+  if (!/^[0-9a-f-]{36}$/i.test(threadId)) return;
+  const launcher=spawn("explorer.exe",[`codex://threads/${threadId}`],{windowsHide:true,detached:true,stdio:"ignore"});
+  launcher.unref();
+}
+
+function preparePersistentCodexTask(item, instruction) {
+  const existing=db.prepare("SELECT * FROM codex_tasks WHERE work_item_id=? ORDER BY created_at DESC LIMIT 1").get(item.id);
+  const launchMode=codexTaskLaunchMode(existing);
+  if(launchMode==="already_running"){
+    eventFor(item.id,"codex_task_reused","The existing native Codex task receipt is still open, so no duplicate was created.");
+    return {id:existing.id,threadId:existing.thread_id,status:existing.status,title:existing.title,instruction:existing.instruction,result:existing.result,error:existing.error,deepLink:existing.status==="waiting_on_user"?codexTaskDeepLink(item,existing.id,existing.instruction):"",createdAt:existing.created_at,updatedAt:existing.updated_at,reused:true};
+  }
+  return { ...prepareUserOwnedCodexTask(item,instruction), reused:false };
 }
 
 async function launchAgentRun({ workItemId = null, mailMessageId = null, companySlug = null, scope, intent, title, allowedSources, revisionOf = null, sourceRefresh = null, skillId = "generic-codex", executorType = "codex_readonly", contextManifest = {} }) {
@@ -1484,6 +2502,13 @@ async function launchAgentRun({ workItemId = null, mailMessageId = null, company
   const safeIntent = String(intent || "").trim().slice(0, 4000);
   if (!safeIntent) throw new Error("Describe what Codex should do.");
   const inputHash = createHash("sha256").update(`${scope}:${safeIntent}:${workItemId || ""}`).digest("hex").slice(0, 12);
+  if (workItemId) {
+    const existing = db.prepare("SELECT * FROM agent_runs WHERE work_item_id=? AND status IN ('queued','working','waiting_on_user') ORDER BY created_at DESC LIMIT 1").get(workItemId);
+    if (existing) {
+      eventFor(workItemId, "agent_run_reused", "An active assignment already owns this card, so Command Center did not create a duplicate.");
+      return mapRun(existing);
+    }
+  }
   db.prepare(`INSERT INTO agent_runs(id,work_item_id,company_slug,scope,intent,title,allowed_sources,status,result,error,revision_of,input_hash,skill_id,executor_type,context_manifest,mail_message_id,created_at,updated_at)
     VALUES(?,?,?,?,?,?,?,'queued','','',?,?,?,?,?,?,?,?)`).run(id, workItemId, companySlug, scope, safeIntent, title, JSON.stringify(allowedSources), revisionOf, inputHash, skillId, executorType, JSON.stringify(contextManifest), mailMessageId, now, now);
   if (workItemId) {
@@ -1552,7 +2577,8 @@ async function launchAgentRun({ workItemId = null, mailMessageId = null, company
       if (sourceRefresh) {
         const parsed = parseAgentJson(finalMessage);
         const changed = upsertNormalizedItems(sourceRefresh, parsed);
-        db.prepare(`UPDATE source_receipts SET status='ready', checked_at=?, detail=?, result=?, error='' WHERE source=?`).run(finished, parsed?.summary || `Refresh complete; ${changed} consequential item${changed === 1 ? "" : "s"} updated.`, finalMessage, sourceRefresh);
+        const projectsChanged = upsertSourceProjects(sourceRefresh,parsed);
+        db.prepare(`UPDATE source_receipts SET status='ready', checked_at=?, detail=?, result=?, error='' WHERE source=?`).run(finished, parsed?.summary || `Refresh complete; ${changed} consequential item${changed === 1 ? "" : "s"} and ${projectsChanged} project plan${projectsChanged === 1 ? "" : "s"} updated.`, finalMessage, sourceRefresh);
       }
     } else {
       const error = stderrBuffer.trim() || `Codex exited without a reviewable result (code ${code}).`;
@@ -1578,6 +2604,166 @@ async function launchAgentRun({ workItemId = null, mailMessageId = null, company
     if (mailMessageId && scope === "mail_draft") db.prepare("UPDATE mail_drafts SET status='error',updated_at=? WHERE mail_message_id=?").run(finished, mailMessageId);
   });
   return mapRun(db.prepare("SELECT * FROM agent_runs WHERE id = ?").get(id));
+}
+
+function pacificDate(value) {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "America/Los_Angeles", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(value));
+}
+
+function csvCell(value) {
+  return `"${String(value ?? "").replaceAll('"', '""')}"`;
+}
+
+async function routeMeetingTranscript({ sourcePath, event, companySlug, noteBody }) {
+  const extension = path.extname(sourcePath).toLowerCase();
+  const date = pacificDate(event.start_at);
+  const title = safeMeetingName(event.subject);
+  const destinationDir = path.join(transcriptRoot, "companies", companySlug, "general");
+  const storedPath = path.join(destinationDir, `${date} - ${title}${extension}`);
+  const summaryPath = path.join(destinationDir, `${date} - ${title}.summary.md`);
+  const metadataPath = path.join(destinationDir, `${date} - ${title}.metadata.json`);
+  await mkdir(destinationDir, { recursive: true });
+  if (path.resolve(sourcePath) !== path.resolve(storedPath)) await copyFile(sourcePath, storedPath);
+  const raw = await readFile(sourcePath);
+  const sourceHash = createHash("sha256").update(raw).digest("hex").toUpperCase();
+  const processedAt = nowIso();
+  const metadata = {
+    meeting_date: date, meeting_title: event.subject, source_file: sourcePath,
+    stored_transcript_path: storedPath, summary_path: summaryPath, metadata_path: metadataPath,
+    company: companySlug, project: "general", classification_confidence: 100,
+    classification_evidence: ["Matched to an Outlook calendar event and confirmed from Command Center."],
+    participants: JSON.parse(event.attendees_json || "[]").map((item) => item.name || item.email).filter(Boolean),
+    source_hash: sourceHash, processed_at: processedAt, recording_url: "",
+  };
+  await writeFile(summaryPath, `# ${event.subject}\n\n${noteBody.trim()}\n`, "utf8");
+  await writeFile(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+  await mkdir(transcriptRoot, { recursive: true });
+  const manifestPath = path.join(transcriptRoot, "manifest.jsonl");
+  const manifest = await readFile(manifestPath, "utf8").catch(() => "");
+  if (!manifest.includes(`"stored_transcript_path":"${storedPath.replaceAll("\\", "\\\\")}"`)) {
+    await appendFile(manifestPath, `${JSON.stringify(metadata)}\n`, "utf8");
+    const indexPath = path.join(transcriptRoot, "index.csv");
+    const existingIndex = await readFile(indexPath, "utf8").catch(() => "");
+    if (!existingIndex.trim()) await appendFile(indexPath, '"meeting_date","meeting_title","company","project","classification_confidence","stored_transcript_path","summary_path","source_hash","processed_at"\n', "utf8");
+    await appendFile(indexPath, `${[date,event.subject,companySlug,"general",100,storedPath,summaryPath,sourceHash,processedAt].map(csvCell).join(",")}\n`, "utf8");
+  }
+  return { storedPath, summaryPath, metadataPath, sourceHash };
+}
+
+async function finishMeetingProcessing({ workflow, event, sourcePath, parsed, runId }) {
+  const finished = nowIso();
+  const companySlugs = db.prepare("SELECT slug FROM companies WHERE active=1").all().map((row) => row.slug);
+  const companySlug = companySlugs.includes(parsed.companySlug) ? parsed.companySlug : meetingCompany(`${event.subject} ${parsed.summary || ""}`);
+  const noteBody = String(parsed.noteBody || parsed.summary || "No meeting note was returned.").slice(0, 100000);
+  const routed = await routeMeetingTranscript({ sourcePath, event, companySlug, noteBody });
+  const existingNote = workflow.note_id ? db.prepare("SELECT * FROM notes WHERE id=?").get(workflow.note_id) : existingMeetingNoteFor(event);
+  const noteId = existingNote?.id || randomUUID();
+  const noteTitle = existingNote?.title || String(parsed.noteTitle || `${event.subject} - Meeting notes`).slice(0, 240);
+  if (!existingNote) {
+    db.prepare(`INSERT INTO notes(id,title,body,type,origin,state,company_slug,meeting_id,project_ref,created_at,updated_at)
+      VALUES(?,?,?,'meeting','agent','active',?,?, 'general',?,?)`)
+      .run(noteId, noteTitle, noteBody, companySlug, event.graph_id, finished, finished);
+  }
+  db.prepare("INSERT OR IGNORE INTO note_links(note_id,work_item_id) VALUES(?,?)").run(noteId, workflow.work_item_id);
+  await persistNoteFile(db.prepare("SELECT * FROM notes WHERE id=?").get(noteId));
+  db.prepare(`INSERT INTO source_references(id,work_item_id,provider,label,source_id,source_path,retrieved_at,freshness)
+    VALUES(?,?, 'transcripts', ?, ?, ?, ?, 'live')`)
+    .run(randomUUID(), workflow.work_item_id, path.basename(sourcePath), routed.sourceHash, routed.storedPath, finished);
+  db.prepare("DELETE FROM meeting_action_suggestions WHERE meeting_workflow_id=? AND decision='proposed'").run(workflow.id);
+  const actions = Array.isArray(parsed.actions) ? parsed.actions.slice(0, 20) : [];
+  for (const raw of actions) {
+    const action = normalizeMeetingAction(raw, companySlugs);
+    if (!action) continue;
+    const existing = action.existingWorkItemId ? db.prepare("SELECT id FROM work_items WHERE id=?").get(action.existingWorkItemId) : null;
+    db.prepare(`INSERT INTO meeting_action_suggestions(id,meeting_workflow_id,title,summary,company_slug,type,priority,owner_state,suggested_action,evidence_timestamp,due_at,existing_work_item_id,decision,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'proposed',?,?)`)
+      .run(randomUUID(), workflow.id, action.title, action.summary, action.companySlug || companySlug, action.type, action.priority, action.owner, action.suggestedAction, action.evidenceTimestamp, action.dueAt, existing?.id || null, finished, finished);
+  }
+  const count = db.prepare("SELECT COUNT(*) AS count FROM meeting_action_suggestions WHERE meeting_workflow_id=? AND decision='proposed'").get(workflow.id).count;
+  db.prepare("UPDATE meeting_workflows SET state='review',transcript_path=?,note_id=?,agent_run_id=?,error='',updated_at=? WHERE id=?")
+    .run(routed.storedPath, noteId, runId, finished, workflow.id);
+  db.prepare("UPDATE agent_runs SET status='review',result=?,updated_at=? WHERE id=?")
+    .run(`Saved “${noteTitle}” and proposed ${count} follow-up action${count === 1 ? "" : "s"}.`, finished, runId);
+  db.prepare("UPDATE work_items SET company_slug=?,status='back_for_review',summary=?,suggested_action=?,updated_at=? WHERE id=?")
+    .run(companySlug, String(parsed.summary || "The meeting transcript has been processed.").slice(0, 4000), count ? `Review ${count} proposed follow-up${count === 1 ? "" : "s"}, then finish the meeting review.` : "Review the saved meeting note, then finish the meeting review.", finished, workflow.work_item_id);
+  eventFor(workflow.work_item_id, "meeting_processed", `Saved the meeting note and proposed ${count} reviewable follow-up action${count === 1 ? "" : "s"}.`);
+}
+
+async function launchMeetingProcessing(workflow, event, sourcePath) {
+  if (!isAllowedTranscriptPath(sourcePath, [downloadsDir, transcriptInbox, transcriptRoot])) throw new Error("Choose a transcript from Downloads or the transcript inbox.");
+  if (!/\.(vtt|srt|txt)$/i.test(sourcePath)) throw new Error("Choose a .vtt, .srt, or .txt transcript.");
+  const transcriptText = (await readFile(sourcePath, "utf8")).slice(0, 180000);
+  if (!transcriptText.trim()) throw new Error("The selected transcript is empty.");
+  const runId = randomUUID();
+  const now = nowIso();
+  const activeItems = db.prepare("SELECT id,title,company_slug,status,summary FROM work_items WHERE status NOT IN ('done','dismissed') AND id<>? ORDER BY updated_at DESC LIMIT 80").all(workflow.work_item_id);
+  const intent = `Process the transcript for ${event.subject} into a meeting note and proposed actions.`;
+  db.prepare(`INSERT INTO agent_runs(id,work_item_id,company_slug,scope,intent,title,allowed_sources,status,result,error,revision_of,input_hash,skill_id,executor_type,context_manifest,created_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,'working','','',NULL,?,'zoom-transcript-router','codex_readonly',?,?,?)`)
+    .run(runId, workflow.work_item_id, meetingCompany(event.subject), "meeting_transcript", intent, `${event.subject} · Meeting follow-through`, JSON.stringify(["transcripts", "calendar", "ai_os", "project_files"]), createHash("sha256").update(`${event.graph_id}:${sourcePath}`).digest("hex").slice(0, 12), JSON.stringify({ meetingWorkflowId: workflow.id, calendarEventId: event.graph_id, transcriptPath: sourcePath }), now, now);
+  db.prepare("UPDATE meeting_workflows SET state='processing',candidate_path=?,agent_run_id=?,error='',updated_at=? WHERE id=?").run(sourcePath, runId, now, workflow.id);
+  db.prepare("UPDATE work_items SET status='working',suggested_action='Command Center is processing the transcript and will return the note and proposed actions here.',updated_at=? WHERE id=?").run(now, workflow.work_item_id);
+  eventFor(workflow.work_item_id, "meeting_processing", `Processing ${path.basename(sourcePath)} with the Zoom Transcript Router.`);
+  const cli = await resolveCodexCli();
+  const args = ["exec", "--json", "-c", 'approval_policy="never"', "-C", aiOsRoot, "--skip-git-repo-check", "--ephemeral", "-s", "read-only", "-"];
+  const child = spawn(cli, args, { cwd: aiOsRoot, env: process.env, windowsHide: true });
+  activeProcesses.set(runId, child);
+  let buffer = ""; let finalMessage = ""; let stderr = "";
+  const timeout = setTimeout(() => { if (!child.killed) child.kill(); }, 15 * 60 * 1000);
+  child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { buffer += chunk; const lines = buffer.split(/\r?\n/); buffer = lines.pop() || ""; for (const line of lines) try { const value = JSON.parse(line); if (value.type === "item.completed" && value.item?.type === "agent_message") finalMessage = value.item.text || ""; } catch {} });
+  child.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-8000); });
+  const prompt = `Use the installed zoom-transcript-router skill's meeting-note standards. Analyze this exact transcript read-only. Do not create or modify files or external systems. Return one JSON object only with this shape:\n{"companySlug":"avionte|stockiq|govworx|firm","noteTitle":"title","noteBody":"complete Markdown meeting note without a title heading","summary":"brief meeting outcome","actions":[{"title":"action","summary":"what is owed and why","companySlug":"avionte|stockiq|govworx|firm","type":"follow_up|decision|task|artifact","priority":"urgent|high|normal|low","owner":"jake|external","suggestedAction":"concrete next step","evidenceTimestamp":"timestamp or short quote locator","dueAt":null,"existingWorkItemId":null}]}\n\nRules: separate Jake-owned actions from items waiting on someone else; include decisions and open questions in the note; do not invent dates; use existingWorkItemId only when the same obligation already appears in the active-card list.\n\nCalendar meeting:\n${JSON.stringify({ subject: event.subject, startAt: event.start_at, endAt: event.end_at, organizer: event.organizer_name, attendees: JSON.parse(event.attendees_json || "[]") })}\n\nActive Command Center cards for deduplication:\n${JSON.stringify(activeItems)}\n\nTranscript:\n${transcriptText}`;
+  child.stdin.end(prompt);
+  child.on("close", (code) => {
+    clearTimeout(timeout); activeProcesses.delete(runId);
+    const parsed = parseAgentJson(finalMessage);
+    if (code === 0 && parsed && typeof parsed.noteBody === "string" && Array.isArray(parsed.actions)) {
+      void finishMeetingProcessing({ workflow, event, sourcePath, parsed, runId }).catch((error) => failMeetingProcessing(workflow, runId, error));
+    } else failMeetingProcessing(workflow, runId, new Error(stderr.trim() || "Codex did not return a valid meeting note and action list."));
+  });
+  child.on("error", (error) => { clearTimeout(timeout); activeProcesses.delete(runId); failMeetingProcessing(workflow, runId, error); });
+  return mapRun(db.prepare("SELECT * FROM agent_runs WHERE id=?").get(runId));
+}
+
+function failMeetingProcessing(workflow, runId, error) {
+  const now = nowIso();
+  const message = String(error?.message || error || "Meeting processing failed.").slice(0, 4000);
+  db.prepare("UPDATE meeting_workflows SET state='error',error=?,updated_at=? WHERE id=?").run(message, now, workflow.id);
+  db.prepare("UPDATE agent_runs SET status='error',error=?,updated_at=? WHERE id=?").run(message, now, runId);
+  db.prepare("UPDATE work_items SET status='back_for_review',suggested_action='Review the processing error, then try the transcript again.',updated_at=? WHERE id=?").run(now, workflow.work_item_id);
+  eventFor(workflow.work_item_id, "meeting_processing_error", message.slice(0, 1200));
+}
+
+function acceptMeetingSuggestion(id) {
+  const suggestion = db.prepare(`SELECT s.*,mw.work_item_id AS meeting_work_item_id,mw.note_id,mw.transcript_path
+    FROM meeting_action_suggestions s JOIN meeting_workflows mw ON mw.id=s.meeting_workflow_id WHERE s.id=?`).get(id);
+  if (!suggestion) throw new Error("Unknown meeting follow-up.");
+  if (suggestion.decision !== "proposed") return suggestion.created_work_item_id || suggestion.existing_work_item_id;
+  const now = nowIso();
+  let targetId = suggestion.existing_work_item_id;
+  if (targetId) {
+    const target = db.prepare("SELECT * FROM work_items WHERE id=?").get(targetId);
+    if (!target) targetId = null;
+    else {
+      if (["done", "dismissed"].includes(target.status)) db.prepare("UPDATE work_items SET status='to_review',resolution='',resolved_at=NULL,updated_at=? WHERE id=?").run(now, targetId);
+      eventFor(targetId, "confirmed_from_meeting", `Confirmed in the transcript linked to ${suggestion.meeting_work_item_id}.`);
+    }
+  }
+  if (!targetId) {
+    targetId = randomUUID();
+    const status = suggestion.owner_state === "external" ? "waiting_external" : "to_review";
+    const decisionState = suggestion.owner_state === "external" ? "accepted" : "committed";
+    db.prepare(`INSERT INTO work_items(id,type,company_slug,title,summary,why_now,priority,confidence,status,suggested_action,owner,due_at,source_provider,source_key,decision_state,created_at,updated_at)
+      VALUES(?,?,?,?,?,'Confirmed in a processed meeting transcript.',?,1,?,?,?,?,'transcripts',?,?,?,?)`)
+      .run(targetId, suggestion.type, suggestion.company_slug, suggestion.title, suggestion.summary, suggestion.priority, status, suggestion.suggested_action, suggestion.owner_state === "external" ? "External" : "Jake", suggestion.due_at, `meeting-action:${suggestion.id}`, decisionState, now, now);
+    db.prepare(`INSERT INTO source_references(id,work_item_id,provider,label,source_id,source_path,retrieved_at,freshness)
+      VALUES(?,?, 'transcripts', 'Meeting transcript', ?, ?, ?, 'live')`).run(randomUUID(), targetId, suggestion.id, suggestion.transcript_path, now);
+    eventFor(targetId, "created_from_meeting", suggestion.evidence_timestamp ? `Transcript evidence: ${suggestion.evidence_timestamp}` : "Accepted from a processed meeting transcript.");
+  }
+  if (suggestion.note_id) db.prepare("INSERT OR IGNORE INTO note_links(note_id,work_item_id) VALUES(?,?)").run(suggestion.note_id, targetId);
+  db.prepare("UPDATE meeting_action_suggestions SET decision='accepted',created_work_item_id=?,updated_at=? WHERE id=?").run(targetId, now, id);
+  return targetId;
 }
 
 async function launchMailDraft(mailMessageId, { automatic = false, feedback = "" } = {}) {
@@ -1643,6 +2829,11 @@ async function resumeTranscriptRun(row) {
 }
 
 async function launchTranscriptRoute({ item, intent, contextManifest }) {
+  const existing = db.prepare("SELECT * FROM agent_runs WHERE work_item_id=? AND status IN ('queued','working','waiting_on_user') ORDER BY created_at DESC LIMIT 1").get(item.id);
+  if (existing) {
+    eventFor(item.id, "agent_run_reused", "An active assignment already owns this card, so Command Center did not create a duplicate.");
+    return mapRun(existing);
+  }
   const now = nowIso();
   const id = randomUUID();
   const waitingReason = "Download the Zoom transcript and leave the .vtt, .srt, or transcript-like .txt file in Downloads. Command Center will resume automatically.";
@@ -1693,6 +2884,9 @@ function searchAll(query) {
   return [...items, ...notes, ...runs, ...mail];
 }
 
+reconcileAllProjects();
+setInterval(() => reconcileAllProjects(), 60 * 60 * 1000).unref();
+
 const server = createServer(async (request, response) => {
   try {
     const url = new URL(request.url || "/", `http://${host}:${port}`);
@@ -1701,8 +2895,74 @@ const server = createServer(async (request, response) => {
     if (request.method === "OPTIONS") return responseJson(response, 204, {});
     if (origin && request.method !== "GET" && request.headers["x-serent-command-center"] !== "1") return responseJson(response, 403, { error: "Command Center request marker is required." });
     if (request.method === "GET" && url.pathname === "/api/health") return responseJson(response, 200, { status: "ready", checkedAt: nowIso(), activeJobs: activeProcesses.size, database: databasePath });
+    if (request.method === "GET" && url.pathname === "/api/pm-agent") return responseJson(response, 200, pmAgentPayload());
+    if (request.method === "POST" && url.pathname === "/api/pm-agent/run") {
+      const body = await readJsonBody(request);
+      const kind = ["manual", "morning", "pulse"].includes(body.kind) ? body.kind : "manual";
+      return responseJson(response, 200, await runPmAgent(kind));
+    }
+    if (request.method === "POST" && url.pathname === "/api/pm-agent/chat/open") {
+      return responseJson(response, 200, await ensurePmChatOpen());
+    }
+    if (request.method === "PATCH" && url.pathname === "/api/pm-agent/config") {
+      const body = await readJsonBody(request); const current = db.prepare("SELECT * FROM pm_agent_config WHERE id='default'").get(); const now = nowIso();
+      const enabled = body.enabled === undefined ? current.enabled : body.enabled ? 1 : 0;
+      const morningTime = /^([01]\d|2[0-3]):[0-5]\d$/.test(String(body.morningTime || "")) ? String(body.morningTime) : current.morning_time;
+      const pulseMinutes = body.pulseMinutes === undefined ? current.pulse_minutes : Math.max(15, Math.min(240, Number(body.pulseMinutes) || 30));
+      const maxConcurrent = body.maxConcurrent === undefined ? current.max_concurrent : Math.max(1, Math.min(3, Number(body.maxConcurrent) || 2));
+      db.prepare("UPDATE pm_agent_config SET mode='observer',enabled=?,morning_time=?,pulse_minutes=?,max_concurrent=?,updated_at=? WHERE id='default'").run(enabled, morningTime, pulseMinutes, maxConcurrent, now);
+      return responseJson(response, 200, pmAgentPayload());
+    }
+    if (request.method === "POST" && url.pathname === "/api/pm-agent/links") {
+      const body = await readJsonBody(request); const threadId = String(body.threadId || ""); const workItemId = String(body.workItemId || ""); const now = nowIso();
+      if (!/^[0-9a-f-]{36}$/i.test(threadId)) throw new Error("Choose a valid Codex task.");
+      if (!db.prepare("SELECT id FROM work_items WHERE id=?").get(workItemId)) throw new Error("The work item no longer exists.");
+      db.prepare(`INSERT INTO pm_thread_links(thread_id,work_item_id,title,status,created_at,updated_at) VALUES(?,?,?,'confirmed',?,?)
+        ON CONFLICT(thread_id) DO UPDATE SET work_item_id=excluded.work_item_id,title=excluded.title,status='confirmed',updated_at=excluded.updated_at`).run(threadId, workItemId, String(body.title || "").slice(0,240), now, now);
+      return responseJson(response, 200, await runPmAgent("manual"));
+    }
+    const pmOpenMatch = url.pathname.match(/^\/api\/pm-agent\/threads\/([^/]+)\/open$/);
+    if (pmOpenMatch && request.method === "POST") {
+      const threadId = decodeURIComponent(pmOpenMatch[1]);
+      if (!/^[0-9a-f-]{36}$/i.test(threadId)) throw new Error("Choose a valid Codex task.");
+      openCodexThreadInApp(threadId);
+      return responseJson(response, 200, { opened: true, threadId });
+    }
     if (request.method === "GET" && url.pathname === "/api/bootstrap") return responseJson(response, 200, bootstrapPayload(Object.fromEntries(url.searchParams)));
     if (request.method === "GET" && url.pathname === "/api/work-items") return responseJson(response, 200, queryWorkItems(Object.fromEntries(url.searchParams)));
+    if (request.method === "GET" && url.pathname === "/api/projects") return responseJson(response, 200, queryProjects());
+    if (request.method === "POST" && url.pathname === "/api/projects/ingest") {
+      const body = await readJsonBody(request);
+      const changed = upsertSourceProjects("box",{ projects: [body] });
+      if (!changed) throw new Error("An approved, source-backed project plan is required.");
+      const project = db.prepare("SELECT id FROM projects WHERE source_provider='box' AND source_id=?").get(String(body.sourceId));
+      return responseJson(response, 201,projectDetail(project.id));
+    }
+    const projectMatch = url.pathname.match(/^\/api\/projects\/([^/]+)$/);
+    if (projectMatch && request.method === "GET") {
+      const project = projectDetail(decodeURIComponent(projectMatch[1]));
+      if (!project) throw new Error("Unknown project.");
+      return responseJson(response, 200, project);
+    }
+    const projectReconcileMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/reconcile$/);
+    if (projectReconcileMatch && request.method === "POST") {
+      const project = reconcileProject(decodeURIComponent(projectReconcileMatch[1]));
+      if (!project) throw new Error("Unknown project.");
+      return responseJson(response, 200, project);
+    }
+    const planItemMatch = url.pathname.match(/^\/api\/project-plan-items\/([^/]+)$/);
+    if (planItemMatch && request.method === "PATCH") {
+      const id = decodeURIComponent(planItemMatch[1]);
+      const current = db.prepare("SELECT * FROM project_plan_items WHERE id=?").get(id);
+      if (!current) throw new Error("Unknown project-plan item.");
+      const body = await readJsonBody(request);
+      const status = ["planned","active","blocked","complete"].includes(body.status) ? body.status : current.status;
+      const owner = typeof body.owner === "string" ? body.owner.trim().slice(0,240) || current.owner_label : current.owner_label;
+      const dueDate = body.dueDate === undefined ? current.due_date : body.dueDate ? String(body.dueDate).slice(0,10) : null;
+      db.prepare("UPDATE project_plan_items SET status=?,owner_label=?,due_date=?,updated_at=? WHERE id=?").run(status,owner,dueDate,nowIso(),id);
+      const project = reconcileProject(current.project_id);
+      return responseJson(response, 200, project);
+    }
     if (request.method === "GET" && url.pathname === "/api/calendar") return responseJson(response, 200, { events: queryCalendar(Object.fromEntries(url.searchParams)), receipt: sourceReceipts().find((item) => item.source === "calendar") || null });
     if (request.method === "POST" && url.pathname === "/api/calendar/refresh") {
       if (!calendarRefreshPromise) calendarRefreshPromise = syncCalendar().catch(() => null).finally(() => { calendarRefreshPromise = null; });
@@ -1727,8 +2987,9 @@ const server = createServer(async (request, response) => {
       const priority = ["urgent","high","normal","low"].includes(body.priority) ? body.priority : "normal";
       const suggestedAction = String(body.suggestedAction || title).trim().slice(0, 4000);
       const dueAt = body.dueAt ? new Date(body.dueAt).toISOString() : null;
-      db.prepare(`INSERT INTO work_items(id,type,company_slug,title,summary,why_now,priority,confidence,status,suggested_action,due_at,source_provider,source_key,decision_state,created_at,updated_at)
-        VALUES(?,?,?,?,?,?,?,1,'to_review',?,?, 'manual',?,'committed',?,?)`).run(id,type,companySlug,title,summary,whyNow,priority,suggestedAction,dueAt,sourceKey,now,now);
+      const preparation = defaultPreparationPolicy({ type, title, suggestedAction, preparationMode: body.preparationMode, preparationSkill: body.preparationSkill, preparationInstruction: body.preparationInstruction });
+      db.prepare(`INSERT INTO work_items(id,type,company_slug,title,summary,why_now,priority,confidence,status,suggested_action,due_at,source_provider,source_key,decision_state,preparation_mode,preparation_skill,preparation_instruction,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,1,'to_review',?,?, 'manual',?,'committed',?,?,?,?,?)`).run(id,type,companySlug,title,summary,whyNow,priority,suggestedAction,dueAt,sourceKey,preparation.mode,preparation.skill,preparation.instruction,now,now);
       db.prepare(`INSERT INTO source_references(id,work_item_id,provider,label,source_id,source_path,source_url,retrieved_at,freshness)
         VALUES(?,?, 'manual','Captured from Jake in Codex',?,'','',?,'live')`).run(randomUUID(),id,sourceKey,now);
       eventFor(id,"created","Captured from Jake's conversational commitment in Codex.");
@@ -1778,16 +3039,88 @@ const server = createServer(async (request, response) => {
       const replyOverride = body.replyState === null ? "" : hasReplyState ? body.replyState : current.reply_override;
       const snoozedUntil = body.snoozedUntil === undefined ? current.snoozed_until : body.snoozedUntil || null;
       db.prepare("UPDATE mail_messages SET company_slug=?,review_state=?,reply_state=?,reply_override=?,snoozed_until=?,updated_at=? WHERE id=?").run(company, reviewState, replyState, replyOverride, snoozedUntil, nowIso(), id);
+      if (company !== current.company_slug && current.action_work_item_id) db.prepare("UPDATE work_items SET company_slug=?,updated_at=? WHERE id=?").run(company, nowIso(), current.action_work_item_id);
       if (body.promote && !current.action_work_item_id) ensureMailAction(id, { highImpact: true });
       const actionId = current.action_work_item_id || (body.promote ? db.prepare("SELECT action_work_item_id FROM mail_messages WHERE id=?").get(id)?.action_work_item_id : null);
       if (actionId && snoozedUntil && Date.parse(snoozedUntil) > Date.now()) db.prepare("UPDATE work_items SET status='waiting_external',updated_at=? WHERE id=? AND status NOT IN ('done','dismissed')").run(nowIso(),actionId);
       if (actionId && (!snoozedUntil || Date.parse(snoozedUntil) <= Date.now())) db.prepare("UPDATE work_items SET status='to_review',updated_at=? WHERE id=? AND status='waiting_external'").run(nowIso(),actionId);
       const action = body.promote ? "promoted" : snoozedUntil !== current.snoozed_until ? "snoozed" : company !== current.company_slug ? "company_corrected" : replyState !== current.reply_state ? "reply_state_corrected" : "reviewed";
       recordFeedback({ eventType: action, mailMessageId: id, companySlug: company, detail: String(body.detail || action), beforeValue: JSON.stringify({ companySlug: current.company_slug, reviewState: current.review_state, replyState: current.reply_state, snoozedUntil: current.snoozed_until }), afterValue: JSON.stringify({ companySlug: company, reviewState, replyState, snoozedUntil }) });
+      if (company !== current.company_slug && company) proposeCompanyRoutingRule(current, company);
       return responseJson(response, 200, mapMail(db.prepare(`${mailSelect} WHERE m.id=?`).get(id), true));
     }
 
     if (request.method === "GET" && url.pathname === "/api/delegation-preview") return responseJson(response, 200, delegationPreview({ workItemId: url.searchParams.get("workItemId"), mailMessageId: url.searchParams.get("mailMessageId"), skillId: url.searchParams.get("skillId") || "" }));
+
+    const meetingWorkflowMatch = url.pathname.match(/^\/api\/meeting-workflows\/([^/]+)$/);
+    if (request.method === "GET" && meetingWorkflowMatch) {
+      const detail = await meetingWorkflowDetail(decodeURIComponent(meetingWorkflowMatch[1]));
+      if (!detail) throw new Error("This card is not a post-meeting workflow.");
+      return responseJson(response, 200, detail);
+    }
+    const meetingProcessMatch = url.pathname.match(/^\/api\/meeting-workflows\/([^/]+)\/process$/);
+    if (request.method === "POST" && meetingProcessMatch) {
+      const workItemId = decodeURIComponent(meetingProcessMatch[1]);
+      const workflow = db.prepare("SELECT * FROM meeting_workflows WHERE work_item_id=?").get(workItemId);
+      if (!workflow) throw new Error("This card is not a post-meeting workflow.");
+      if (workflow.state === "processing") return responseJson(response, 200, await meetingWorkflowDetail(workItemId));
+      const event = db.prepare("SELECT * FROM calendar_events WHERE id=?").get(workflow.calendar_event_id);
+      const body = await readJsonBody(request);
+      const candidates = await transcriptCandidatesFor(event);
+      let sourcePath = String(body.candidatePath || "");
+      if (sourcePath && !candidates.some((item) => path.resolve(item.path) === path.resolve(sourcePath))) throw new Error("That transcript is no longer an eligible match for this meeting.");
+      if (!sourcePath && candidates.length === 1 && candidates[0].score >= 12) sourcePath = candidates[0].path;
+      if (!sourcePath && candidates.length > 1 && candidates[0].score >= 8 && candidates[0].score - candidates[1].score >= 3) sourcePath = candidates[0].path;
+      if (!sourcePath) {
+        const state = candidates.length ? "candidate_review" : "waiting_for_transcript";
+        db.prepare("UPDATE meeting_workflows SET state=?,error='',updated_at=? WHERE id=?").run(state, nowIso(), workflow.id);
+        return responseJson(response, 200, await meetingWorkflowDetail(workItemId));
+      }
+      await launchMeetingProcessing(workflow, event, sourcePath);
+      return responseJson(response, 202, await meetingWorkflowDetail(workItemId));
+    }
+    const meetingSuggestionMatch = url.pathname.match(/^\/api\/meeting-workflows\/([^/]+)\/suggestions\/([^/]+)$/);
+    if (request.method === "PATCH" && meetingSuggestionMatch) {
+      const workItemId = decodeURIComponent(meetingSuggestionMatch[1]);
+      const suggestionId = decodeURIComponent(meetingSuggestionMatch[2]);
+      const belongs = db.prepare(`SELECT s.id FROM meeting_action_suggestions s JOIN meeting_workflows mw ON mw.id=s.meeting_workflow_id WHERE s.id=? AND mw.work_item_id=?`).get(suggestionId, workItemId);
+      if (!belongs) throw new Error("Unknown meeting follow-up.");
+      const body = await readJsonBody(request);
+      if (body.decision === "accept") acceptMeetingSuggestion(suggestionId);
+      else if (body.decision === "reject") db.prepare("UPDATE meeting_action_suggestions SET decision='rejected',updated_at=? WHERE id=? AND decision='proposed'").run(nowIso(), suggestionId);
+      else if (body.decision === "edit") {
+        const current = db.prepare("SELECT * FROM meeting_action_suggestions WHERE id=?").get(suggestionId);
+        if (current.decision !== "proposed") throw new Error("Only an unreviewed follow-up can be edited.");
+        db.prepare("UPDATE meeting_action_suggestions SET title=?,summary=?,suggested_action=?,priority=?,owner_state=?,updated_at=? WHERE id=?")
+          .run(String(body.title || current.title).slice(0,240), String(body.summary ?? current.summary).slice(0,4000), String(body.suggestedAction ?? current.suggested_action).slice(0,4000), ["urgent","high","normal","low"].includes(body.priority) ? body.priority : current.priority, ["jake","external"].includes(body.ownerState) ? body.ownerState : current.owner_state, nowIso(), suggestionId);
+      } else throw new Error("Choose accept, edit, or reject.");
+      return responseJson(response, 200, await meetingWorkflowDetail(workItemId));
+    }
+    const meetingCompleteMatch = url.pathname.match(/^\/api\/meeting-workflows\/([^/]+)\/complete$/);
+    if (request.method === "POST" && meetingCompleteMatch) {
+      const workItemId = decodeURIComponent(meetingCompleteMatch[1]);
+      const workflow = db.prepare("SELECT * FROM meeting_workflows WHERE work_item_id=?").get(workItemId);
+      if (!workflow) throw new Error("This card is not a post-meeting workflow.");
+      const proposed = db.prepare("SELECT COUNT(*) AS count FROM meeting_action_suggestions WHERE meeting_workflow_id=? AND decision='proposed'").get(workflow.id).count;
+      if (proposed) throw new Error("Accept or ignore each proposed follow-up before finishing the meeting review.");
+      const now = nowIso();
+      db.prepare("UPDATE meeting_workflows SET state='complete',updated_at=? WHERE id=?").run(now, workflow.id);
+      db.prepare("UPDATE work_items SET status='done',resolution='Meeting note saved and follow-up review completed.',resolved_at=?,updated_at=? WHERE id=?").run(now, now, workItemId);
+      eventFor(workItemId, "meeting_review_complete", "Meeting note saved and all proposed follow-ups were reviewed.");
+      return responseJson(response, 200, await meetingWorkflowDetail(workItemId));
+    }
+    const meetingNoTranscriptMatch = url.pathname.match(/^\/api\/meeting-workflows\/([^/]+)\/no-transcript$/);
+    if (request.method === "POST" && meetingNoTranscriptMatch) {
+      const workItemId = decodeURIComponent(meetingNoTranscriptMatch[1]);
+      const workflow = db.prepare("SELECT * FROM meeting_workflows WHERE work_item_id=?").get(workItemId);
+      if (!workflow) throw new Error("This card is not a post-meeting workflow.");
+      if (workflow.state === "processing") throw new Error("This transcript is already being processed.");
+      const now = nowIso();
+      db.prepare("UPDATE meeting_workflows SET state='complete',error='',updated_at=? WHERE id=?").run(now, workflow.id);
+      db.prepare("UPDATE work_items SET status='done',resolution='No transcript was recorded for this meeting.',suggested_action='No transcript follow-through is required.',resolved_at=?,updated_at=? WHERE id=?").run(now, now, workItemId);
+      eventFor(workItemId, "no_transcript", "Jake confirmed that no transcript was recorded. The reminder was closed without processing.");
+      return responseJson(response, 200, await meetingWorkflowDetail(workItemId));
+    }
 
     const clickUpCompleteMatch = url.pathname.match(/^\/api\/work-items\/([^/]+)\/complete-clickup$/);
     if (request.method === "POST" && clickUpCompleteMatch) {
@@ -1802,7 +3135,7 @@ const server = createServer(async (request, response) => {
       const body = await readJsonBody(request);
       const instruction = String(body.instruction || item.suggested_action || "Complete this assignment.").trim().slice(0,4000);
       if (!instruction) throw new Error("Describe the assignment for the new Codex task.");
-      return responseJson(response, 202, await launchPersistentCodexTask(item,instruction));
+      return responseJson(response, 201, preparePersistentCodexTask(item,instruction));
     }
     const codexTaskLinkMatch = url.pathname.match(/^\/api\/work-items\/([^/]+)\/codex-task-link$/);
     if (request.method === "POST" && codexTaskLinkMatch) {
@@ -1811,39 +3144,123 @@ const server = createServer(async (request, response) => {
       const body = await readJsonBody(request);
       const instruction = String(body.instruction || item.suggested_action || "Complete this assignment.").trim().slice(0,4000);
       if (!instruction) throw new Error("Describe the assignment for the new Codex task.");
-      return responseJson(response, 201, prepareUserOwnedCodexTask(item,instruction));
+      return responseJson(response, 201, preparePersistentCodexTask(item,instruction));
     }
     const codexTaskCallbackMatch = url.pathname.match(/^\/api\/codex-tasks\/([^/]+)\/callback$/);
     if (request.method === "POST" && codexTaskCallbackMatch) {
       const task = db.prepare("SELECT * FROM codex_tasks WHERE id=?").get(decodeURIComponent(codexTaskCallbackMatch[1]));
       if (!task) throw new Error("Unknown Codex task receipt.");
       const body = await readJsonBody(request); const status=String(body.status||""); const now=nowIso();
-      if (!['working','complete','error'].includes(status)) throw new Error("Codex task callback status must be working, complete, or error.");
-      if(status==='working'){
-        db.prepare("UPDATE codex_tasks SET status='working',updated_at=? WHERE id=?").run(now,task.id);
+      const normalizedStatus={working:'started',complete:'completed',error:'failed'}[status]||status;
+      if (!['accepted','started','heartbeat','needs_input','completed','failed','ownership_released'].includes(normalizedStatus)) throw new Error("Codex task callback status must be accepted, started, heartbeat, needs_input, completed, failed, or ownership_released.");
+      const threadId=String(body.threadId||"");
+      if(threadId && !/^[0-9a-f-]{36}$/i.test(threadId)) throw new Error("Codex task callback threadId must be a valid task ID.");
+      const verifiedThreadId=threadId||task.thread_id;
+      if(['accepted','started','heartbeat'].includes(normalizedStatus) && !/^[0-9a-f-]{36}$/i.test(verifiedThreadId)) throw new Error("A verified native Codex task ID is required before this assignment can be accepted or started.");
+      if(normalizedStatus==='accepted'){
+        db.prepare("UPDATE codex_tasks SET thread_id=CASE WHEN ?<>'' THEN ? ELSE thread_id END,status='accepted',heartbeat_at=?,updated_at=? WHERE id=?").run(threadId,threadId,now,now,task.id);
+        db.prepare("UPDATE work_items SET status='queued',updated_at=? WHERE id=?").run(now,task.work_item_id);
+        eventFor(task.work_item_id,"codex_task_accepted",`Native Codex accepted the assignment: ${task.title}`);
+      }else if(normalizedStatus==='started'||normalizedStatus==='heartbeat'){
+        db.prepare("UPDATE codex_tasks SET thread_id=CASE WHEN ?<>'' THEN ? ELSE thread_id END,status='working',heartbeat_at=?,updated_at=? WHERE id=?").run(threadId,threadId,now,now,task.id);
         db.prepare("UPDATE work_items SET status='working',updated_at=? WHERE id=?").run(now,task.work_item_id);
-        eventFor(task.work_item_id,"codex_task_started",`Started the user-owned Codex task: ${task.title}`);
-      }else if(status==='complete'){
+        if(normalizedStatus==='started') eventFor(task.work_item_id,"codex_task_started",`Started the native Codex task: ${task.title}`);
+      }else if(normalizedStatus==='needs_input'){
+        const detail=String(body.result||"The native Codex task needs input from its owning PM.").slice(0,8000);
+        db.prepare("UPDATE codex_tasks SET status='needs_input',result=?,heartbeat_at=?,updated_at=? WHERE id=?").run(detail,now,now,task.id);
+        db.prepare("UPDATE work_items SET status='waiting_on_user',updated_at=? WHERE id=?").run(now,task.work_item_id);
+        eventFor(task.work_item_id,"codex_task_needs_input",detail);
+      }else if(normalizedStatus==='completed'){
         const result=String(body.result||"The separate Codex task completed.").slice(0,50000);
-        db.prepare("UPDATE codex_tasks SET status='complete',result=?,error='',updated_at=? WHERE id=?").run(result,now,task.id);
-        db.prepare("UPDATE work_items SET status='back_for_review',updated_at=? WHERE id=?").run(now,task.work_item_id);
-        eventFor(task.work_item_id,"codex_task_returned","User-owned Codex task completed and returned for review.");
-      }else{
+        applyCodexTaskResult(task,result);
+      }else if(normalizedStatus==='failed'){
         const error=String(body.error||"The separate Codex task needs attention.").slice(0,8000);
         db.prepare("UPDATE codex_tasks SET status='error',error=?,updated_at=? WHERE id=?").run(error,now,task.id);
         db.prepare("UPDATE work_items SET status='back_for_review',updated_at=? WHERE id=?").run(now,task.work_item_id);
         eventFor(task.work_item_id,"codex_task_error",error);
+      }else{
+        const detail=String(body.result||"The native Codex task released ownership without completing the assignment.").slice(0,8000);
+        db.prepare("UPDATE codex_tasks SET status='ownership_released',result=?,heartbeat_at=?,updated_at=? WHERE id=?").run(detail,now,now,task.id);
+        db.prepare("UPDATE work_items SET status='to_review',updated_at=? WHERE id=?").run(now,task.work_item_id);
+        eventFor(task.work_item_id,"codex_task_ownership_released",detail);
       }
-      return responseJson(response, 200, {id:task.id,status,updatedAt:now});
+      return responseJson(response, 200, {id:task.id,status:normalizedStatus==='heartbeat'?'working':normalizedStatus,updatedAt:now});
+    }
+
+    const cardCommandMatch = url.pathname.match(/^\/api\/work-items\/([^/]+)\/command$/);
+    if (request.method === "POST" && cardCommandMatch) {
+      const id = decodeURIComponent(cardCommandMatch[1]);
+      const current = db.prepare("SELECT * FROM work_items WHERE id=?").get(id);
+      if (!current) throw new Error("Unknown work item.");
+      const body = await readJsonBody(request);
+      const instruction = String(body.instruction || "").trim().slice(0, 4000);
+      if (!instruction) throw new Error("Describe what you want to change or do.");
+      const companies = db.prepare("SELECT slug,display_name FROM companies WHERE active=1").all().map((company) => ({ slug: company.slug, displayName: company.display_name, aliases: company.slug === "firm" ? ["Serent", "Serent / Firm"] : [] }));
+      const parsed = parseCardCommand({ instruction, current, companies, now: new Date() });
+      if (parsed.clarification) return responseJson(response, 200, { handled: true, updated: workItemById(id), changes: [], remainingIntent: "", clarification: parsed.clarification, message: parsed.clarification, undoToken: "" });
+      if (!parsed.handled) return responseJson(response, 200, { handled: false, updated: workItemById(id), changes: [], remainingIntent: instruction, clarification: "", message: "", undoToken: "" });
+
+      const commandId = randomUUID();
+      const now = nowIso();
+      const fields = Object.keys(parsed.patch);
+      const previous = cardCommandSnapshot(current, fields);
+      if (parsed.patch.status === "done") {
+        previous.projectPlanItems = db.prepare(`SELECT p.id,p.status FROM project_plan_items p
+          JOIN project_action_links l ON l.project_plan_item_id=p.id WHERE l.work_item_id=?`).all(id);
+      }
+      applyCardCommandPatch(id, parsed.patch);
+      db.prepare(`INSERT INTO card_commands(id,work_item_id,instruction,previous_json,next_json,status,created_at)
+        VALUES(?,?,?,?,?,'applied',?)`).run(commandId, id, instruction, JSON.stringify(previous), JSON.stringify(parsed.patch), now);
+      const labels = [...new Set(parsed.changes.map((change) => change.label))];
+      const message = `Updated ${labels.join(", ")}.`;
+      eventFor(id, "command_applied", `${message} Jake wrote: ${instruction}`);
+      if (Object.hasOwn(parsed.patch, "company_slug")) {
+        const linkedMail = db.prepare("SELECT id FROM mail_messages WHERE action_work_item_id=? LIMIT 1").get(id);
+        if (linkedMail) db.prepare("UPDATE mail_messages SET company_slug=?,updated_at=? WHERE id=?").run(parsed.patch.company_slug, now, linkedMail.id);
+      }
+      if (parsed.patch.status === "done") {
+        db.prepare(`UPDATE project_plan_items SET status='complete',updated_at=? WHERE id IN
+          (SELECT project_plan_item_id FROM project_action_links WHERE work_item_id=?)`).run(now,id);
+      }
+      return responseJson(response, 200, { handled: true, updated: workItemById(id), changes: parsed.changes, remainingIntent: parsed.remainingIntent, clarification: "", message, undoToken: commandId });
+    }
+
+    const undoCardCommandMatch = url.pathname.match(/^\/api\/card-commands\/([^/]+)\/undo$/);
+    if (request.method === "POST" && undoCardCommandMatch) {
+      const command = db.prepare("SELECT * FROM card_commands WHERE id=?").get(decodeURIComponent(undoCardCommandMatch[1]));
+      if (!command) throw new Error("Unknown card change.");
+      if (command.status !== "applied") throw new Error("This card change has already been undone.");
+      const previous = JSON.parse(command.previous_json || "{}");
+      applyCardCommandPatch(command.work_item_id, previous);
+      const now = nowIso();
+      db.prepare("UPDATE card_commands SET status='undone',undone_at=? WHERE id=?").run(now, command.id);
+      if (Object.hasOwn(previous, "company_slug")) {
+        const linkedMail = db.prepare("SELECT id FROM mail_messages WHERE action_work_item_id=? LIMIT 1").get(command.work_item_id);
+        if (linkedMail) db.prepare("UPDATE mail_messages SET company_slug=?,updated_at=? WHERE id=?").run(previous.company_slug, now, linkedMail.id);
+      }
+      if (Array.isArray(previous.projectPlanItems)) {
+        const restorePlanStatus = db.prepare("UPDATE project_plan_items SET status=?,updated_at=? WHERE id=?");
+        for (const item of previous.projectPlanItems) restorePlanStatus.run(item.status, now, item.id);
+      }
+      eventFor(command.work_item_id, "command_undone", `Undid card command: ${command.instruction}`);
+      return responseJson(response, 200, { updated: workItemById(command.work_item_id), message: "Undid the card change." });
     }
 
     const workItemMatch = url.pathname.match(/^\/api\/work-items\/([^/]+)$/);
+    if (request.method === "GET" && workItemMatch) {
+      const id = decodeURIComponent(workItemMatch[1]);
+      const row = db.prepare(`SELECT w.*, c.display_name AS company_name FROM work_items w LEFT JOIN companies c ON c.slug=w.company_slug WHERE w.id=?`).get(id);
+      if (!row) throw new Error("Unknown work item.");
+      return responseJson(response, 200, hydrateWorkItem(row));
+    }
     if (request.method === "PATCH" && workItemMatch) {
       const id = decodeURIComponent(workItemMatch[1]);
       const current = db.prepare("SELECT * FROM work_items WHERE id = ?").get(id);
       if (!current) throw new Error("Unknown work item.");
       const body = await readJsonBody(request);
       const allowedStatus = ["to_review", "queued", "working", "waiting_on_user", "waiting_external", "back_for_review", "done", "dismissed", "error"];
+      const requestedCompany = body.companySlug === undefined ? current.company_slug : body.companySlug || null;
+      const companySlug = requestedCompany && !db.prepare("SELECT slug FROM companies WHERE slug=? AND active=1").get(requestedCompany) ? current.company_slug : requestedCompany;
       const next = {
         status: allowedStatus.includes(body.status) ? body.status : current.status,
         priority: ["urgent", "high", "normal", "low"].includes(body.priority) ? body.priority : current.priority,
@@ -1856,13 +3273,26 @@ const server = createServer(async (request, response) => {
         dueAt: body.dueAt === undefined ? current.due_at : body.dueAt ? new Date(body.dueAt).toISOString() : null,
         plannedAt: body.plannedAt === undefined ? current.planned_at : body.plannedAt ? new Date(body.plannedAt).toISOString() : null,
         plannedMinutes: body.plannedMinutes === undefined ? current.planned_minutes : Math.min(240, Math.max(0, Number(body.plannedMinutes || 0))),
+        preparationMode: ["manual","auto","none"].includes(body.preparationMode) ? body.preparationMode : current.preparation_mode,
+        preparationSkill: typeof body.preparationSkill === "string" ? body.preparationSkill.trim().slice(0,120) : current.preparation_skill,
+        preparationInstruction: typeof body.preparationInstruction === "string" ? body.preparationInstruction.trim().slice(0,4000) : current.preparation_instruction,
+        companySlug,
       };
       const resolvedAt = ["done", "dismissed"].includes(next.status) ? nowIso() : null;
-      db.prepare(`UPDATE work_items SET status=?,priority=?,draft=?,title=?,summary=?,suggested_action=?,resolution=?,decision_state=?,due_at=?,planned_at=?,planned_minutes=?,updated_at=?,resolved_at=? WHERE id=?`).run(next.status, next.priority, next.draft, next.title, next.summary, next.suggestedAction, next.resolution, next.decisionState, next.dueAt, next.plannedAt, next.plannedMinutes, nowIso(), resolvedAt, id);
-      const eventType = next.status !== current.status ? next.status : "edited";
+      db.prepare(`UPDATE work_items SET status=?,priority=?,draft=?,title=?,summary=?,suggested_action=?,resolution=?,decision_state=?,due_at=?,planned_at=?,planned_minutes=?,preparation_mode=?,preparation_skill=?,preparation_instruction=?,company_slug=?,updated_at=?,resolved_at=? WHERE id=?`).run(next.status, next.priority, next.draft, next.title, next.summary, next.suggestedAction, next.resolution, next.decisionState, next.dueAt, next.plannedAt, next.plannedMinutes, next.preparationMode, next.preparationSkill, next.preparationInstruction, next.companySlug, nowIso(), resolvedAt, id);
+      if (next.status === "done") {
+        db.prepare(`UPDATE project_plan_items SET status='complete',updated_at=? WHERE id IN
+          (SELECT project_plan_item_id FROM project_action_links WHERE work_item_id=?)`).run(nowIso(),id);
+      }
+      const linkedMail = next.companySlug !== current.company_slug ? db.prepare("SELECT * FROM mail_messages WHERE action_work_item_id=? LIMIT 1").get(id) : null;
+      if (linkedMail) {
+        db.prepare("UPDATE mail_messages SET company_slug=?,updated_at=? WHERE id=?").run(next.companySlug, nowIso(), linkedMail.id);
+        if (next.companySlug) proposeCompanyRoutingRule(linkedMail, next.companySlug);
+      }
+      const eventType = next.status !== current.status ? next.status : next.companySlug !== current.company_slug ? "company_corrected" : "edited";
       eventFor(id, eventType, body.eventDetail || (eventType === "edited" ? "Workbench content updated." : `Moved to ${eventType}.`));
-      if (next.status !== current.status || next.priority !== current.priority || next.draft !== current.draft) {
-        recordFeedback({ eventType, workItemId: id, companySlug: current.company_slug, detail: body.eventDetail || "Workbench action", beforeValue: JSON.stringify({ status: current.status, priority: current.priority, draft: current.draft }), afterValue: JSON.stringify({ status: next.status, priority: next.priority, draft: next.draft }) });
+      if (next.status !== current.status || next.priority !== current.priority || next.draft !== current.draft || next.companySlug !== current.company_slug) {
+        recordFeedback({ eventType, workItemId: id, mailMessageId: linkedMail?.id || null, companySlug: next.companySlug, detail: body.eventDetail || "Workbench action", beforeValue: JSON.stringify({ status: current.status, priority: current.priority, draft: current.draft, companySlug: current.company_slug }), afterValue: JSON.stringify({ status: next.status, priority: next.priority, draft: next.draft, companySlug: next.companySlug }) });
       }
       if (next.status === "dismissed" && body.feedback) {
         const now = nowIso();
@@ -2043,4 +3473,9 @@ server.listen(port, host, () => {
   void reconcilePersistentTasks();
   const reconciliationTimer=setInterval(()=>void reconcilePersistentTasks(),15000);
   reconciliationTimer.unref();
+  if (localWorkflowsEnabled) {
+    const pmTimer = setInterval(() => void maybeRunPmAgent(), 60000);
+    pmTimer.unref();
+    setTimeout(() => void maybeRunPmAgent(), 5000).unref();
+  }
 });

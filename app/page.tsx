@@ -4,6 +4,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import MailWorkspace from "./mail-workspace";
 import CalendarWorkspace from "./calendar-workspace";
 import MarkdownEditor from "./markdown-editor";
+import PmAgentWorkspace from "./pm-agent-workspace";
+import ProjectWorkspace from "./project-workspace";
+import { dueDateEndOfLocalDayIso, dueDateInputValue } from "./due-date";
+import { workViewFor, workViews, type WorkView } from "./work-view";
 
 type WorkStatus =
   | "to_review"
@@ -15,7 +19,7 @@ type WorkStatus =
   | "done"
   | "dismissed"
   | "error";
-type WorkView = "needs_me" | "my_work" | "codex_working" | "waiting" | "done";
+type DueBucket = "overdue" | "today" | "tomorrow" | "this_week" | "later" | "no_date";
 
 type Company = {
   slug: string;
@@ -89,6 +93,18 @@ type AgentRun = {
   updatedAt: string;
 };
 
+type CodexTaskReceipt = {
+  id: string;
+  threadId: string;
+  title: string;
+  instruction: string;
+  status: string;
+  result: string;
+  error: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
 type WorkItem = {
   id: string;
   type: string;
@@ -106,6 +122,9 @@ type WorkItem = {
   dueAt: string | null;
   plannedAt: string | null;
   plannedMinutes: number;
+  preparationMode: "manual" | "auto" | "none";
+  preparationSkill: string;
+  preparationInstruction: string;
   resolution: string;
   decisionState: "proposed" | "accepted" | "committed";
   createdAt: string;
@@ -115,7 +134,16 @@ type WorkItem = {
   notes: Note[];
   agentRuns: AgentRun[];
   externalActions: Array<{ id: string; provider: string; actionType: string; targetId: string; status: string; receipt: string; error: string; createdAt: string; updatedAt: string }>;
-  codexTasks: Array<{ id: string; threadId: string; title: string; instruction: string; status: string; result: string; error: string; createdAt: string; updatedAt: string }>;
+  codexTasks: CodexTaskReceipt[];
+  projectContext: null | {
+    projectId: string;
+    projectTitle: string;
+    planItemId: string;
+    planItemTitle: string;
+    workstream: string;
+    phaseTitle: string;
+    dueDate: string | null;
+  };
   activeRules: PreferenceRule[];
 };
 
@@ -133,13 +161,14 @@ type PreferenceRule = {
   updatedAt: string;
 };
 
-type SkillRoute = { id: string; label: string; description: string; executorType: string; expectedOutput: string };
-type DelegationPreview = {
-  selectedSkill: SkillRoute;
-  availableSkills: SkillRoute[];
-  contextManifest: Record<string, unknown>;
-  contextSummary: string[];
-  missingPrerequisites: string[];
+type CardCommandResponse = {
+  handled: boolean;
+  updated: WorkItem;
+  changes: Array<{ field: string; label: string; before: unknown; after: unknown }>;
+  remainingIntent: string;
+  clarification: string;
+  message: string;
+  undoToken: string;
 };
 
 type SourceReceipt = {
@@ -161,6 +190,30 @@ type Bootstrap = {
   sources: SourceReceipt[];
   dailyNote: Note;
   runner: { status: string; activeJobs: number };
+};
+
+type MeetingWorkflow = {
+  id: string;
+  workItemId: string;
+  state: "waiting_for_transcript" | "candidate_review" | "processing" | "review" | "complete" | "error";
+  candidatePath: string;
+  transcriptPath: string;
+  noteId: string | null;
+  noteTitle: string;
+  noteFilePath: string;
+  agentRunId: string | null;
+  error: string;
+  event: { subject: string; startAt: string; endAt: string; attendees: Array<{ name?: string; email?: string }> };
+  candidates: Array<{ path: string; name: string; modifiedAt: string; size: number; score: number; reasons: string[] }>;
+  suggestions: Array<{
+    id: string; title: string; summary: string; companySlug: string | null; type: string;
+    priority: "urgent" | "high" | "normal" | "low"; ownerState: "jake" | "external";
+    suggestedAction: string; evidenceTimestamp: string; dueAt: string | null;
+    existingWorkItemId: string | null; decision: "proposed" | "accepted" | "rejected";
+    createdWorkItemId: string | null;
+  }>;
+  createdAt: string;
+  updatedAt: string;
 };
 
 type SearchResult = {
@@ -188,7 +241,9 @@ const statusMeta: Record<WorkStatus, { label: string; short: string }> = {
 };
 
 const navItems = [
-  ["inbox", "Today"],
+  ["inbox", "My work"],
+  ["projects", "Projects"],
+  ["pm", "PM agent"],
   ["calendar", "Calendar"],
   ["mail", "Mail"],
   ["notes", "Documents"],
@@ -196,8 +251,9 @@ const navItems = [
   ["agents", "Codex work"],
   ["search", "Search"],
 ] as const;
-const primaryNavItems = navItems.slice(0, 4);
-const moreNavItems = navItems.slice(4);
+const focusNavItems = navItems.filter(([id]) => ["inbox", "mail", "calendar"].includes(id));
+const workspaceNavItems = navItems.filter(([id]) => ["projects", "notes", "companies"].includes(id));
+const intelligenceNavItems = navItems.filter(([id]) => ["pm", "agents", "search"].includes(id));
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(`${runnerUrl}${path}`, {
@@ -212,6 +268,15 @@ async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.error || "The local runner could not complete the request.");
   return payload as T;
+}
+
+function openDeepLink(href: string) {
+  const link = document.createElement("a");
+  link.href = href;
+  link.style.display = "none";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
 }
 
 function relativeTime(value: string | null) {
@@ -249,21 +314,41 @@ function actionKind(item: WorkItem) {
   return { id: "suggested", label: "Suggested" };
 }
 
-const workViews: Array<{ id: WorkView; label: string }> = [
-  { id: "needs_me", label: "Needs Me" },
-  { id: "my_work", label: "My Work" },
-  { id: "codex_working", label: "Codex Working" },
-  { id: "waiting", label: "Waiting" },
-  { id: "done", label: "Done" },
+const dueBuckets: Array<{ id: DueBucket; label: string }> = [
+  { id: "overdue", label: "Overdue" },
+  { id: "today", label: "Today" },
+  { id: "tomorrow", label: "Tomorrow" },
+  { id: "this_week", label: "This week" },
+  { id: "later", label: "Later" },
+  { id: "no_date", label: "No due date" },
 ];
 
-function workViewFor(item: WorkItem): WorkView {
-  if (["done", "dismissed"].includes(item.status)) return "done";
-  if (["queued", "working"].includes(item.status)) return "codex_working";
-  if (item.status === "waiting_external") return "waiting";
-  if (["back_for_review", "error", "waiting_on_user"].includes(item.status)) return "needs_me";
-  if (item.status === "to_review" && item.decisionState === "proposed") return "needs_me";
-  return "my_work";
+function startOfDay(value: Date) {
+  return new Date(value.getFullYear(), value.getMonth(), value.getDate());
+}
+
+function dueBucketFor(item: WorkItem, anchor: Date): DueBucket {
+  if (!item.dueAt) return "no_date";
+  const due = startOfDay(new Date(item.dueAt));
+  const today = startOfDay(anchor);
+  const difference = Math.round((due.getTime() - today.getTime()) / 86_400_000);
+  if (difference < 0) return "overdue";
+  if (difference === 0) return "today";
+  if (difference === 1) return "tomorrow";
+  const daysUntilSunday = (7 - today.getDay()) % 7;
+  if (difference <= daysUntilSunday) return "this_week";
+  return "later";
+}
+
+function dueLabel(item: WorkItem, anchor: Date) {
+  const bucket = dueBucketFor(item, anchor);
+  if (bucket === "no_date") return "No due date";
+  const date = new Date(item.dueAt!);
+  const calendarDate = date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  if (bucket === "overdue") return `Overdue · ${calendarDate}`;
+  if (bucket === "today") return `Today · ${calendarDate}`;
+  if (bucket === "tomorrow") return `Tomorrow · ${calendarDate}`;
+  return calendarDate;
 }
 
 function cardState(item: WorkItem) {
@@ -285,8 +370,20 @@ function requestedOutcome(run: AgentRun) {
   return String(value || run.title).trim();
 }
 
+function codexTaskPresentation(task: CodexTaskReceipt) {
+  if (task.status === "waiting_on_user" && !task.threadId) return { label: "Ready to open", detail: "No Codex task is running yet. Open this handoff when you are ready to start the work." };
+  if (task.status === "accepted") return { label: "Accepted", detail: "A verified native Codex task accepted this assignment and is waiting to report that work started." };
+  if (["starting", "working"].includes(task.status)) return { label: "Working", detail: "The native Codex task reports that it is actively working on this assignment." };
+  if (task.status === "needs_input") return { label: "Needs input", detail: task.result || "The native Codex task needs input before it can continue." };
+  if (task.status === "needs_attention") return { label: "Needs attention", detail: task.result || "The linked Codex task has not reported recent progress." };
+  if (task.status === "complete") return { label: "Completed", detail: task.result || "The native Codex task completed this assignment." };
+  if (task.status === "error") return { label: "Failed", detail: task.error || "The native Codex task reported a failure." };
+  if (task.status === "ownership_released") return { label: "Released", detail: task.result || "The native Codex task released this assignment." };
+  return { label: task.status.replaceAll("_", " "), detail: task.result || task.error || "No activity has been reported." };
+}
+
 function sourceName(source: string) {
-  return ({ ai_os: "AI OS", project_files: "project files", manual: "this card", outlook: "Outlook", calendar: "calendar", transcripts: "transcripts", box: "Box", clickup: "ClickUp" } as Record<string, string>)[source] || source.replaceAll("_", " ");
+  return ({ ai_os: "AI OS", project_files: "project files", project_plan: "approved project plan", manual: "this card", outlook: "Outlook", calendar: "calendar", transcripts: "transcripts", box: "Box", clickup: "ClickUp" } as Record<string, string>)[source] || source.replaceAll("_", " ");
 }
 
 function workingSurface(item: WorkItem) {
@@ -307,20 +404,20 @@ export default function Home() {
       ? "all"
       : window.localStorage.getItem("serent-tend-company") || "all",
   );
-  const [statusFilter, setStatusFilter] = useState<WorkView>("needs_me");
+  const [statusFilter, setStatusFilter] = useState<WorkView>("open");
   const [sourceFilter, setSourceFilter] = useState("all");
   const [typeFilter, setTypeFilter] = useState("all");
   const [priorityFilter, setPriorityFilter] = useState("all");
   const [mobileWorkbenchOpen, setMobileWorkbenchOpen] = useState(false);
   const [quickCapture, setQuickCapture] = useState("");
   const [composer, setComposer] = useState("");
-  const [composerScope, setComposerScope] = useState("item");
   const [codexDestination, setCodexDestination] = useState<"card" | "task">("card");
   const [draft, setDraft] = useState("");
   const [draftItemId, setDraftItemId] = useState("");
   const [notice, setNotice] = useState("");
+  const [undoCommandId, setUndoCommandId] = useState("");
   const [busy, setBusy] = useState(false);
-  const [showMore, setShowMore] = useState(false);
+  const [commandOpen, setCommandOpen] = useState(false);
   const [notes, setNotes] = useState<Note[]>([]);
   const [activeNoteId, setActiveNoteId] = useState("");
   const [noteTitle, setNoteTitle] = useState("");
@@ -333,9 +430,9 @@ export default function Home() {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [policies, setPolicies] = useState<PreferenceRule[]>([]);
-  const [delegation, setDelegation] = useState<DelegationPreview | null>(null);
-  const [skillSelection] = useState({ itemId: "", skillId: "" });
   const [mailTargetId, setMailTargetId] = useState("");
+  const [meetingWorkflow, setMeetingWorkflow] = useState<MeetingWorkflow | null>(null);
+  const [meetingEdit, setMeetingEdit] = useState<{ id: string; title: string; suggestedAction: string } | null>(null);
   const quickRef = useRef<HTMLInputElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const noteSaveVersion = useRef(0);
@@ -403,6 +500,13 @@ export default function Home() {
     window.localStorage.setItem("serent-tend-company", companyFilter);
   }, [companyFilter]);
 
+  useEffect(() => {
+    const refreshCalendar = () => void api("/api/calendar/refresh", { method: "POST", body: JSON.stringify({}) }).catch(() => {});
+    const initial = window.setTimeout(refreshCalendar, 1500);
+    const timer = window.setInterval(refreshCalendar, 5 * 60 * 1000);
+    return () => { window.clearTimeout(initial); window.clearInterval(timer); };
+  }, []);
+
   const activeNote = notes.find((note) => note.id === activeNoteId) || data?.dailyNote || null;
   const filteredNotes = useMemo(() => {
     const query = noteQuery.trim().toLowerCase();
@@ -464,36 +568,53 @@ export default function Home() {
     if (priorityFilter !== "all" && item.priority !== priorityFilter) return false;
     return true;
   });
-  const effectiveSelectedId = filteredItems.some((item) => item.id === selectedId)
-    ? selectedId
-    : filteredItems[0]?.id || "";
+  const effectiveSelectedId = items.some((item) => item.id === selectedId) ? selectedId : filteredItems[0]?.id || "";
   const selected = items.find((item) => item.id === effectiveSelectedId) || null;
   const selectedWorkingSurface = selected ? workingSurface(selected) : null;
-  const selectedActiveRun = selected?.agentRuns.find((run) => ["queued", "working"].includes(run.status)) || null;
-  const selectedActiveTask = selected?.codexTasks.find((task) => ["starting", "working", "waiting_on_user"].includes(task.status)) || null;
-  const selectedSkillId = selected && skillSelection.itemId === selected.id ? skillSelection.skillId : "";
+  const selectedActiveRun = selected?.agentRuns.find((run) => ["queued", "working", "waiting_on_user"].includes(run.status)) || null;
+  const selectedLatestResult = selected?.agentRuns.filter((run) => ["review", "error"].includes(run.status)).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0] || null;
+  const selectedPreparedTask = selected?.codexTasks.find((task) => task.status === "waiting_on_user" && !task.threadId) || null;
+  const selectedActiveTask = selected?.codexTasks.find((task) => Boolean(task.threadId) && ["accepted", "starting", "working"].includes(task.status)) || null;
+  const selectedMeetingId = selected?.type === "meeting_follow_up" ? selected.id : "";
+  const activeMeetingWorkflow = meetingWorkflow?.workItemId === selectedMeetingId ? meetingWorkflow : null;
   const visibleDraft = selected && draftItemId === selected.id ? draft : selected?.draft || "";
   const allRuns = items.flatMap((item) => item.agentRuns).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 
   useEffect(() => {
-    if (!selected) return;
+    if (!selectedMeetingId) return;
     let cancelled = false;
-    api<DelegationPreview>(`/api/delegation-preview?workItemId=${encodeURIComponent(selected.id)}${selectedSkillId ? `&skillId=${encodeURIComponent(selectedSkillId)}` : ""}`)
-      .then((next) => { if (!cancelled) setDelegation(next); })
-      .catch(() => { if (!cancelled) setDelegation(null); });
-    return () => { cancelled = true; };
-  }, [selected, selectedSkillId]);
+    const readWorkflow = async () => {
+      try {
+        const next = await api<MeetingWorkflow>(`/api/meeting-workflows/${encodeURIComponent(selectedMeetingId)}`);
+        if (!cancelled) setMeetingWorkflow(next);
+      } catch {
+        if (!cancelled) setMeetingWorkflow(null);
+      }
+    };
+    void readWorkflow();
+    const timer = window.setInterval(() => void readWorkflow(), 3000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [selectedMeetingId]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement;
       const typing = ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName);
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setCommandOpen((current) => !current);
+        return;
+      }
+      if (event.key === "Escape") {
+        setCommandOpen(false);
+        setMobileWorkbenchOpen(false);
+      }
       if (event.key === "/" && !typing) {
         event.preventDefault();
         setView("search");
         window.setTimeout(() => searchRef.current?.focus(), 0);
       }
-      if (event.key.toLowerCase() === "n" && !typing) {
+      if (["c", "n"].includes(event.key.toLowerCase()) && !typing) {
         event.preventDefault();
         quickRef.current?.focus();
       }
@@ -553,26 +674,6 @@ export default function Home() {
     }
   };
 
-  const launchAgent = async (revisionOf?: string) => {
-    if (!selected) return;
-    const intent = composer.trim() || selected.suggestedAction;
-    if (!intent) return;
-    setBusy(true);
-    try {
-      await api<AgentRun>("/api/agent-runs", {
-        method: "POST",
-        body: JSON.stringify({ workItemId: selected.id, scope: composerScope, intent, revisionOf: revisionOf || null, skillId: selectedSkillId || delegation?.selectedSkill.id }),
-      });
-      setComposer("");
-      setNotice("Queued for Codex. You can keep working here.");
-      await load(true);
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : "The assignment could not be queued.");
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const completeInClickUp = async () => {
     if (!selected) return;
     setBusy(true);
@@ -585,18 +686,92 @@ export default function Home() {
     } finally { setBusy(false); }
   };
 
-  const openCodexTask = async () => {
+  const processMeetingTranscript = async (candidatePath = "") => {
     if (!selected) return;
     setBusy(true);
     try {
-      const launch = await api<{ deepLink: string }>(`/api/work-items/${encodeURIComponent(selected.id)}/codex-task-link`, { method: "POST", body: JSON.stringify({ instruction: composer.trim() || selected.suggestedAction }) });
-      setComposer("");
-      setNotice(`Opened "${selected.companyName} - ${selected.title}" as a normal Codex task. Press Send there to start it.`);
+      const next = await api<MeetingWorkflow>(`/api/meeting-workflows/${encodeURIComponent(selected.id)}/process`, { method: "POST", body: JSON.stringify({ candidatePath }) });
+      setMeetingWorkflow(next);
+      if (next.state === "waiting_for_transcript") setNotice("No matching transcript is in Downloads yet. Download it, then try again.");
+      else if (next.state === "candidate_review") setNotice("I found more than one possible transcript. Choose the right one.");
+      else setNotice("Processing the transcript. The note and proposed follow-ups will return to this card.");
       await load(true);
-      window.location.assign(launch.deepLink);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The transcript could not be processed.");
+    } finally { setBusy(false); }
+  };
+
+  const decideMeetingSuggestion = async (suggestionId: string, decision: "accept" | "reject") => {
+    if (!selected) return;
+    setBusy(true);
+    try {
+      const next = await api<MeetingWorkflow>(`/api/meeting-workflows/${encodeURIComponent(selected.id)}/suggestions/${encodeURIComponent(suggestionId)}`, { method: "PATCH", body: JSON.stringify({ decision }) });
+      setMeetingWorkflow(next);
+      setNotice(decision === "accept" ? "Added to Command Center without writing to any external system." : "Ignored. It will not become a card.");
+      await load(true);
+    } catch (error) { setNotice(error instanceof Error ? error.message : "The follow-up could not be updated."); }
+    finally { setBusy(false); }
+  };
+
+  const saveMeetingSuggestionEdit = async () => {
+    if (!selected || !meetingEdit?.title.trim()) return;
+    setBusy(true);
+    try {
+      const next = await api<MeetingWorkflow>(`/api/meeting-workflows/${encodeURIComponent(selected.id)}/suggestions/${encodeURIComponent(meetingEdit.id)}`, { method: "PATCH", body: JSON.stringify({ decision: "edit", title: meetingEdit.title.trim(), suggestedAction: meetingEdit.suggestedAction.trim() }) });
+      setMeetingWorkflow(next);
+      setMeetingEdit(null);
+      setNotice("Updated the proposed follow-up. It still needs your approval before becoming a card.");
+    } catch (error) { setNotice(error instanceof Error ? error.message : "The follow-up could not be edited."); }
+    finally { setBusy(false); }
+  };
+
+  const finishMeetingReview = async () => {
+    if (!selected) return;
+    setBusy(true);
+    try {
+      const next = await api<MeetingWorkflow>(`/api/meeting-workflows/${encodeURIComponent(selected.id)}/complete`, { method: "POST", body: JSON.stringify({}) });
+      setMeetingWorkflow(next);
+      setNotice("Meeting processed. The note is saved and accepted follow-ups are now in your work stream.");
+      await load(true);
+    } catch (error) { setNotice(error instanceof Error ? error.message : "The meeting review could not be finished."); }
+    finally { setBusy(false); }
+  };
+
+  const closeMeetingWithoutTranscript = async () => {
+    if (!selected) return;
+    setBusy(true);
+    try {
+      const next = await api<MeetingWorkflow>(`/api/meeting-workflows/${encodeURIComponent(selected.id)}/no-transcript`, { method: "POST", body: JSON.stringify({}) });
+      setMeetingWorkflow(next);
+      setNotice("Closed. No transcript was recorded, so no transcript follow-through is required.");
+      await load(true);
+    } catch (error) { setNotice(error instanceof Error ? error.message : "The meeting reminder could not be closed."); }
+    finally { setBusy(false); }
+  };
+
+  const openCodexTask = async (instructionOverride = "") => {
+    if (!selected) return;
+    setBusy(true);
+    try {
+      const instruction = instructionOverride.trim() || composer.trim() || selected.suggestedAction;
+      const task = await api<{ reused: boolean; deepLink?: string; threadId?: string; status: string }>(`/api/work-items/${encodeURIComponent(selected.id)}/codex-task`, { method: "POST", body: JSON.stringify({ instruction }) });
+      setComposer("");
+      if (task.deepLink) openDeepLink(task.deepLink);
+      else if (task.threadId) await reopenCodexTask(task.threadId);
+      setNotice(task.reused ? `Reopened the existing "${selected.companyName} - ${selected.title}" native Codex handoff.` : `Handed "${selected.companyName} - ${selected.title}" to a native Codex task. Progress returns through its receipt.`);
+      await load(true);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "The separate Codex task could not be created.");
     } finally { setBusy(false); }
+  };
+
+  const reopenCodexTask = async (threadId: string) => {
+    try {
+      await api(`/api/pm-agent/threads/${encodeURIComponent(threadId)}/open`, { method: "POST", body: JSON.stringify({}) });
+      setNotice("Opened the linked Codex task. Continue refining there; its next callback will return the result to this card.");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The linked Codex task could not be opened.");
+    }
   };
 
   const acceptAction = async () => {
@@ -605,8 +780,52 @@ export default function Home() {
   };
 
   const submitCodexChoice = async () => {
-    if (codexDestination === "task") await openCodexTask();
-    else await launchAgent();
+    if (codexDestination === "task") return openCodexTask();
+    if (!selected) return;
+    const instruction = composer.trim() || selected.suggestedAction;
+    if (!instruction) return;
+    setBusy(true);
+    try {
+      const command = await api<CardCommandResponse>(`/api/work-items/${encodeURIComponent(selected.id)}/command`, { method: "POST", body: JSON.stringify({ instruction }) });
+      if (command.handled) {
+        setData((current) => current ? { ...current, items: current.items.map((item) => item.id === command.updated.id ? command.updated : item) } : current);
+        setUndoCommandId(command.undoToken || "");
+        setComposer("");
+        if (command.clarification) {
+          setNotice(command.clarification);
+          return;
+        }
+        if (command.remainingIntent) {
+          await openCodexTask(command.remainingIntent);
+          setNotice(`${command.message} The remaining work was handed to a native Codex task.`);
+        } else {
+          setNotice(command.message);
+        }
+      } else {
+        await openCodexTask(instruction);
+        setNotice("This needs real Codex work, so Command Center handed it to a native task linked to this card.");
+      }
+      await load(true);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The instruction could not be completed.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const undoCardCommand = async () => {
+    if (!undoCommandId) return;
+    setBusy(true);
+    try {
+      const result = await api<{ updated: WorkItem; message: string }>(`/api/card-commands/${encodeURIComponent(undoCommandId)}/undo`, { method: "POST", body: JSON.stringify({}) });
+      setData((current) => current ? { ...current, items: current.items.map((item) => item.id === result.updated.id ? result.updated : item) } : current);
+      setUndoCommandId("");
+      setNotice(result.message);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The card change could not be undone.");
+    } finally {
+      setBusy(false);
+    }
   };
 
   const requestNoteEdit = async () => {
@@ -688,7 +907,7 @@ export default function Home() {
       if (target) setStatusFilter(workViewFor(target));
       setSelectedId(targetId);
       setView("inbox");
-      if (window.innerWidth <= 860) setMobileWorkbenchOpen(true);
+      if (window.innerWidth <= 1024) setMobileWorkbenchOpen(true);
     } else if (result.kind === "note") {
       const note = notes.find((item) => item.id === result.id);
       if (note) void selectNote(note).then(() => setView("notes"));
@@ -717,23 +936,16 @@ export default function Home() {
   return (
     <main className={`app-shell view-${view}`}>
       <aside className="left-rail">
-        <div>
-          <p className="brand-eyebrow">SERENT</p>
-          <h1 className="brand">Command Center</h1>
-          <p className="brand-copy">What needs your attention, and help getting it done.</p>
+        <div className="workspace-switcher">
+          <span className="workspace-logo" aria-hidden="true">S</span>
+          <div><strong>Serent</strong><small>Command Center</small></div>
+          <button type="button" onClick={() => setCommandOpen(true)} aria-label="Open command menu">...</button>
         </div>
 
         <nav className="primary-nav" aria-label="Serent Command Center">
-          {primaryNavItems.map(([id, label]) => (
-            <button key={id} className={view === id ? "nav-item active" : "nav-item"} onClick={() => setView(id)} type="button">
-              <span className="nav-mark" aria-hidden="true" />
-              {label}
-              {id === "inbox" ? <span className="nav-count">{items.filter((item) => !["done", "dismissed"].includes(item.status)).length}</span> : null}
-              {id === "mail" ? <span className="nav-count">{data.mailCounts.needs_reply || 0}</span> : null}
-            </button>
-          ))}
-          <button className={showMore ? "nav-item active" : "nav-item"} onClick={() => setShowMore((current) => !current)} type="button"><span className="nav-mark" aria-hidden="true" />More</button>
-          {showMore ? <div className="more-nav">{moreNavItems.map(([id,label]) => <button key={id} className={view===id?"nav-item active":"nav-item"} onClick={() => { setView(id); setShowMore(false); }} type="button">{label}</button>)}<button className={view === "settings" ? "nav-item active" : "nav-item"} onClick={() => { setShowMore(false); void openSettings(); }} type="button">Learning &amp; sources</button></div> : null}
+          <NavGroup label="Focus" items={focusNavItems} view={view} onSelect={setView} itemCount={items.filter((item) => !["done", "dismissed"].includes(item.status)).length} mailCount={data.mailCounts.needs_reply || 0} />
+          <NavGroup label="Workspace" items={workspaceNavItems} view={view} onSelect={setView} />
+          <NavGroup label="Intelligence" items={intelligenceNavItems} view={view} onSelect={setView} />
         </nav>
 
         <section className="company-rail" aria-labelledby="company-filter-title">
@@ -745,8 +957,8 @@ export default function Home() {
             <span>All companies</span><b>{Object.values(data.companyCounts).reduce((sum, count) => sum + count, 0)}</b>
           </button>
           {data.companies.map((company) => (
-            <button className={companyFilter === company.slug ? "company-filter active" : "company-filter"} key={company.slug} onClick={() => { setCompanyFilter(company.slug); setView("inbox"); }} type="button">
-              <span>{company.displayName}</span><b>{data.companyCounts[company.slug] || 0}</b>
+            <button className={companyFilter === company.slug ? "company-filter active" : "company-filter"} data-company={company.slug} key={company.slug} onClick={() => { setCompanyFilter(company.slug); setView("inbox"); }} type="button">
+              <span className="company-filter-name"><i className="company-dot" aria-hidden="true" />{company.displayName}</span><b>{data.companyCounts[company.slug] || 0}</b>
             </button>
           ))}
         </section>
@@ -763,21 +975,23 @@ export default function Home() {
           <form className="quick-capture" onSubmit={(event) => { event.preventDefault(); void capture(); }}>
             <span aria-hidden="true">+</span>
             <input ref={quickRef} aria-label="Quick capture" value={quickCapture} onChange={(event) => setQuickCapture(event.target.value)} placeholder="Capture a thought, commitment, or question…" />
-            <kbd>N</kbd>
+            <kbd>C</kbd>
           </form>
-          {notice ? <button className="notice" onClick={() => setNotice("")} type="button">{notice}</button> : null}
+          <button className="command-trigger" type="button" onClick={() => setCommandOpen(true)}><span>Search or jump to</span><kbd>Ctrl K</kbd></button>
+          {notice ? <div className="notice-group"><button className="notice" onClick={() => setNotice("")} type="button">{notice}</button>{undoCommandId ? <button className="undo-command" disabled={busy} onClick={() => void undoCardCommand()} type="button">Undo</button> : null}</div> : null}
         </header>
 
         {view === "inbox" ? (
           <InboxView
             companies={data.companies}
             companyFilter={companyFilter}
+            setCompanyFilter={setCompanyFilter}
             filteredItems={filteredItems}
             items={items}
             selectedId={effectiveSelectedId}
             setSelectedId={(id) => {
               setSelectedId(id);
-              if (window.innerWidth <= 860) setMobileWorkbenchOpen(true);
+              if (window.innerWidth <= 1024) setMobileWorkbenchOpen(true);
             }}
             statusFilter={statusFilter}
             setStatusFilter={setStatusFilter}
@@ -792,6 +1006,20 @@ export default function Home() {
 
         {view === "mail" ? <MailWorkspace companies={data.companies} selectedMessageId={mailTargetId} onNotice={setNotice} onPromoted={() => void load(true)} /> : null}
         {view === "calendar" ? <CalendarWorkspace items={items} onNotice={setNotice} onUpdated={() => void load(true)} /> : null}
+        {view === "projects" ? <ProjectWorkspace companyFilter={companyFilter} onNotice={setNotice} onUpdated={() => void load(true)} onOpenWorkItem={(id) => {
+          const item = items.find((candidate) => candidate.id === id);
+          setSelectedId(id);
+          if (item) setStatusFilter(workViewFor(item));
+          setView("inbox");
+          if (window.innerWidth <= 1024) setMobileWorkbenchOpen(true);
+        }} /> : null}
+        {view === "pm" ? <PmAgentWorkspace onNotice={setNotice} onOpenWorkItem={(id) => {
+          const item = items.find((candidate) => candidate.id === id);
+          setSelectedId(id);
+          if (item) setStatusFilter(workViewFor(item));
+          setView("inbox");
+          if (window.innerWidth <= 1024) setMobileWorkbenchOpen(true);
+        }} /> : null}
 
         {view === "companies" ? (
           <section className="content-view">
@@ -800,9 +1028,9 @@ export default function Home() {
               {data.companies.map((company) => {
                 const companyItems = items.filter((item) => item.companySlug === company.slug);
                 return (
-                  <button className="company-card" key={company.slug} onClick={() => { setCompanyFilter(company.slug); setView("inbox"); }} type="button">
+                  <button className="company-card" data-company={company.slug} key={company.slug} onClick={() => { setCompanyFilter(company.slug); setView("inbox"); }} type="button">
                     <span className="company-card-count">{companyItems.filter((item) => !["done", "dismissed"].includes(item.status)).length}</span>
-                    <h3>{company.displayName}</h3>
+                    <span className="company-card-label"><i className="company-dot" aria-hidden="true" />Company room</span><h3>{company.displayName}</h3>
                     <p>{company.description}</p>
                     <div><span>{companyItems.filter((item) => item.status === "to_review").length} to review</span><span>{companyItems.filter((item) => item.status === "back_for_review").length} returned</span></div>
                   </button>
@@ -890,23 +1118,66 @@ export default function Home() {
         ) : null}
       </section>
 
-      <aside className={mobileWorkbenchOpen ? "workbench mobile-open" : "workbench"}>
+      <aside className={mobileWorkbenchOpen ? "workbench mobile-open" : "workbench"} data-company={selected?.companySlug || "unassigned"}>
         {view === "inbox" && selected ? (
           <>
             <button className="mobile-close" type="button" onClick={() => setMobileWorkbenchOpen(false)}>← Back to inbox</button>
             <header className="workbench-header">
-              <div><span className="owner-pill">{cardState(selected).owner}</span><span className={`state-pill state-${workViewFor(selected)}`}>{cardState(selected).label}</span><span className={`priority priority-${selected.priority}`}>{selected.priority}</span></div>
-              <p>{selected.companyName} · {selected.type}</p>
+              <div><span className="company-badge">{selected.companyName}</span><span className="owner-pill">{cardState(selected).owner}</span><span className={`state-pill state-${workViewFor(selected)}`}>{cardState(selected).label}</span><span className={`action-kind kind-${actionKind(selected).id}`}>{actionKind(selected).label}</span><span className={`priority priority-${selected.priority}`}>{selected.priority}</span></div>
               <h2>{selected.title}</h2>
               <p className="workbench-summary">{selected.summary}</p>
+              <div className="card-routing-row">
+                <label>Company<select aria-label="Card company assignment" value={selected.companySlug || ""} disabled={busy} onChange={(event) => void patchItem({ companySlug: event.target.value || null, eventDetail: `Jake assigned this card to ${event.target.selectedOptions[0]?.text || "Unassigned"}.` })}><option value="">Unassigned</option>{data.companies.map((company) => <option key={company.slug} value={company.slug}>{company.displayName}</option>)}</select></label>
+                <div className="due-date-field">
+                  <label htmlFor={`card-due-date-${selected.id}`}>Due date</label>
+                  <div>
+                    <input id={`card-due-date-${selected.id}`} aria-label="Card due date" type="date" value={dueDateInputValue(selected.dueAt)} disabled={busy} onChange={(event) => { const localDate = event.target.value; void patchItem({ dueAt: dueDateEndOfLocalDayIso(localDate), eventDetail: localDate ? `Jake set the due date to ${localDate}.` : "Jake cleared the due date." }); }} />
+                    <button aria-label="Clear due date" type="button" disabled={busy || !selected.dueAt} onClick={() => void patchItem({ dueAt: null, eventDetail: "Jake cleared the due date." })}>Clear</button>
+                  </div>
+                </div>
+                <span>{selected.type.replaceAll("_", " ")}</span>
+              </div>
             </header>
 
+            {selected.projectContext ? <button className="project-context-link" type="button" onClick={() => { setCompanyFilter(selected.companySlug || "all"); setView("projects"); }}>
+              <span>PROJECT PLAN</span><strong>{selected.projectContext.workstream}</strong><small>{selected.projectContext.phaseTitle} · Due {selected.projectContext.dueDate ? relativeTime(`${selected.projectContext.dueDate}T17:00:00-07:00`) : "not scheduled"}</small>
+            </button> : null}
+
             <section className="why-card"><span>Why Command Center surfaced this</span><p>{selected.whyNow}</p><small>{Math.round(selected.confidence * 100)}% confidence · {relativeTime(selected.dueAt)}</small>{selected.activeRules.length ? <div className="rule-chips">{selected.activeRules.map((rule) => <span key={rule.id}>{rule.title}</span>)}</div> : null}</section>
+
+            {selectedLatestResult ? <section className={`returned-result returned-${selectedLatestResult.status}`}>
+              <div><span>{selectedLatestResult.status === "review" ? "Ready for your review" : "Codex needs attention"}</span><time>{fullDate(selectedLatestResult.updatedAt)}</time></div>
+              <h3>{selectedLatestResult.title}</h3>
+              <p>{selectedLatestResult.result || selectedLatestResult.error}</p>
+            </section> : null}
 
             <details className="workbench-section" open>
               <summary>Likely next action</summary>
               <p className="suggested-action">{selected.suggestedAction}</p>
             </details>
+
+            {selected.type === "meeting_follow_up" ? <section className="meeting-followthrough" aria-live="polite">
+              <div className="meeting-followthrough-heading"><div><span>MEETING TO ACTIONS</span><h3>{activeMeetingWorkflow?.state === "processing" ? "Processing the transcript" : activeMeetingWorkflow?.state === "review" ? "Review the follow-ups" : activeMeetingWorkflow?.state === "complete" ? "Meeting processed" : "Add the transcript when it is ready"}</h3></div><span className={`meeting-state meeting-${activeMeetingWorkflow?.state || "loading"}`}>{(activeMeetingWorkflow?.state || "loading").replaceAll("_", " ")}</span></div>
+              {!activeMeetingWorkflow ? <p>Loading the meeting workflow...</p> : null}
+              {activeMeetingWorkflow && ["waiting_for_transcript", "candidate_review", "error"].includes(activeMeetingWorkflow.state) ? <>
+                {activeMeetingWorkflow.noteId ? <div className="meeting-note-receipt"><div><span>Meeting note already saved</span><strong>{activeMeetingWorkflow.noteTitle}</strong><small>Processing the transcript now will extract follow-up cards without creating another note.</small></div><button type="button" onClick={async () => { const nextNotes = await api<Note[]>("/api/notes"); setNotes(nextNotes); const note = nextNotes.find((item) => item.id === activeMeetingWorkflow.noteId); if (note) await selectNote(note); setView("notes"); }}>Open note</button></div> : null}
+                <ol className="meeting-steps"><li className="complete">Meeting ended</li><li>Download the Zoom transcript</li><li>Process it here</li><li>Review proposed actions</li></ol>
+                {activeMeetingWorkflow.error ? <p className="meeting-error">{activeMeetingWorkflow.error}</p> : null}
+                {activeMeetingWorkflow.candidates.length ? <div className="transcript-candidates"><p>{activeMeetingWorkflow.candidates.length === 1 ? "I found this likely transcript:" : "Choose the transcript for this meeting:"}</p>{activeMeetingWorkflow.candidates.map((candidate) => <button key={candidate.path} type="button" disabled={busy} onClick={() => void processMeetingTranscript(candidate.path)}><strong>{candidate.name}</strong><span>{candidate.reasons.join(" · ") || `Downloaded ${fullDate(candidate.modifiedAt)}`}</span></button>)}</div> : <div className="transcript-empty"><p>Download the transcript to your Downloads folder. Command Center will not process anything until you click below.</p><button type="button" disabled={busy} onClick={() => void processMeetingTranscript()}>{busy ? "Checking..." : "I downloaded it — find transcript"}</button></div>}
+                <button className="no-transcript-action" type="button" disabled={busy} onClick={() => void closeMeetingWithoutTranscript()}>No transcript was recorded</button>
+              </> : null}
+              {activeMeetingWorkflow?.state === "processing" ? <div className="meeting-processing"><span className="processing-dot" /><div><strong>Codex is reading the transcript</strong><p>It will save one meeting note and return proposed actions to this card. Nothing is being sent or written to ClickUp.</p></div></div> : null}
+              {activeMeetingWorkflow && ["review", "complete"].includes(activeMeetingWorkflow.state) ? <>
+                <div className="meeting-note-receipt"><div><span>Saved meeting note</span><strong>{activeMeetingWorkflow.noteTitle}</strong>{activeMeetingWorkflow.noteFilePath ? <small>{activeMeetingWorkflow.noteFilePath}</small> : null}</div>{activeMeetingWorkflow.noteId ? <button type="button" onClick={async () => { const nextNotes = await api<Note[]>("/api/notes"); setNotes(nextNotes); const note = nextNotes.find((item) => item.id === activeMeetingWorkflow.noteId); if (note) await selectNote(note); setView("notes"); }}>Open note</button> : null}</div>
+                <div className="meeting-suggestions"><div className="meeting-suggestions-title"><strong>Proposed follow-ups</strong><span>{activeMeetingWorkflow.suggestions.filter((item) => item.decision === "proposed").length} to review</span></div>
+                  {activeMeetingWorkflow.suggestions.length ? activeMeetingWorkflow.suggestions.map((suggestion) => <article key={suggestion.id} className={`meeting-suggestion decision-${suggestion.decision}`}>
+                    <div className="meeting-suggestion-meta"><span>{suggestion.ownerState === "jake" ? "Jake owns" : "Waiting on someone else"}</span><span>{suggestion.priority}</span>{suggestion.existingWorkItemId ? <span>Matches existing card</span> : null}</div>
+                    {meetingEdit?.id === suggestion.id ? <div className="meeting-suggestion-editor"><label>Action<input value={meetingEdit.title} onChange={(event) => setMeetingEdit({ ...meetingEdit, title: event.target.value })} /></label><label>Next step<textarea value={meetingEdit.suggestedAction} onChange={(event) => setMeetingEdit({ ...meetingEdit, suggestedAction: event.target.value })} /></label><div><button type="button" disabled={busy || !meetingEdit.title.trim()} onClick={() => void saveMeetingSuggestionEdit()}>Save edit</button><button className="secondary" type="button" disabled={busy} onClick={() => setMeetingEdit(null)}>Cancel</button></div></div> : <><h4>{suggestion.title}</h4><p>{suggestion.summary}</p><strong className="meeting-next-step">Next: {suggestion.suggestedAction}</strong>{suggestion.evidenceTimestamp ? <small>Evidence: {suggestion.evidenceTimestamp}</small> : null}{suggestion.decision === "proposed" ? <div><button type="button" disabled={busy} onClick={() => void decideMeetingSuggestion(suggestion.id, "accept")}>{suggestion.existingWorkItemId ? "Link to existing card" : suggestion.ownerState === "external" ? "Add to Waiting" : "Add to Open Work"}</button><button className="secondary" type="button" disabled={busy} onClick={() => setMeetingEdit({ id: suggestion.id, title: suggestion.title, suggestedAction: suggestion.suggestedAction })}>Edit</button><button className="secondary" type="button" disabled={busy} onClick={() => void decideMeetingSuggestion(suggestion.id, "reject")}>Ignore</button></div> : <div className="suggestion-decision">{suggestion.decision === "accepted" ? "Added" : "Ignored"}</div>}</>}
+                  </article>) : <p className="muted-copy">No follow-up actions were identified. The meeting note is still saved.</p>}
+                </div>
+                {activeMeetingWorkflow.state === "review" ? <button className="finish-meeting-review" type="button" disabled={busy || activeMeetingWorkflow.suggestions.some((item) => item.decision === "proposed")} onClick={() => void finishMeetingReview()}>Finish meeting review</button> : null}
+              </> : null}
+            </section> : null}
 
             <details className="workbench-section optional-workspace" open={Boolean(visibleDraft)}>
               <summary>{selectedWorkingSurface?.label || "Working notes"} <span>Optional</span></summary>
@@ -926,13 +1197,16 @@ export default function Home() {
               {selected.agentRuns.length ? selected.agentRuns.map((run) => <article className={`agent-result agent-${run.status}`} key={run.id}>
                 <div><strong>{run.status === "review" ? "Ready for your review" : run.status === "error" ? "Needs attention" : run.status === "waiting_on_user" ? "Waiting for you" : "Codex is working"}</strong><time>{fullDate(run.updatedAt)}</time></div>
                 {["queued", "working"].includes(run.status) ? <div className="activity-receipt"><p><span>Working on</span>{requestedOutcome(run)}</p><p><span>Using</span>{run.allowedSources.map(sourceName).join(", ") || "card context"}</p><p><span>Returns to</span>This card for your review</p><p><span>External actions</span>None</p><small>Started {relativeTime(run.createdAt)}</small></div> : <p>{run.result || run.error || run.waitingReason || "No result was returned."}</p>}
-                {run.status === "review" ? <button type="button" onClick={() => { setComposer(`Revise this result: `); setComposerScope("item"); }}>Revise with feedback</button> : null}
+                {run.status === "review" ? <button type="button" onClick={() => setComposer("Revise this result: ")}>Revise with feedback</button> : null}
               </article>) : <p className="muted-copy">Codex has not worked on this item yet.</p>}
             </details>
 
             {selected.codexTasks.length ? <details className="workbench-section" open>
               <summary>Separate Codex tasks ({selected.codexTasks.length})</summary>
-              {selected.codexTasks.map((task) => <article className={`codex-task-receipt task-${task.status}`} key={task.id}><div><strong>{task.title}</strong><span>{task.status.replaceAll("_", " ")}</span></div><p>{task.result || task.error || (task.status === "waiting_on_user" ? "The assignment is prefilled in Codex. Press Send there to start it." : "Codex is working on the assignment...")}</p>{task.threadId ? <small>Created in the Codex sidebar</small> : task.status === "waiting_on_user" ? <small>Waiting for you in Codex</small> : null}</article>)}
+               {selected.codexTasks.map((task) => {
+                 const presentation = codexTaskPresentation(task);
+                 return <article className={`codex-task-receipt task-${task.status}`} key={task.id}><div><strong>{task.title}</strong><span>{presentation.label}</span></div><p>{presentation.detail}</p>{task.threadId ? <footer><small>Verified native task receipt; Command Center does not control execution</small><button type="button" onClick={() => void reopenCodexTask(task.threadId)}>Open task</button></footer> : task.status === "waiting_on_user" ? <footer><small>Prepared only; no task is running</small><button type="button" onClick={() => void openCodexTask(task.instruction)}>Open in Codex</button></footer> : null}</article>;
+               })}
             </details> : null}
 
             {selected.externalActions.length ? <details className="workbench-section" open>
@@ -949,29 +1223,60 @@ export default function Home() {
             <div className="resolution-actions">
               {selected.decisionState === "proposed" ? <button className="accept-action" disabled={busy} type="button" onClick={() => void acceptAction()}>I&apos;ll handle it</button> : null}
               {selected.status === "waiting_external" ? <button className="accept-action" disabled={busy} type="button" onClick={() => void patchItem({ status: "to_review", eventDetail: "Jake is following up on this waiting item." })}>Follow up now</button> : null}
-              {selected.status === "error" ? <button className="accept-action" disabled={busy} type="button" onClick={() => void patchItem({ status: "to_review", eventDetail: "Returned to Jake's work after an error." })}>Return to My Work</button> : null}
-              {!['queued','working'].includes(selected.status) ? <button disabled={busy} type="button" onClick={() => void patchItem({ status: "done", resolution: "Completed from the Command Center workbench." })}>{selected.status === "back_for_review" ? "Accept & mark done" : "Done"}</button> : null}
+              {selected.status === "error" ? <button className="accept-action" disabled={busy} type="button" onClick={() => void patchItem({ status: "to_review", eventDetail: "Returned to Jake's work after an error." })}>Return to Open Work</button> : null}
+              {selected.type !== "meeting_follow_up" && !['queued','working'].includes(selected.status) ? <button disabled={busy} type="button" onClick={() => void patchItem({ status: "done", resolution: "Completed from the Command Center workbench." })}>{selected.status === "back_for_review" ? "Accept & mark done" : "Done"}</button> : null}
               {!['queued','working'].includes(selected.status) && selected.sources.some((source) => source.provider === "clickup" && Boolean(source.sourceId || /\/t\/[a-zA-Z0-9_-]+/.test(source.sourceUrl))) ? <button className="clickup-complete" disabled={busy || selected.externalActions.some((action) => ["queued","working"].includes(action.status))} type="button" onClick={() => void completeInClickUp()}>Done in ClickUp</button> : null}
-              {!['queued','working','done','dismissed'].includes(selected.status) ? <button disabled={busy} type="button" onClick={() => { const feedback = window.prompt("Why should Command Center stop surfacing items like this?", "Not consequential for me."); if (feedback !== null) void patchItem({ status: "dismissed", feedback }); }}>Not needed</button> : null}
+              {!['queued','working','done','dismissed'].includes(selected.status) ? <button disabled={busy} type="button" onClick={() => void patchItem({ status: "dismissed", eventDetail: "Jake marked this item as not needed." })}>Not needed</button> : null}
             </div>
 
-            {selectedActiveRun || selectedActiveTask ? <section className="codex-active-banner"><strong>{selectedActiveTask?.status === "waiting_on_user" ? "Finish starting this in Codex" : "Codex is working on this"}</strong><p>{selectedActiveRun ? requestedOutcome(selectedActiveRun) : selectedActiveTask?.instruction}</p><small>{selectedActiveTask?.status === "waiting_on_user" ? "The assignment is prefilled in the new task. Press Send there to begin." : selectedActiveTask ? "The work is in a separate Codex task." : "The result will return to this card. No external action will be taken."}</small></section> : <form className="codex-composer" onSubmit={(event) => { event.preventDefault(); void submitCodexChoice(); }}>
-              <div><span>How should Codex handle this?</span><select value={codexDestination} onChange={(event) => setCodexDestination(event.target.value as "card" | "task")} aria-label="Where Codex should work"><option value="card">Return the result to this card</option><option value="task">Create a separate Codex sidebar task</option></select></div>
-              <textarea value={composer} onChange={(event) => setComposer(event.target.value)} placeholder="Describe the outcome you want, or leave this blank to use the suggested next step..." aria-label="Outcome for Codex" />
-              <div className="composer-actions"><button className="open-codex-task" type="submit" disabled={busy}>{codexDestination === "task" ? "Create sidebar task" : "Start and return here"}</button></div>
-            </form>}
+            {selectedPreparedTask ? <section className="codex-active-banner codex-ready-banner"><strong>Ready to open in Codex</strong><p>{selectedPreparedTask.instruction}</p><small>This handoff is prepared, but no Codex task is running yet.</small><button type="button" disabled={busy} onClick={() => void openCodexTask(selectedPreparedTask.instruction)}>Open native Codex task</button></section> : null}
+            {selectedActiveRun || selectedActiveTask ? <section className="codex-active-banner"><strong>{selectedActiveRun?.status === "waiting_on_user" ? "Waiting for your input" : selectedActiveTask?.status === "accepted" ? "Accepted by Codex; waiting to start" : "Codex is working on this"}</strong><p>{selectedActiveRun ? selectedActiveRun.waitingReason || requestedOutcome(selectedActiveRun) : selectedActiveTask?.instruction}</p><small>{selectedActiveTask ? "This status comes from a verified native task callback." : "The result will return to this card. No external action will be taken."}</small></section> : null}
+            <form className="codex-composer" onSubmit={(event) => { event.preventDefault(); void submitCodexChoice(); }}>
+              {selected.preparationMode === "auto" ? <p className="auto-prep-note">PM agent: this preparation is ready to delegate. A native Codex task starts only when you open the handoff.</p> : null}
+              <div><span>Change this card or ask Codex to work on it</span><select value={codexDestination} onChange={(event) => setCodexDestination(event.target.value as "card" | "task")} aria-label="Where Codex should work"><option value="card">Smart: update card or open Codex task</option><option value="task">Always open a separate Codex task</option></select></div>
+              <textarea value={composer} onChange={(event) => setComposer(event.target.value)} placeholder="Try: Move this to Friday, set priority high, or draft the follow-up email..." aria-label="Card instruction" />
+              <div className="composer-actions"><button className="open-codex-task" type="submit" disabled={busy}>{codexDestination === "task" ? "Open native Codex task" : "Apply or open"}</button></div>
+            </form>
           </>
         ) : (
           <div className="workbench-placeholder"><p className="kicker">WORKBENCH</p><h2>{view === "notes" ? "Write alongside the work" : "Select an action to begin"}</h2><p>Your sources, notes, drafts, approvals, and Codex assignments stay together here.</p></div>
         )}
       </aside>
+
+      {commandOpen ? <div className="command-overlay" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setCommandOpen(false); }}>
+        <section className="command-menu" role="dialog" aria-modal="true" aria-label="Command menu">
+          <header><span>Command Center</span><kbd>Esc</kbd></header>
+          <div className="command-menu-search"><span aria-hidden="true">/</span><input autoFocus aria-label="Command search" placeholder="Search or choose a destination..." onKeyDown={(event) => { if (event.key === "Enter") { setView("search"); setCommandOpen(false); window.setTimeout(() => searchRef.current?.focus(), 0); } }} /></div>
+          <p>Go to</p>
+          <div className="command-actions">{navItems.map(([id, label]) => <button type="button" key={id} onClick={() => { setView(id); setCommandOpen(false); }}><span className="command-action-mark" aria-hidden="true" />{label}<small>{id === "inbox" ? "J / K to move" : ""}</small></button>)}</div>
+          <footer><span><kbd>C</kbd> Create</span><span><kbd>/</kbd> Search</span><span><kbd>J</kbd><kbd>K</kbd> Navigate</span></footer>
+        </section>
+      </div> : null}
     </main>
   );
+}
+
+function NavGroup({ label, items, view, onSelect, itemCount, mailCount }: {
+  label: string;
+  items: ReadonlyArray<(typeof navItems)[number]>;
+  view: (typeof navItems)[number][0] | "settings";
+  onSelect: (view: (typeof navItems)[number][0]) => void;
+  itemCount?: number;
+  mailCount?: number;
+}) {
+  return <section className="nav-group"><p>{label}</p>{items.map(([id, itemLabel]) => (
+    <button key={id} data-nav={id} className={view === id ? "nav-item active" : "nav-item"} onClick={() => onSelect(id)} type="button">
+      <span className="nav-mark" aria-hidden="true" />{itemLabel}
+      {id === "inbox" && itemCount !== undefined ? <span className="nav-count">{itemCount}</span> : null}
+      {id === "mail" && mailCount !== undefined ? <span className="nav-count">{mailCount}</span> : null}
+    </button>
+  ))}</section>;
 }
 
 function InboxView({
   companies,
   companyFilter,
+  setCompanyFilter,
   filteredItems,
   items,
   selectedId,
@@ -987,6 +1292,7 @@ function InboxView({
 }: {
   companies: Company[];
   companyFilter: string;
+  setCompanyFilter: (company: string) => void;
   filteredItems: WorkItem[];
   items: WorkItem[];
   selectedId: string;
@@ -1000,21 +1306,40 @@ function InboxView({
   priorityFilter: string;
   setPriorityFilter: (priority: string) => void;
 }) {
+  const [dayAnchor] = useState(() => new Date());
+  const [layoutMode, setLayoutMode] = useState<"list" | "board">("list");
   const companyName = companyFilter === "all" ? "All companies" : companies.find((company) => company.slug === companyFilter)?.displayName || "Company";
   const sources = [...new Set(items.flatMap((item) => item.sources.map((source) => source.provider)))];
   const types = [...new Set(items.map((item) => item.type))];
   const viewCopy: Record<WorkView, string> = {
-    needs_me: "Decisions, returned work, and issues that need your attention now.",
-    my_work: "Committed actions that you own and can move forward.",
+    open: "Everything still outstanding, including work waiting on someone else, ordered by when it needs to happen.",
     codex_working: "Work Codex is actively processing or preparing to start.",
-    waiting: "Items waiting on another person, source, or dependency.",
     done: "Completed work and items you decided were not needed.",
   };
-  const viewLabel = workViews.find((workView) => workView.id === statusFilter)?.label || "Needs Me";
+  const viewLabel = workViews.find((workView) => workView.id === statusFilter)?.label || "Open Work";
+  const sortedItems = [...filteredItems].sort((left, right) => {
+    const leftDue = left.dueAt ? new Date(left.dueAt).getTime() : Number.MAX_SAFE_INTEGER;
+    const rightDue = right.dueAt ? new Date(right.dueAt).getTime() : Number.MAX_SAFE_INTEGER;
+    return leftDue - rightDue || right.updatedAt.localeCompare(left.updatedAt);
+  });
+  const groupedItems = dueBuckets.map((bucket) => ({ ...bucket, items: sortedItems.filter((item) => dueBucketFor(item, dayAnchor) === bucket.id) })).filter((bucket) => bucket.items.length);
+  const renderCard = (item: WorkItem, board = false) => {
+    const state = cardState(item);
+    const dueBucket = dueBucketFor(item, dayAnchor);
+    return (
+      <button className={`${board ? "issue-board-card" : "feed-card issue-row"}${selectedId === item.id ? " selected" : ""}`} data-company={item.companySlug || "unassigned"} key={item.id} onClick={() => setSelectedId(item.id)} type="button">
+        <span className={`issue-status-icon status-${item.status}`} aria-label={statusMeta[item.status].label} />
+        <span className="issue-row-main"><strong>{item.title}</strong><span><span className="feed-company"><i className="company-dot" aria-hidden="true" />{item.companyName}</span>{state.label !== "Ready" ? <span className={item.status === "error" ? "feed-state feed-state-critical" : item.status === "waiting_external" ? "feed-state feed-state-waiting" : "feed-state"}>{state.label}</span> : null}</span></span>
+        <span className={`issue-priority priority-${item.priority}`} aria-label={`${item.priority} priority`}>{item.priority === "urgent" ? "!!!" : item.priority === "high" ? "!!" : item.priority === "normal" ? "-" : ""}</span>
+        <time className={`due-chip due-${dueBucket}`}>{dueLabel(item, dayAnchor)}</time>
+      </button>
+    );
+  };
   return (
     <section className="inbox-view">
       <div className="inbox-heading">
-        <div><p className="kicker">YOUR FOCUS</p><h2>{viewLabel}</h2><p>{companyName} · {filteredItems.length} items. {viewCopy[statusFilter]}</p></div>
+        <div><p className="issue-breadcrumb">Workspace / My work</p><h2>{viewLabel}</h2><p>{companyName} / {filteredItems.length} items. {viewCopy[statusFilter]}</p></div>
+        <div className="layout-toggle" aria-label="Layout"><button className={layoutMode === "list" ? "active" : ""} type="button" onClick={() => setLayoutMode("list")}>List</button><button className={layoutMode === "board" ? "active" : ""} type="button" onClick={() => setLayoutMode("board")}>Board</button></div>
       </div>
 
       <div className="status-tabs work-view-tabs" role="tablist" aria-label="Work view">
@@ -1025,25 +1350,21 @@ function InboxView({
         })}
       </div>
 
-      <div className="filter-row">
+      <div className="filter-row" aria-label="View filters">
+        <select value={companyFilter} onChange={(event) => setCompanyFilter(event.target.value)} aria-label="Filter by company"><option value="all">All companies</option>{companies.map((company) => <option key={company.slug} value={company.slug}>{company.displayName}</option>)}</select>
         <select value={priorityFilter} onChange={(event) => setPriorityFilter(event.target.value)} aria-label="Filter by priority"><option value="all">All urgency</option><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select>
         <select value={sourceFilter} onChange={(event) => setSourceFilter(event.target.value)} aria-label="Filter by source"><option value="all">All sources</option>{sources.map((source) => <option key={source} value={source}>{source}</option>)}</select>
         <select value={typeFilter} onChange={(event) => setTypeFilter(event.target.value)} aria-label="Filter by work type"><option value="all">All work types</option>{types.map((type) => <option key={type} value={type}>{type.replaceAll("_", " ")}</option>)}</select>
       </div>
 
-      <div className="feed-list">
-        {filteredItems.length ? filteredItems.map((item) => {
-          const state = cardState(item);
-          return (
-            <button className={selectedId === item.id ? `feed-card selected priority-${item.priority}` : `feed-card priority-${item.priority}`} key={item.id} onClick={() => setSelectedId(item.id)} type="button">
-              <div className="feed-card-top"><span className="owner-pill">{state.owner}</span><span className={`state-pill state-${workViewFor(item)}`}>{state.label}</span><span className="feed-company">{item.companyName}</span><time>{relativeTime(item.dueAt || item.updatedAt)}</time></div>
-              <h3>{item.title}</h3>
-              <p>{item.whyNow}</p>
-              <div className="feed-card-next"><span>Next action</span><strong>{item.suggestedAction}</strong></div>
-              <footer><span>{actionKind(item).label}</span><span>{item.sources.map((source) => source.provider).join(" + ")}</span><span>{item.priority}</span></footer>
-            </button>
-          );
-        }) : <div className="empty-message"><strong>Nothing needs attention in this view.</strong><p>Choose another work view or clear a filter.</p></div>}
+      <div className={layoutMode === "board" ? "feed-list issue-board" : "feed-list issue-list"}>
+        {layoutMode === "list" && filteredItems.length && statusFilter === "open" ? groupedItems.map((bucket) => <section className={`due-group due-group-${bucket.id}`} key={bucket.id} aria-labelledby={`due-group-${bucket.id}`}>
+          <header className="due-group-heading"><span className="due-group-dot" aria-hidden="true" /><h3 id={`due-group-${bucket.id}`}>{bucket.label}</h3><b>{bucket.items.length}</b></header>
+          <div className="due-group-list">{bucket.items.map((item) => renderCard(item))}</div>
+        </section>) : null}
+        {layoutMode === "list" && filteredItems.length && statusFilter !== "open" ? <section className="due-group"><header className="due-group-heading"><span className="due-group-dot" aria-hidden="true" /><h3>{viewLabel}</h3><b>{sortedItems.length}</b></header><div className="due-group-list">{sortedItems.map((item) => renderCard(item))}</div></section> : null}
+        {layoutMode === "board" && filteredItems.length ? groupedItems.map((bucket) => <section className={`issue-board-column due-group-${bucket.id}`} key={bucket.id}><header><span className="due-group-dot" aria-hidden="true" /><h3>{bucket.label}</h3><b>{bucket.items.length}</b></header><div>{bucket.items.map((item) => renderCard(item, true))}</div></section>) : null}
+        {!filteredItems.length ? <div className="empty-message"><strong>Nothing in this view.</strong><p>Choose another view or clear a filter.</p></div> : null}
       </div>
     </section>
   );
