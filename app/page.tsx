@@ -4,12 +4,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import MailWorkspace from "./mail-workspace";
 import CalendarWorkspace from "./calendar-workspace";
 import MarkdownEditor from "./markdown-editor";
-import PmAgentWorkspace from "./pm-agent-workspace";
 import ProjectWorkspace from "./project-workspace";
-import CardActionComposer from "./card-action-composer";
-import CardResultPanel from "./card-result-panel";
-import AssignmentReceiptList from "./assignment-receipt-list";
-import { activeAssignmentStatuses, latestActionableAssignment, type Assignment, type CardActionMode } from "./card-workbench-model";
+import TranscriptWorkspace from "./transcript-workspace";
+import { type Assignment } from "./card-workbench-model";
+import { cardState as simplifiedCardState, contextKind, definitionOfDone, nextAction, showPriority, workingSurface as simplifiedWorkingSurface } from "./card-view-model";
 import { dueDateEndOfLocalDayIso, dueDateInputValue } from "./due-date";
 import { workViewFor, workViews, type WorkView } from "./work-view";
 
@@ -167,16 +165,6 @@ type PreferenceRule = {
   updatedAt: string;
 };
 
-type CardCommandResponse = {
-  handled: boolean;
-  updated: WorkItem;
-  changes: Array<{ field: string; label: string; before: unknown; after: unknown }>;
-  remainingIntent: string;
-  clarification: string;
-  message: string;
-  undoToken: string;
-};
-
 type SourceReceipt = {
   source: string;
   status: string;
@@ -234,33 +222,21 @@ type SearchResult = {
 
 const runnerUrl = "http://127.0.0.1:4318";
 
-const statusMeta: Record<WorkStatus, { label: string; short: string }> = {
-  to_review: { label: "To review", short: "Review" },
-  queued: { label: "Queued for Codex", short: "Queued" },
-  working: { label: "Working", short: "Working" },
-  waiting_on_user: { label: "Waiting on Jake", short: "Waiting" },
-  waiting_external: { label: "Waiting", short: "Waiting" },
-  needs_attention: { label: "Needs attention", short: "Attention" },
-  back_for_review: { label: "Back for review", short: "Returned" },
-  done: { label: "Done", short: "Done" },
-  dismissed: { label: "Dismissed", short: "Dismissed" },
-  error: { label: "Needs attention", short: "Error" },
-};
-
 const navItems = [
-  ["inbox", "My work"],
-  ["projects", "Projects"],
-  ["pm", "PM agent"],
-  ["calendar", "Calendar"],
+  ["inbox", "Open Work"],
   ["mail", "Mail"],
-  ["notes", "Documents"],
+  ["calendar", "Calendar"],
+  ["projects", "Projects"],
+  ["documents", "Documents"],
+  ["transcripts", "Transcripts"],
+  ["notes", "Notes"],
   ["companies", "Companies"],
-  ["agents", "Codex work"],
   ["search", "Search"],
 ] as const;
+type ViewId = (typeof navItems)[number][0] | "settings";
 const focusNavItems = navItems.filter(([id]) => ["inbox", "mail", "calendar"].includes(id));
-const workspaceNavItems = navItems.filter(([id]) => ["projects", "notes", "companies"].includes(id));
-const intelligenceNavItems = navItems.filter(([id]) => ["pm", "agents", "search"].includes(id));
+const workspaceNavItems = navItems.filter(([id]) => ["projects", "documents", "transcripts", "notes", "companies"].includes(id));
+const intelligenceNavItems = navItems.filter(([id]) => id === "search");
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(`${runnerUrl}${path}`, {
@@ -277,16 +253,6 @@ async function api<T>(path: string, options?: RequestInit): Promise<T> {
   return payload as T;
 }
 
-function relativeTime(value: string | null) {
-  if (!value) return "No due date";
-  const date = new Date(value);
-  const minutes = Math.round((date.getTime() - Date.now()) / 60000);
-  if (Math.abs(minutes) < 60) return minutes <= 0 ? "Due now" : `In ${minutes}m`;
-  const hours = Math.round(minutes / 60);
-  if (Math.abs(hours) < 24) return hours <= 0 ? `${Math.abs(hours)}h ago` : `In ${hours}h`;
-  return date.toLocaleDateString([], { month: "short", day: "numeric" });
-}
-
 function bodyForEditor(title: string, body: string) {
   const leadingTitle = body.match(/^#\s+([^\r\n]+)\r?\n+/);
   return leadingTitle?.[1]?.trim() === title.trim() ? body.slice(leadingTitle[0].length) : body;
@@ -299,17 +265,6 @@ function fullDate(value: string) {
     hour: "numeric",
     minute: "2-digit",
   });
-}
-
-function ItemBadge({ status }: { status: WorkStatus }) {
-  return <span className={`status-badge status-${status}`}>{statusMeta[status].short}</span>;
-}
-
-function actionKind(item: WorkItem) {
-  if (item.decisionState === "committed" || item.sources.some((source) => source.provider === "clickup")) return { id: "committed", label: "Committed" };
-  if (item.decisionState === "accepted") return { id: "accepted", label: "Accepted" };
-  if (["outlook", "calendar", "transcripts"].some((provider) => item.sources.some((source) => source.provider === provider))) return { id: "owed", label: "Likely owed" };
-  return { id: "suggested", label: "Suggested" };
 }
 
 const dueBuckets: Array<{ id: DueBucket; label: string }> = [
@@ -349,42 +304,9 @@ function dueLabel(item: WorkItem, anchor: Date) {
   return calendarDate;
 }
 
-function cardState(item: WorkItem) {
-  if (item.status === "queued") return { owner: "Codex", label: "Starting" };
-  if (item.status === "working") return { owner: "Codex", label: "Working" };
-  if (item.status === "back_for_review") return { owner: "You", label: "Ready to review" };
-  if (item.status === "error") return { owner: "You", label: "Needs attention" };
-  if (item.status === "waiting_on_user") return { owner: "You", label: "Needs input" };
-  if (item.status === "waiting_external") return { owner: "Someone else", label: "Waiting" };
-  if (item.status === "needs_attention") return { owner: "You", label: "Check progress" };
-  if (item.status === "done") return { owner: "—", label: "Done" };
-  if (item.status === "dismissed") return { owner: "—", label: "Not needed" };
-  if (item.decisionState === "proposed") return { owner: "You", label: "Needs decision" };
-  return { owner: "You", label: "Ready" };
-}
-
-function requestedOutcome(run: AgentRun) {
-  const marker = "Jake's request:";
-  const value = run.intent.includes(marker) ? run.intent.split(marker).at(-1) : run.intent;
-  return String(value || run.title).trim();
-}
-
-function sourceName(source: string) {
-  return ({ ai_os: "AI OS", project_files: "project files", project_plan: "approved project plan", manual: "this card", outlook: "Outlook", calendar: "calendar", transcripts: "transcripts", box: "Box", clickup: "ClickUp" } as Record<string, string>)[source] || source.replaceAll("_", " ");
-}
-
-function workingSurface(item: WorkItem) {
-  const text = `${item.type} ${item.title}`.toLowerCase();
-  if (/email|reply|follow.?up/.test(text)) return { label: "Draft reply", placeholder: "Write or refine the reply you may send..." };
-  if (/meeting_prep|one-on-one|1:1|agenda/.test(text)) return { label: "Meeting agenda", placeholder: "Capture talking points, decisions needed, and questions..." };
-  if (/deck|presentation|powerpoint|artifact/.test(text)) return { label: "Deck outline", placeholder: "Capture the story, required slides, evidence, and open questions..." };
-  if (/schedul|calendar|kickoff meeting/.test(text)) return { label: "Scheduling note", placeholder: "Capture attendees, timing constraints, and the outreach you want to make..." };
-  return { label: "Working notes", placeholder: "Capture optional notes, a checklist, or partial thinking for this action..." };
-}
-
 export default function Home() {
   const [data, setData] = useState<Bootstrap | null>(null);
-  const [view, setView] = useState<(typeof navItems)[number][0] | "settings">("inbox");
+  const [view, setView] = useState<ViewId>("inbox");
   const [selectedId, setSelectedId] = useState<string>("");
   const [companyFilter, setCompanyFilter] = useState(() =>
     typeof window === "undefined"
@@ -397,14 +319,11 @@ export default function Home() {
   const [priorityFilter, setPriorityFilter] = useState("all");
   const [mobileWorkbenchOpen, setMobileWorkbenchOpen] = useState(false);
   const [quickCapture, setQuickCapture] = useState("");
-  const [composer, setComposer] = useState("");
-  const [composerItemId, setComposerItemId] = useState("");
-  const [cardActionMode, setCardActionMode] = useState<CardActionMode>("update");
-  const [revisionOf, setRevisionOf] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [draftItemId, setDraftItemId] = useState("");
+  const [waitingFor, setWaitingFor] = useState("");
+  const [waitingItemId, setWaitingItemId] = useState("");
   const [notice, setNotice] = useState("");
-  const [undoCommandId, setUndoCommandId] = useState("");
   const [busy, setBusy] = useState(false);
   const [commandOpen, setCommandOpen] = useState(false);
   const [notes, setNotes] = useState<Note[]>([]);
@@ -413,7 +332,6 @@ export default function Home() {
   const [noteDraft, setNoteDraft] = useState("");
   const [noteEditId, setNoteEditId] = useState("");
   const [noteDirty, setNoteDirty] = useState(false);
-  const [noteCodexInstruction, setNoteCodexInstruction] = useState("");
   const [noteQuery, setNoteQuery] = useState("");
   const [noteRailOpen, setNoteRailOpen] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
@@ -502,12 +420,17 @@ export default function Home() {
     if (!query) return notes;
     return notes.filter((note) => `${note.title} ${note.body} ${note.type}`.toLowerCase().includes(query));
   }, [noteQuery, notes]);
+  const workspaceNotes = useMemo(() => {
+    if (view === "notes") return filteredNotes.filter((note) => ["daily", "scratch"].includes(note.type));
+    if (view === "documents") return filteredNotes.filter((note) => ["meeting", "project", "decision"].includes(note.type));
+    return filteredNotes;
+  }, [filteredNotes, view]);
   const noteGroups = useMemo(() => [
-    { id: "daily", label: "Daily", notes: filteredNotes.filter((note) => note.type === "daily") },
-    { id: "meetings", label: "Meetings", notes: filteredNotes.filter((note) => note.type === "meeting") },
-    { id: "projects", label: "Projects & decisions", notes: filteredNotes.filter((note) => ["project", "decision"].includes(note.type)) },
-    { id: "notes", label: "Notes", notes: filteredNotes.filter((note) => note.type === "scratch") },
-  ].filter((group) => group.notes.length), [filteredNotes]);
+    { id: "daily", label: "Daily", notes: workspaceNotes.filter((note) => note.type === "daily") },
+    { id: "meetings", label: "Meetings", notes: workspaceNotes.filter((note) => note.type === "meeting") },
+    { id: "projects", label: "Projects & decisions", notes: workspaceNotes.filter((note) => ["project", "decision"].includes(note.type)) },
+    { id: "notes", label: "Notes", notes: workspaceNotes.filter((note) => note.type === "scratch") },
+  ].filter((group) => group.notes.length), [workspaceNotes]);
 
   const saveNoteSnapshot = useCallback(async (id: string, title: string, body: string, version: number) => {
     const saved = await api<Note>(`/api/notes/${encodeURIComponent(id)}`, {
@@ -559,17 +482,13 @@ export default function Home() {
   });
   const effectiveSelectedId = items.some((item) => item.id === selectedId) ? selectedId : filteredItems[0]?.id || "";
   const selected = items.find((item) => item.id === effectiveSelectedId) || null;
-  const selectedWorkingSurface = selected ? workingSurface(selected) : null;
+  const selectedWorkingSurface = selected ? simplifiedWorkingSurface(selected) : null;
+  const selectedState = selected ? simplifiedCardState(selected) : null;
   const selectedLatestResult = selected?.agentRuns.filter((run) => ["review", "error"].includes(run.status)).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0] || null;
-  const selectedLatestAssignment = selected ? latestActionableAssignment(selected.assignments || []) : null;
-  const selectedActiveAssignment = selected?.assignments.find((assignment) => activeAssignmentStatuses.has(assignment.status)) || null;
+  const selectedLatestAssignment = selected?.assignments.filter((assignment) => ["completed", "failed", "needs_input", "needs_attention"].includes(assignment.status)).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0] || null;
   const selectedMeetingId = selected?.type === "meeting_follow_up" ? selected.id : "";
   const activeMeetingWorkflow = meetingWorkflow?.workItemId === selectedMeetingId ? meetingWorkflow : null;
   const visibleDraft = selected && draftItemId === selected.id ? draft : selected?.draft || "";
-  const allRuns = items.flatMap((item) => item.agentRuns).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-  const visibleComposer = selected && composerItemId === selected.id ? composer : "";
-  const visibleCardActionMode = selected && composerItemId === selected.id ? cardActionMode : "update";
-  const visibleRevisionOf = selected && composerItemId === selected.id ? revisionOf : null;
 
   useEffect(() => {
     if (!selectedMeetingId) return;
@@ -665,18 +584,6 @@ export default function Home() {
     }
   };
 
-  const completeInClickUp = async () => {
-    if (!selected) return;
-    setBusy(true);
-    try {
-      await api(`/api/work-items/${encodeURIComponent(selected.id)}/complete-clickup`, { method: "POST", body: JSON.stringify({}) });
-      setNotice("ClickUp completion started. Command Center will keep the receipt on this card.");
-      await load(true);
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : "ClickUp could not be updated.");
-    } finally { setBusy(false); }
-  };
-
   const processMeetingTranscript = async (candidatePath = "") => {
     if (!selected) return;
     setBusy(true);
@@ -740,104 +647,12 @@ export default function Home() {
     finally { setBusy(false); }
   };
 
-  const acceptAction = async () => {
-    await patchItem({ decisionState: "accepted", eventDetail: "Jake accepted this recommended action." });
-    setNotice("Kept in your action stream. Command Center will continue tracking it.");
-  };
-
-  const submitCardAction = async () => {
-    if (!selected) return;
-    const mode = visibleCardActionMode;
-    const instruction = visibleComposer.trim();
-    if (!instruction) return;
-    setBusy(true);
-    try {
-      const response = await api<(CardCommandResponse & { outcome: string }) | { outcome: string; assignment: Assignment; handoffPacket: { prompt: string } | null; reused: boolean }>(`/api/work-items/${encodeURIComponent(selected.id)}/instructions`, {
-        method: "POST",
-        body: JSON.stringify({
-          mode,
-          instruction,
-          revisionOf: visibleRevisionOf,
-          clientRequestId: `${selected.id}:${mode}:${Date.now()}`,
-        }),
-      });
-      if (mode === "update") {
-        const command = response as CardCommandResponse & { outcome: string };
-        if (!command.handled) {
-          setNotice("That does not look like a card update. Choose Ask Codex if you want work prepared.");
-          return;
-        }
-        setData((current) => current ? { ...current, items: current.items.map((item) => item.id === command.updated.id ? command.updated : item) } : current);
-        setUndoCommandId(command.undoToken || "");
-        setNotice(command.clarification || command.message);
-      } else {
-        const prepared = response as { outcome: string; assignment: Assignment; handoffPacket: { prompt: string } | null; reused: boolean };
-        setNotice(prepared.reused
-          ? "This exact assignment is already active. Command Center kept the existing owner and did not create a duplicate."
-          : mode === "return_here"
-            ? "Prepared. No task is running yet; copy the handoff packet when you are ready. The result will return to this card."
-            : "Separate task prepared. No task is running yet; copy the handoff packet when you are ready.");
-      }
-      setComposer("");
-      setComposerItemId("");
-      setRevisionOf(null);
-      await load(true);
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : "The card action could not be completed.");
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const copyAssignmentPacket = async (assignment: Assignment) => {
-    setBusy(true);
-    try {
-      const response = await api<{ assignment: Assignment; handoffPacket: { prompt: string } }>(`/api/assignments/${encodeURIComponent(assignment.id)}/packet`, { method: "POST", body: JSON.stringify({}) });
-      await navigator.clipboard.writeText(response.handoffPacket.prompt);
-      setNotice("Handoff packet copied. Paste it into a user-owned Codex task; preparation alone does not start work.");
-      await load(true);
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : "The handoff packet could not be copied.");
-    } finally { setBusy(false); }
-  };
-
-  const cancelAssignment = async (assignment: Assignment) => {
-    setBusy(true);
-    try {
-      await api(`/api/assignments/${encodeURIComponent(assignment.id)}/cancel`, { method: "POST", body: JSON.stringify({}) });
-      setNotice("Cancelled the unowned preparation. No Codex task was stopped because none had accepted it.");
-      await load(true);
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : "The preparation could not be cancelled.");
-    } finally { setBusy(false); }
-  };
-
-  const undoCardCommand = async () => {
-    if (!undoCommandId) return;
-    setBusy(true);
-    try {
-      const result = await api<{ updated: WorkItem; message: string }>(`/api/card-commands/${encodeURIComponent(undoCommandId)}/undo`, { method: "POST", body: JSON.stringify({}) });
-      setData((current) => current ? { ...current, items: current.items.map((item) => item.id === result.updated.id ? result.updated : item) } : current);
-      setUndoCommandId("");
-      setNotice(result.message);
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : "The card change could not be undone.");
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const requestNoteEdit = async () => {
-    if (!activeNote || !noteCodexInstruction.trim()) return;
-    setBusy(true);
-    try {
-      const updated = await api<Note>(`/api/notes/${encodeURIComponent(activeNote.id)}/codex-edit`, { method: "POST", body: JSON.stringify({ instruction: noteCodexInstruction.trim() }) });
-      setNotes((current) => current.map((note) => note.id === updated.id ? updated : note));
-      setNoteCodexInstruction("");
-      setNotice("Codex is preparing a document edit. You can keep writing while it works.");
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Codex could not start the document edit.");
-    } finally { setBusy(false); }
+  const markWaiting = async () => {
+    if (!selected || waitingItemId !== selected.id || !waitingFor.trim()) return;
+    const person = waitingFor.trim();
+    await patchItem({ status: "waiting_external", eventDetail: `Waiting on ${person}.` });
+    setWaitingFor("");
+    setWaitingItemId("");
   };
 
   const decideNoteProposal = async (decision: "accept" | "reject") => {
@@ -977,7 +792,7 @@ export default function Home() {
             <kbd>C</kbd>
           </form>
           <button className="command-trigger" type="button" onClick={() => setCommandOpen(true)}><span>Search or jump to</span><kbd>Ctrl K</kbd></button>
-          {notice ? <div className="notice-group"><button className="notice" onClick={() => setNotice("")} type="button">{notice}</button>{undoCommandId ? <button className="undo-command" disabled={busy} onClick={() => void undoCardCommand()} type="button">Undo</button> : null}</div> : null}
+          {notice ? <div className="notice-group"><button className="notice" onClick={() => setNotice("")} type="button">{notice}</button></div> : null}
         </header>
 
         {view === "inbox" ? (
@@ -1012,14 +827,6 @@ export default function Home() {
           setView("inbox");
           if (window.innerWidth <= 1024) setMobileWorkbenchOpen(true);
         }} /> : null}
-        {view === "pm" ? <PmAgentWorkspace onNotice={setNotice} onOpenWorkItem={(id) => {
-          const item = items.find((candidate) => candidate.id === id);
-          setSelectedId(id);
-          if (item) setStatusFilter(workViewFor(item));
-          setView("inbox");
-          if (window.innerWidth <= 1024) setMobileWorkbenchOpen(true);
-        }} /> : null}
-
         {view === "companies" ? (
           <section className="content-view">
             <div className="view-heading"><p className="kicker">COMPANY ROOMS</p><h2>Where the work lives</h2><p>Each room combines its complete action inbox with the context behind it.</p></div>
@@ -1039,15 +846,26 @@ export default function Home() {
           </section>
         ) : null}
 
-        {view === "notes" ? (
+        {view === "transcripts" ? <TranscriptWorkspace items={items} notes={notes} onOpenItem={(id) => {
+          const item = items.find((candidate) => candidate.id === id);
+          setSelectedId(id);
+          if (item) setStatusFilter(workViewFor(item));
+          setView("inbox");
+          if (window.innerWidth <= 1024) setMobileWorkbenchOpen(true);
+        }} onOpenNote={(id) => {
+          const note = notes.find((candidate) => candidate.id === id);
+          if (note) void selectNote(note).then(() => setView("notes"));
+        }} /> : null}
+
+        {view === "notes" || view === "documents" ? (
           <section className={noteRailOpen ? "notes-layout" : "notes-layout list-collapsed"}>
             <aside className="note-list" aria-label="Document navigation">
-              <div className="view-heading compact"><p className="kicker">DOCUMENTS</p><h2>Your workbench</h2><p>Find a document and keep writing.</p></div>
+              <div className="view-heading compact"><p className="kicker">{view === "notes" ? "NOTES" : "DOCUMENTS"}</p><h2>{view === "notes" ? "Your thinking space" : "Your workbench"}</h2><p>{view === "notes" ? "Keep decisions and working thoughts easy to find." : "Find a document and keep writing."}</p></div>
               <div className="note-list-actions"><button className="new-note" type="button" onClick={async () => {
-                const note = await api<Note>("/api/notes", { method: "POST", body: JSON.stringify({ title: "Untitled note", body: "", type: "scratch", companySlug: companyFilter === "all" ? null : companyFilter }) });
+                const note = await api<Note>("/api/notes", { method: "POST", body: JSON.stringify({ title: "Untitled note", body: "", type: view === "documents" ? "project" : "scratch", companySlug: companyFilter === "all" ? null : companyFilter }) });
                 setNotes((current) => [note, ...current]); setActiveNoteId(note.id); setNoteTitle(note.title); setNoteDraft(bodyForEditor(note.title, note.body)); setNoteEditId(note.id); setNoteDirty(false);
               }}>+ New</button><button className="collapse-note-list" type="button" onClick={() => setNoteRailOpen(false)} aria-label="Hide document list">Hide</button></div>
-              <input className="note-search" value={noteQuery} onChange={(event) => setNoteQuery(event.target.value)} placeholder="Search documents..." aria-label="Search documents" />
+              <input className="note-search" value={noteQuery} onChange={(event) => setNoteQuery(event.target.value)} placeholder={view === "notes" ? "Search notes..." : "Search documents..."} aria-label={view === "notes" ? "Search notes" : "Search documents"} />
               <div className="note-groups">{noteGroups.map((group) => (
                 <section className="note-group" key={group.id}>
                   <h3>{group.label}<span>{group.notes.length}</span></h3>
@@ -1072,31 +890,11 @@ export default function Home() {
                       <p>{activeNote.latestProposal.summary || activeNote.latestProposal.error || `Working on: ${activeNote.latestProposal.instruction}`}</p>
                       {activeNote.latestProposal.status === "ready" ? <><details><summary>Preview revised Markdown</summary><pre>{activeNote.latestProposal.proposedBody}</pre></details><div className="proposal-actions"><button type="button" disabled={busy} onClick={() => void decideNoteProposal("accept")}>Accept edit</button><button type="button" disabled={busy} onClick={() => void decideNoteProposal("reject")}>Reject</button></div></> : null}
                     </section> : null}
-                    <details className="note-codex-drawer"><summary>Ask Codex to edit this document</summary>
-                      <form className="note-codex-composer" onSubmit={(event) => { event.preventDefault(); void requestNoteEdit(); }}>
-                        <label htmlFor="note-codex-instruction">Describe the change you want</label>
-                        <textarea id="note-codex-instruction" value={noteCodexInstruction} onChange={(event) => setNoteCodexInstruction(event.target.value)} placeholder="Add an agenda for tomorrow's kickoff using the company context and open questions..." />
-                        <button type="submit" disabled={busy || !noteCodexInstruction.trim()}>Propose edit</button>
-                      </form>
-                    </details>
                     <div className="note-actions"><span>{activeNote.companySlug ? data.companies.find((company) => company.slug === activeNote.companySlug)?.displayName : "Unfiled"}</span><div><details className="document-info"><summary>Document info</summary><small className="document-path">{activeNote.filePath || "Creating local file..."}</small></details><button type="button" onClick={async () => { await api(`/api/notes/${activeNote.id}/promote`, { method: "POST", body: JSON.stringify({}) }); setNotice("Promoted to the action inbox."); await load(); }}>Promote to action</button></div></div>
                   </div>
                 </div>
               ) : <p>Select a note.</p>}
             </article>
-          </section>
-        ) : null}
-
-        {view === "agents" ? (
-          <section className="content-view">
-            <div className="view-heading"><p className="kicker">AGENTS</p><h2>Background work</h2><p>Every assignment keeps its scope, permitted sources, and result history.</p></div>
-            <div className="run-list">
-              {allRuns.length ? allRuns.map((run) => (
-                <button className="run-row" key={run.id} type="button" onClick={() => { if (run.workItemId) { setSelectedId(run.workItemId); setView("inbox"); } }}>
-                  <span className={`run-dot run-${run.status}`} /><div><strong>{run.title}</strong><p>{run.result || run.error || run.waitingReason || "Codex is working in the background."}</p><small>{run.skillId} · {run.scope} · {run.allowedSources.join(", ") || "local context"}</small></div><ItemBadge status={run.status === "review" ? "back_for_review" : run.status as WorkStatus} />
-                </button>
-              )) : <div className="empty-message">No agent work has been launched from the new workbench yet.</div>}
-            </div>
           </section>
         ) : null}
 
@@ -1120,40 +918,50 @@ export default function Home() {
       <aside className={mobileWorkbenchOpen ? "workbench mobile-open" : "workbench"} data-company={selected?.companySlug || "unassigned"}>
         {view === "inbox" && selected ? (
           <>
-            <button className="mobile-close" type="button" onClick={() => setMobileWorkbenchOpen(false)}>← Back to inbox</button>
+            <button className="mobile-close" type="button" onClick={() => setMobileWorkbenchOpen(false)}>← Back to Open Work</button>
             <header className="workbench-header">
-              <div><span className="company-badge">{selected.companyName}</span><span className="owner-pill">{cardState(selected).owner}</span><span className={`state-pill state-${workViewFor(selected)}`}>{cardState(selected).label}</span><span className={`action-kind kind-${actionKind(selected).id}`}>{actionKind(selected).label}</span><span className={`priority priority-${selected.priority}`}>{selected.priority}</span></div>
+              <div><span className="company-badge">{selected.companyName || "Personal"}</span><span className={`state-pill state-${workViewFor(selected)}`}>{selectedState?.label}</span>{showPriority(selected.priority) ? <span className={`priority priority-${selected.priority}`}>{selected.priority}</span> : null}</div>
               <h2>{selected.title}</h2>
-              <p className="workbench-summary">{selected.summary}</p>
-              <div className="card-routing-row">
-                <label>Company<select aria-label="Card company assignment" value={selected.companySlug || ""} disabled={busy} onChange={(event) => void patchItem({ companySlug: event.target.value || null, eventDetail: `Jake assigned this card to ${event.target.selectedOptions[0]?.text || "Unassigned"}.` })}><option value="">Unassigned</option>{data.companies.map((company) => <option key={company.slug} value={company.slug}>{company.displayName}</option>)}</select></label>
-                <div className="due-date-field">
-                  <label htmlFor={`card-due-date-${selected.id}`}>Due date</label>
-                  <div>
-                    <input id={`card-due-date-${selected.id}`} aria-label="Card due date" type="date" value={dueDateInputValue(selected.dueAt)} disabled={busy} onChange={(event) => { const localDate = event.target.value; void patchItem({ dueAt: dueDateEndOfLocalDayIso(localDate), eventDetail: localDate ? `Jake set the due date to ${localDate}.` : "Jake cleared the due date." }); }} />
-                    <button aria-label="Clear due date" type="button" disabled={busy || !selected.dueAt} onClick={() => void patchItem({ dueAt: null, eventDetail: "Jake cleared the due date." })}>Clear</button>
-                  </div>
-                </div>
-                <span>{selected.type.replaceAll("_", " ")}</span>
-              </div>
             </header>
 
-            {selected.projectContext ? <button className="project-context-link" type="button" onClick={() => { setCompanyFilter(selected.companySlug || "all"); setView("projects"); }}>
-              <span>PROJECT PLAN</span><strong>{selected.projectContext.workstream}</strong><small>{selected.projectContext.phaseTitle} · Due {selected.projectContext.dueDate ? relativeTime(`${selected.projectContext.dueDate}T17:00:00-07:00`) : "not scheduled"}</small>
-            </button> : null}
+            <section className="card-section card-needs">
+              <div className="card-section-heading"><span>1</span><div><p>What needs to happen</p><h3>The next move</h3></div></div>
+              <dl className="card-definition-list"><div><dt>Next</dt><dd>{nextAction(selected)}</dd></div><div><dt>Done when</dt><dd>{definitionOfDone(selected)}</dd></div></dl>
+              <div className="card-edit-row">
+                <label htmlFor={`card-due-date-${selected.id}`}>Change due date<input id={`card-due-date-${selected.id}`} aria-label="Card due date" type="date" value={dueDateInputValue(selected.dueAt)} disabled={busy} onChange={(event) => { const localDate = event.target.value; void patchItem({ dueAt: dueDateEndOfLocalDayIso(localDate), eventDetail: localDate ? `Jake set the due date to ${localDate}.` : "Jake cleared the due date." }); }} /></label>
+                <label>Priority<select aria-label="Card priority" value={selected.priority} disabled={busy} onChange={(event) => void patchItem({ priority: event.target.value, eventDetail: `Jake changed priority to ${event.target.value}.` })}><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label>
+                {selected.dueAt ? <button className="text-action" type="button" disabled={busy} onClick={() => void patchItem({ dueAt: null, eventDetail: "Jake cleared the due date." })}>Clear date</button> : null}
+              </div>
+            </section>
 
-            <section className="why-card"><span>Why Command Center surfaced this</span><p>{selected.whyNow}</p><small>{Math.round(selected.confidence * 100)}% confidence · {relativeTime(selected.dueAt)}</small>{selected.activeRules.length ? <div className="rule-chips">{selected.activeRules.map((rule) => <span key={rule.id}>{rule.title}</span>)}</div> : null}</section>
+            <section className="card-section">
+              <div className="card-section-heading"><span>2</span><div><p>Why it matters</p><h3>{selected.projectContext?.projectTitle || selected.companyName || "Personal commitment"}</h3></div></div>
+              <p className="card-section-copy">{selected.whyNow || selected.summary}</p>
+              {selected.summary && selected.summary !== selected.whyNow ? <p className="card-section-copy secondary-copy">{selected.summary}</p> : null}
+              {selected.projectContext ? <button className="project-context-link" type="button" onClick={() => { setCompanyFilter(selected.companySlug || "all"); setView("projects"); }}><span>PROJECT</span><strong>{selected.projectContext.workstream}</strong><small>{selected.projectContext.phaseTitle}</small></button> : null}
+            </section>
 
-            {selectedLatestAssignment ? <CardResultPanel assignment={selectedLatestAssignment} formatDate={fullDate} onRevise={(assignment) => { setComposerItemId(selected.id); setCardActionMode("return_here"); setRevisionOf(assignment.id); setComposer("Revise this result with the following feedback: "); }} /> : selectedLatestResult ? <section className={`returned-result returned-${selectedLatestResult.status}`}>
-              <div><span>{selectedLatestResult.status === "review" ? "Ready for your review" : "Codex needs attention"}</span><time>{fullDate(selectedLatestResult.updatedAt)}</time></div>
-              <h3>{selectedLatestResult.title}</h3>
-              <p>{selectedLatestResult.result || selectedLatestResult.error}</p>
-            </section> : null}
+            <section className="card-section card-current-state">
+              <div className="card-section-heading"><span>3</span><div><p>Current state</p><h3>{selectedState?.label}</h3></div></div>
+              <div className="current-owner"><strong>{selectedState?.owner}</strong><p>{selectedState?.detail}</p></div>
+              {selectedLatestAssignment || selectedLatestResult ? <div className="latest-review"><strong>{selectedLatestAssignment?.status === "needs_input" || selectedLatestResult?.status === "error" ? "A decision or fix is needed" : "Latest reviewable result"}</strong><p>{selectedLatestAssignment?.result || selectedLatestAssignment?.error || selectedLatestResult?.result || selectedLatestResult?.error}</p></div> : null}
+              <div className="card-primary-controls">
+                {!['done','dismissed'].includes(selected.status) ? <button type="button" disabled={busy} onClick={() => void patchItem({ status: "done", resolution: "Completed from Command Center." })}>Done</button> : null}
+                <button className="secondary" type="button" disabled={busy} onClick={() => { setWaitingItemId(selected.id); setWaitingFor(""); }}>Waiting on…</button>
+                <button className="secondary" type="button" disabled={busy} onClick={() => void patchItem({ status: "back_for_review", eventDetail: "Jake marked this item ready to review." })}>Ready to review</button>
+                {!['done','dismissed'].includes(selected.status) ? <button className="secondary" type="button" disabled={busy} onClick={() => void patchItem({ status: "dismissed", eventDetail: "Jake marked this item as not needed." })}>Not needed</button> : null}
+              </div>
+              {waitingItemId === selected.id ? <form className="waiting-editor" onSubmit={(event) => { event.preventDefault(); void markWaiting(); }}><label htmlFor={`waiting-on-${selected.id}`}>Who or what are you waiting on?</label><div><input id={`waiting-on-${selected.id}`} autoFocus value={waitingFor} onChange={(event) => setWaitingFor(event.target.value)} placeholder="Kyle, customer data, legal review…" /><button type="submit" disabled={busy || !waitingFor.trim()}>Save</button><button className="secondary" type="button" onClick={() => { setWaitingItemId(""); setWaitingFor(""); }}>Cancel</button></div></form> : null}
+            </section>
 
-            <details className="workbench-section" open>
-              <summary>Likely next action</summary>
-              <p className="suggested-action">{selected.suggestedAction}</p>
-            </details>
+            <section className="card-section card-context">
+              <div className="card-section-heading"><span>4</span><div><p>Relevant context</p><h3>{contextKind(selected)}</h3></div></div>
+              {activeMeetingWorkflow?.event ? <dl className="context-facts"><div><dt>Date</dt><dd>{fullDate(activeMeetingWorkflow.event.startAt)}</dd></div><div><dt>Attendees</dt><dd>{activeMeetingWorkflow.event.attendees.map((attendee) => attendee.name || attendee.email).filter(Boolean).join(", ") || "Not listed"}</dd></div></dl> : null}
+              {selected.sources[0]?.sourceUrl ? <a className="card-source-primary" href={selected.sources[0].sourceUrl} target="_blank" rel="noreferrer">Open source/context</a> : null}
+              <div className="context-links">{selected.sources.slice(0, 3).map((source) => source.sourceUrl ? <a href={source.sourceUrl} target="_blank" rel="noreferrer" key={source.id}>Open {source.label || source.provider}</a> : <span key={source.id} title={source.sourcePath}>{source.label || source.provider}</span>)}</div>
+              {selected.notes.slice(0, 2).map((note) => <button className="linked-note" key={note.id} type="button" onClick={() => void selectNote(note).then(() => setView("notes"))}><strong>{note.title}</strong><span>{note.body.slice(0, 100) || "Empty note"}</span></button>)}
+              {!selected.sources.length && !selected.notes.length && !selected.projectContext ? <p className="muted-copy">No linked source has been added yet.</p> : null}
+            </section>
 
             {selected.type === "meeting_follow_up" ? <section className="meeting-followthrough" aria-live="polite">
               <div className="meeting-followthrough-heading"><div><span>MEETING TO ACTIONS</span><h3>{activeMeetingWorkflow?.state === "processing" ? "Processing the transcript" : activeMeetingWorkflow?.state === "review" ? "Review the follow-ups" : activeMeetingWorkflow?.state === "complete" ? "Meeting processed" : "Add the transcript when it is ready"}</h3></div><span className={`meeting-state meeting-${activeMeetingWorkflow?.state || "loading"}`}>{(activeMeetingWorkflow?.state || "loading").replaceAll("_", " ")}</span></div>
@@ -1178,61 +986,26 @@ export default function Home() {
               </> : null}
             </section> : null}
 
-            <details className="workbench-section optional-workspace" open={Boolean(visibleDraft)}>
-              <summary>{selectedWorkingSurface?.label || "Working notes"} <span>Optional</span></summary>
+            <details className="card-section optional-workspace" open={Boolean(visibleDraft)}>
+              <summary><span className="section-number">5</span><span><small>Working area</small>{selectedWorkingSurface?.label || "Working notes"}</span></summary>
               <textarea className="draft-editor" value={visibleDraft} onChange={(event) => { setDraftItemId(selected.id); setDraft(event.target.value); }} placeholder={selectedWorkingSurface?.placeholder || "Capture optional working notes..."} aria-label={selectedWorkingSurface?.label || "Working notes"} />
               <div className="inline-actions"><button type="button" disabled={busy || !visibleDraft.trim()} onClick={() => void patchItem({ draft: visibleDraft, eventDetail: `${selectedWorkingSurface?.label || "Working notes"} updated.` })}>Save to card</button></div>
-              <small className="approval-copy">This stays on the card. It is not a Codex instruction and is not sent anywhere.</small>
+              <small className="approval-copy">This stays on the card and is not sent anywhere.</small>
             </details>
 
-            <details className="workbench-section" open>
-              <summary>Sources &amp; history</summary>
+            <details className="card-section card-history">
+              <summary><span className="section-number">6</span><span><small>History</small>Audit trail and receipts</span></summary>
               <div className="source-chips">{selected.sources.map((source) => source.sourceUrl ? <a href={source.sourceUrl} target="_blank" rel="noreferrer" key={source.id}>{source.provider} · {source.freshness}</a> : <span key={source.id} title={source.sourcePath}>{source.provider} · {source.freshness}</span>)}</div>
-              <ol className="history-list">{selected.events.slice(0, 6).map((event) => <li key={event.id}><span>{event.type.replaceAll("_", " ")}</span><p>{event.detail}</p><time>{fullDate(event.createdAt)}</time></li>)}</ol>
-            </details>
-
-            <details className="workbench-section" open={selected.agentRuns.length > 0}>
-              <summary>Codex work {selected.agentRuns.length ? `(${selected.agentRuns.length})` : ""}</summary>
-              {selected.agentRuns.length ? selected.agentRuns.map((run) => <article className={`agent-result agent-${run.status}`} key={run.id}>
-                <div><strong>{run.status === "review" ? "Ready for your review" : run.status === "error" ? "Needs attention" : run.status === "waiting_on_user" ? "Waiting for you" : "Codex is working"}</strong><time>{fullDate(run.updatedAt)}</time></div>
-                {["queued", "working"].includes(run.status) ? <div className="activity-receipt"><p><span>Working on</span>{requestedOutcome(run)}</p><p><span>Using</span>{run.allowedSources.map(sourceName).join(", ") || "card context"}</p><p><span>Returns to</span>This card for your review</p><p><span>External actions</span>None</p><small>Started {relativeTime(run.createdAt)}</small></div> : <p>{run.result || run.error || run.waitingReason || "No result was returned."}</p>}
-                {run.status === "review" ? <button type="button" onClick={() => { setComposerItemId(selected.id); setCardActionMode("return_here"); setComposer("Revise this result with the following feedback: "); }}>Revise with feedback</button> : null}
-              </article>) : <p className="muted-copy">Codex has not worked on this item yet.</p>}
-            </details>
-
-            <AssignmentReceiptList assignments={selected.assignments || []} busy={busy} formatDate={fullDate} onCopyPacket={(assignment) => void copyAssignmentPacket(assignment)} onCancel={(assignment) => void cancelAssignment(assignment)} />
-
-            {selected.codexTasks.length ? <details className="workbench-section legacy-receipts">
-              <summary>Legacy task receipts ({selected.codexTasks.length})</summary>
-              {selected.codexTasks.map((task) => <article className="codex-task-receipt" key={task.id}><div><strong>{task.title}</strong><span>{task.status.replaceAll("_", " ")}</span></div><p>{task.result || task.error || task.instruction}</p><small>Historical receipt only. New work uses the owner-bound assignment lifecycle.</small></article>)}
-            </details> : null}
-
-            {selected.externalActions.length ? <details className="workbench-section" open>
-              <summary>System receipts</summary>
-              {selected.externalActions.map((action) => <article className={`external-receipt receipt-${action.status}`} key={action.id}><div><strong>{action.provider} · {action.actionType.replaceAll("_", " ")}</strong><span>{action.status}</span></div><p>{action.receipt || action.error || `Updating ${action.targetId}...`}</p></article>)}
-            </details> : null}
-
-            <details className="workbench-section">
-              <summary>Linked notes {selected.notes.length ? `(${selected.notes.length})` : ""}</summary>
-              {selected.notes.map((note) => <button className="linked-note" key={note.id} type="button" onClick={() => void selectNote(note).then(() => setView("notes"))}><strong>{note.title}</strong><span>{note.body.slice(0, 100) || "Empty note"}</span></button>)}
+              <ol className="history-list">{selected.events.map((event) => <li key={event.id}><span>{event.type.replaceAll("_", " ")}</span><p>{event.detail}</p><time>{fullDate(event.createdAt)}</time></li>)}</ol>
+              {selected.assignments.length ? <div className="audit-group"><h4>Assignment receipts</h4>{selected.assignments.map((assignment) => <article key={assignment.id}><strong>{assignment.status.replaceAll("_", " ")}</strong><span>{assignment.ownerId || "No owner"}</span><p>{assignment.result || assignment.error || assignment.instruction}</p><small>{fullDate(assignment.updatedAt)}</small></article>)}</div> : null}
+              {selected.agentRuns.length ? <div className="audit-group"><h4>Native work history</h4>{selected.agentRuns.map((run) => <article key={run.id}><strong>{run.status.replaceAll("_", " ")}</strong><p>{run.result || run.error || run.waitingReason || run.intent}</p><small>{fullDate(run.updatedAt)}</small></article>)}</div> : null}
+              {selected.codexTasks.length ? <div className="audit-group"><h4>Legacy task receipts</h4>{selected.codexTasks.map((task) => <article key={task.id}><strong>{task.title}</strong><span>{task.status.replaceAll("_", " ")}</span><p>{task.result || task.error || task.instruction}</p></article>)}</div> : null}
+              {selected.externalActions.length ? <div className="audit-group"><h4>System receipts</h4>{selected.externalActions.map((action) => <article key={action.id}><strong>{action.provider} · {action.actionType.replaceAll("_", " ")}</strong><span>{action.status}</span><p>{action.receipt || action.error || action.targetId}</p></article>)}</div> : null}
               <button className="text-action" type="button" onClick={() => void createContextNote()}>+ Add contextual note</button>
             </details>
-
-            <div className="resolution-actions">
-              {selected.decisionState === "proposed" ? <button className="accept-action" disabled={busy} type="button" onClick={() => void acceptAction()}>I&apos;ll handle it</button> : null}
-              {selected.status === "waiting_external" ? <button className="accept-action" disabled={busy} type="button" onClick={() => void patchItem({ status: "to_review", eventDetail: "Jake is following up on this waiting item." })}>Follow up now</button> : null}
-              {selected.status === "error" ? <button className="accept-action" disabled={busy} type="button" onClick={() => void patchItem({ status: "to_review", eventDetail: "Returned to Jake's work after an error." })}>Return to Open Work</button> : null}
-              {selected.type !== "meeting_follow_up" && !['queued','working'].includes(selected.status) ? <button disabled={busy} type="button" onClick={() => void patchItem({ status: "done", resolution: "Completed from the Command Center workbench." })}>{selected.status === "back_for_review" ? "Accept & mark done" : "Done"}</button> : null}
-              {!['queued','working'].includes(selected.status) && selected.sources.some((source) => source.provider === "clickup" && Boolean(source.sourceId || /\/t\/[a-zA-Z0-9_-]+/.test(source.sourceUrl))) ? <button className="clickup-complete" disabled={busy || selected.externalActions.some((action) => ["queued","working"].includes(action.status))} type="button" onClick={() => void completeInClickUp()}>Done in ClickUp</button> : null}
-              {!['queued','working','done','dismissed'].includes(selected.status) ? <button disabled={busy} type="button" onClick={() => void patchItem({ status: "dismissed", eventDetail: "Jake marked this item as not needed." })}>Not needed</button> : null}
-            </div>
-
-            {selectedActiveAssignment ? <section className={`codex-active-banner assignment-${selectedActiveAssignment.status}`}><strong>{selectedActiveAssignment.status === "needs_input" ? "Codex needs your decision" : selectedActiveAssignment.status === "needs_attention" ? "Check the existing Codex owner" : selectedActiveAssignment.status === "accepted" ? "Accepted; waiting to start" : "Codex is working"}</strong><p>{selectedActiveAssignment.result || selectedActiveAssignment.instruction}</p><small>Owner: {selectedActiveAssignment.ownerId || "not yet reported"}. Command Center will not create a replacement task automatically.</small></section> : null}
-            {visibleRevisionOf ? <div className="revision-notice">Revising a returned result. Your feedback will create a linked assignment after you submit.</div> : null}
-            <CardActionComposer mode={visibleCardActionMode} instruction={visibleComposer} busy={busy} onMode={(mode) => { setComposerItemId(selected.id); setCardActionMode(mode); if (mode !== "return_here") setRevisionOf(null); }} onInstruction={(value) => { setComposerItemId(selected.id); setComposer(value); }} onSubmit={() => void submitCardAction()} />
           </>
         ) : (
-          <div className="workbench-placeholder"><p className="kicker">WORKBENCH</p><h2>{view === "notes" ? "Write alongside the work" : "Select an action to begin"}</h2><p>Your sources, notes, drafts, approvals, and Codex assignments stay together here.</p></div>
+          <div className="workbench-placeholder"><p className="kicker">DETAILS</p><h2>{view === "notes" || view === "documents" ? "Write alongside the work" : "Select an item to see its full context"}</h2><p>Command Center keeps commitments, evidence, notes, and verified results together.</p></div>
         )}
       </aside>
 
@@ -1252,7 +1025,7 @@ export default function Home() {
 function NavGroup({ label, items, view, onSelect, itemCount, mailCount }: {
   label: string;
   items: ReadonlyArray<(typeof navItems)[number]>;
-  view: (typeof navItems)[number][0] | "settings";
+  view: ViewId;
   onSelect: (view: (typeof navItems)[number][0]) => void;
   itemCount?: number;
   mailCount?: number;
@@ -1306,7 +1079,6 @@ function InboxView({
   const types = [...new Set(items.map((item) => item.type))];
   const viewCopy: Record<WorkView, string> = {
     open: "Everything still outstanding, including work waiting on someone else, ordered by when it needs to happen.",
-    codex_working: "Work Codex is actively processing or preparing to start.",
     done: "Completed work and items you decided were not needed.",
   };
   const viewLabel = workViews.find((workView) => workView.id === statusFilter)?.label || "Open Work";
@@ -1317,13 +1089,13 @@ function InboxView({
   });
   const groupedItems = dueBuckets.map((bucket) => ({ ...bucket, items: sortedItems.filter((item) => dueBucketFor(item, dayAnchor) === bucket.id) })).filter((bucket) => bucket.items.length);
   const renderCard = (item: WorkItem, board = false) => {
-    const state = cardState(item);
+    const state = simplifiedCardState(item);
     const dueBucket = dueBucketFor(item, dayAnchor);
     return (
       <button className={`${board ? "issue-board-card" : "feed-card issue-row"}${selectedId === item.id ? " selected" : ""}`} data-company={item.companySlug || "unassigned"} key={item.id} onClick={() => setSelectedId(item.id)} type="button">
-        <span className={`issue-status-icon status-${item.status}`} aria-label={statusMeta[item.status].label} />
-        <span className="issue-row-main"><strong>{item.title}</strong><span><span className="feed-company"><i className="company-dot" aria-hidden="true" />{item.companyName}</span>{state.label !== "Ready" ? <span className={item.status === "error" ? "feed-state feed-state-critical" : item.status === "waiting_external" ? "feed-state feed-state-waiting" : "feed-state"}>{state.label}</span> : null}</span></span>
-        <span className={`issue-priority priority-${item.priority}`} aria-label={`${item.priority} priority`}>{item.priority === "urgent" ? "!!!" : item.priority === "high" ? "!!" : item.priority === "normal" ? "-" : ""}</span>
+        <span className={`issue-status-icon status-${item.status}`} aria-label={state.label} />
+        <span className="issue-row-main"><span className="issue-row-meta"><span className="feed-company"><i className="company-dot" aria-hidden="true" />{item.companyName || "Personal"}</span><span className={item.status === "error" ? "feed-state feed-state-critical" : item.status === "waiting_external" ? "feed-state feed-state-waiting" : "feed-state"}>{state.label}</span></span><strong>{item.title}</strong><span className="issue-next"><b>Next</b>{nextAction(item)}</span></span>
+        {showPriority(item.priority) ? <span className={`issue-priority-label priority-${item.priority}`}>{item.priority}</span> : null}
         <time className={`due-chip due-${dueBucket}`}>{dueLabel(item, dayAnchor)}</time>
       </button>
     );
@@ -1331,7 +1103,7 @@ function InboxView({
   return (
     <section className="inbox-view">
       <div className="inbox-heading">
-        <div><p className="issue-breadcrumb">Workspace / My work</p><h2>{viewLabel}</h2><p>{companyName} / {filteredItems.length} items. {viewCopy[statusFilter]}</p></div>
+        <div><p className="issue-breadcrumb">Workspace / Open Work</p><h2>{viewLabel}</h2><p>{companyName} / {filteredItems.length} items. {viewCopy[statusFilter]}</p></div>
         <div className="layout-toggle" aria-label="Layout"><button className={layoutMode === "list" ? "active" : ""} type="button" onClick={() => setLayoutMode("list")}>List</button><button className={layoutMode === "board" ? "active" : ""} type="button" onClick={() => setLayoutMode("board")}>Board</button></div>
       </div>
 

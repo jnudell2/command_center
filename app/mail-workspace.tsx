@@ -197,13 +197,13 @@ export default function MailWorkspace({ companies, selectedMessageId, onNotice, 
     if (!detail) return;
     setBusy(true);
     try {
-      const next = detail.actionWorkItemId ? detail : await api<Mail>(`/api/mail/${detail.id}`, { method: "PATCH", body: JSON.stringify({ promote: true, detail: "Promoted mail so Codex work can return to an owned card." }) });
+      const next = detail.actionWorkItemId ? detail : await api<Mail>(`/api/mail/${detail.id}`, { method: "PATCH", body: JSON.stringify({ promote: true, detail: "Promoted mail into an owned Open Work card." }) });
       setDetail(next);
       await loadList(true);
       onPromoted();
       if (next.actionWorkItemId) {
         onOpenWorkItem(next.actionWorkItemId);
-        onNotice("Opened the mail card. Choose Ask Codex · Return here to prepare the reply; no task starts automatically.");
+        onNotice("Opened the mail card with its reply obligation and source message in context.");
       }
     } catch (error) { onNotice(error instanceof Error ? error.message : "The mail card could not be opened."); }
     finally { setBusy(false); }
