@@ -21,9 +21,48 @@ test("keeps native Codex task execution outside the Command Center runner", asyn
   const source = await readFile(fileURLToPath(new URL("../scripts/local-control-server.mjs", import.meta.url)), "utf8");
   assert.doesNotMatch(source, /function readCodexThread/);
   assert.doesNotMatch(source, /function launchPersistentCodexTask/);
-  assert.match(source, /codex:\/\/threads\/new/);
-  assert.match(source, /codex_task_heartbeat_missed/);
-  assert.match(source, /status='working'[\s\S]*-10 minutes/);
+  assert.doesNotMatch(source, /app-server|thread\/start|thread\/resume|turn\/start|openCodexThreadInApp/);
+  assert.match(source, /This launch endpoint is retired/);
+  assert.match(source, /reconcileAssignmentAttention/);
+  assert.match(source, /existing native Codex owner remains assigned/);
+});
+
+test("preserves one assignment owner across restart and marks stale work for attention", async (t) => {
+  const dataDir = await mkdtemp(path.join(tmpdir(), "serent-assignment-restart-"));
+  const port = 45200 + Math.floor(Math.random() * 500);
+  const startRunner = () => spawn(process.execPath, [fileURLToPath(new URL("../scripts/local-control-server.mjs", import.meta.url))], {
+    cwd: fileURLToPath(new URL("..", import.meta.url)),
+    env: { ...process.env, SERENT_TEND_DATA_DIR: dataDir, SERENT_TEND_PORT: String(port), SERENT_TEND_DISABLE_LOCAL_WORKFLOWS: "1" },
+    windowsHide: true,
+  });
+  let runner = startRunner();
+  t.after(async () => {
+    if (runner.exitCode === null) { const exited = once(runner, "exit"); runner.kill(); await exited; }
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      try { await rm(dataDir, { recursive: true, force: true }); break; }
+      catch (error) { if (attempt === 7) throw error; await new Promise((resolve) => setTimeout(resolve, 80)); }
+    }
+  });
+  await waitFor(`http://127.0.0.1:${port}/api/health`);
+  const item = await (await fetch(`http://127.0.0.1:${port}/api/work-items`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ title: "Restart lifecycle QA", sourceKey: "restart-lifecycle-qa", companySlug: "firm" }) })).json();
+  const prepared = await (await fetch(`http://127.0.0.1:${port}/api/work-items/${item.id}/instructions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ mode: "return_here", instruction: "Remain owner-bound across restart." }) })).json();
+  const token = prepared.handoffPacket.prompt.match(/^Authorization: Bearer ([A-Za-z0-9_-]+)$/m)?.[1];
+  await fetch(`http://127.0.0.1:${port}/api/assignments/${prepared.assignment.id}/events`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify({ eventId: "restart-accepted", type: "accepted", ownerId: "restart-owner" }) });
+
+  const db = new DatabaseSync(path.join(dataDir, "serent-tend.sqlite"));
+  db.prepare("UPDATE assignments SET heartbeat_at=?,updated_at=? WHERE id=?").run("2020-01-01T00:00:00.000Z", "2020-01-01T00:00:00.000Z", prepared.assignment.id);
+  db.close();
+  const exited = once(runner, "exit");
+  runner.kill();
+  await exited;
+  runner = startRunner();
+  await waitFor(`http://127.0.0.1:${port}/api/health`);
+  const restored = await (await fetch(`http://127.0.0.1:${port}/api/work-items/${item.id}`)).json();
+  assert.equal(restored.status, "needs_attention");
+  assert.equal(restored.assignments[0].id, prepared.assignment.id);
+  assert.equal(restored.assignments[0].ownerId, "restart-owner");
+  assert.equal(restored.assignments[0].status, "needs_attention");
+  assert.equal(restored.assignments.filter((assignment) => ["prepared", "accepted", "working", "needs_input", "needs_attention"].includes(assignment.status)).length, 1);
 });
 
 test("migrates a fresh local store and exposes adaptive Mail contracts", async (t) => {
@@ -134,7 +173,8 @@ test("migrates a fresh local store and exposes adaptive Mail contracts", async (
   const dueCleared = await (await fetch(`http://127.0.0.1:${port}/api/work-items/${captured.id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ dueAt: null, eventDetail: "Jake cleared the due date." }) })).json();
   assert.equal(dueCleared.dueAt, null);
   assert.equal(dueCleared.events[0].detail, "Jake cleared the due date.");
-  const cardCommand = await (await fetch(`http://127.0.0.1:${port}/api/work-items/${captured.id}/command`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ instruction: "Change this to Revised kickoff, set priority to urgent, due 2030-08-22" }) })).json();
+  const cardCommand = await (await fetch(`http://127.0.0.1:${port}/api/work-items/${captured.id}/instructions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ mode: "update", instruction: "Change this to Revised kickoff, set priority to urgent, due 2030-08-22" }) })).json();
+  assert.equal(cardCommand.outcome, "card_updated");
   assert.equal(cardCommand.handled, true);
   assert.equal(cardCommand.updated.title, "Revised kickoff");
   assert.equal(cardCommand.updated.priority, "urgent");
@@ -146,32 +186,89 @@ test("migrates a fresh local store and exposes adaptive Mail contracts", async (
   assert.equal(cardCommandUndo.updated.title, "Prepare tomorrow's kickoff");
   assert.equal(cardCommandUndo.updated.priority, "high");
   assert.equal(cardCommandUndo.updated.dueAt, null);
-  const mixedCommand = await (await fetch(`http://127.0.0.1:${port}/api/work-items/${captured.id}/command`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ instruction: "Move this to 2030-08-23 and draft the kickoff email" }) })).json();
+  const mixedCommand = await (await fetch(`http://127.0.0.1:${port}/api/work-items/${captured.id}/instructions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ mode: "update", instruction: "Move this to 2030-08-23 and draft the kickoff email" }) })).json();
   assert.equal(mixedCommand.handled, true);
   assert.equal(mixedCommand.remainingIntent, "draft the kickoff email");
   await fetch(`http://127.0.0.1:${port}/api/card-commands/${mixedCommand.undoToken}/undo`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
-  const unclearCommand = await (await fetch(`http://127.0.0.1:${port}/api/work-items/${captured.id}/command`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ instruction: "Due sometime-ish" }) })).json();
+  const unclearCommand = await (await fetch(`http://127.0.0.1:${port}/api/work-items/${captured.id}/instructions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ mode: "update", instruction: "Due sometime-ish" }) })).json();
   assert.match(unclearCommand.clarification, /could not understand the due date/i);
   assert.equal(unclearCommand.updated.dueAt, null);
-  const preparedTask = await (await fetch(`http://127.0.0.1:${port}/api/work-items/${captured.id}/codex-task`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ instruction: "Prepare a local kickoff brief." }) })).json();
-  assert.equal(preparedTask.status, "waiting_on_user");
-  assert.match(preparedTask.deepLink, /^codex:\/\/threads\/new/);
+  const preparedResponse = await fetch(`http://127.0.0.1:${port}/api/work-items/${captured.id}/instructions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ mode: "return_here", instruction: "Prepare a local kickoff brief.", clientRequestId: "prepare-click-1" }) });
+  assert.equal(preparedResponse.status, 201);
+  const preparedTask = await preparedResponse.json();
+  assert.equal(preparedTask.assignment.status, "prepared");
+  assert.equal(preparedTask.assignment.destination, "card");
+  assert.match(preparedTask.handoffPacket.prompt, /No Codex task is running yet|does not launch/);
   const liveCaptured = await (await fetch(`http://127.0.0.1:${port}/api/work-items/${captured.id}`)).json();
   assert.equal(liveCaptured.status, "to_review");
-  const unverifiedStart = await fetch(`http://127.0.0.1:${port}/api/codex-tasks/${preparedTask.id}/callback`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ status: "started" }) });
-  assert.equal(unverifiedStart.status, 400);
-  const nativeThreadId = "019f638b-d56d-7df2-bd21-ac47d008125b";
-  const acceptedReceipt = await (await fetch(`http://127.0.0.1:${port}/api/codex-tasks/${preparedTask.id}/callback`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ status: "accepted", threadId: nativeThreadId }) })).json();
-  assert.equal(acceptedReceipt.status, "accepted");
+  const duplicatePrepared = await (await fetch(`http://127.0.0.1:${port}/api/work-items/${captured.id}/instructions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ mode: "return_here", instruction: "Prepare a local kickoff brief.", clientRequestId: "prepare-click-1" }) })).json();
+  assert.equal(duplicatePrepared.assignment.id, preparedTask.assignment.id);
+  assert.equal(duplicatePrepared.reused, true);
+  const token = preparedTask.handoffPacket.prompt.match(/^Authorization: Bearer ([A-Za-z0-9_-]+)$/m)?.[1];
+  assert.ok(token);
+  const callbackHeaders = { "content-type": "application/json", authorization: `Bearer ${token}` };
+  const unverifiedStart = await fetch(`http://127.0.0.1:${port}/api/assignments/${preparedTask.assignment.id}/events`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ eventId: "event-started-unowned", type: "started", ownerId: "native-owner-1" }) });
+  assert.equal(unverifiedStart.status, 403);
+  const acceptedReceipt = await (await fetch(`http://127.0.0.1:${port}/api/assignments/${preparedTask.assignment.id}/events`, { method: "POST", headers: callbackHeaders, body: JSON.stringify({ eventId: "event-accepted-1", type: "accepted", ownerId: "native-owner-1" }) })).json();
+  assert.equal(acceptedReceipt.assignment.status, "accepted");
   assert.equal((await (await fetch(`http://127.0.0.1:${port}/api/work-items/${captured.id}`)).json()).status, "queued");
-  const startedReceipt = await (await fetch(`http://127.0.0.1:${port}/api/codex-tasks/${preparedTask.id}/callback`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ status: "started", threadId: nativeThreadId }) })).json();
-  assert.equal(startedReceipt.status, "started");
+  const conflictingOwner = await fetch(`http://127.0.0.1:${port}/api/assignments/${preparedTask.assignment.id}/events`, { method: "POST", headers: callbackHeaders, body: JSON.stringify({ eventId: "event-conflict-1", type: "started", ownerId: "native-owner-2" }) });
+  assert.equal(conflictingOwner.status, 409);
+  const startedReceipt = await (await fetch(`http://127.0.0.1:${port}/api/assignments/${preparedTask.assignment.id}/events`, { method: "POST", headers: callbackHeaders, body: JSON.stringify({ eventId: "event-started-1", type: "started", ownerId: "native-owner-1" }) })).json();
+  assert.equal(startedReceipt.assignment.status, "working");
   assert.equal((await (await fetch(`http://127.0.0.1:${port}/api/work-items/${captured.id}`)).json()).status, "working");
-  const reusedTask = await (await fetch(`http://127.0.0.1:${port}/api/work-items/${captured.id}/codex-task`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ instruction: "Do not duplicate this." }) })).json();
-  assert.equal(reusedTask.id, preparedTask.id);
-  assert.equal(reusedTask.reused, true);
-  const needsInput = await (await fetch(`http://127.0.0.1:${port}/api/codex-tasks/${preparedTask.id}/callback`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ status: "needs_input", result: "Choose the audience." }) })).json();
-  assert.equal(needsInput.status, "needs_input");
+  const needsInput = await (await fetch(`http://127.0.0.1:${port}/api/assignments/${preparedTask.assignment.id}/events`, { method: "POST", headers: callbackHeaders, body: JSON.stringify({ eventId: "event-needs-input-1", type: "needs_input", ownerId: "native-owner-1", result: "Choose the audience." }) })).json();
+  assert.equal(needsInput.assignment.status, "needs_input");
+  assert.equal((await (await fetch(`http://127.0.0.1:${port}/api/work-items/${captured.id}`)).json()).status, "waiting_on_user");
+  const conflictingPreparation = await fetch(`http://127.0.0.1:${port}/api/work-items/${captured.id}/instructions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ mode: "separate_task", instruction: "Start different work." }) });
+  assert.equal(conflictingPreparation.status, 409);
+  const completedBody = JSON.stringify({ eventId: "event-completed-1", type: "completed", ownerId: "native-owner-1", result: "Kickoff brief ready for review." });
+  const completed = await (await fetch(`http://127.0.0.1:${port}/api/assignments/${preparedTask.assignment.id}/events`, { method: "POST", headers: callbackHeaders, body: completedBody })).json();
+  assert.equal(completed.assignment.status, "completed");
+  const replay = await (await fetch(`http://127.0.0.1:${port}/api/assignments/${preparedTask.assignment.id}/events`, { method: "POST", headers: callbackHeaders, body: completedBody })).json();
+  assert.equal(replay.replayed, true);
+  const returnedCard = await (await fetch(`http://127.0.0.1:${port}/api/work-items/${captured.id}`)).json();
+  assert.equal(returnedCard.status, "back_for_review");
+  assert.equal(returnedCard.assignments[0].result, "Kickoff brief ready for review.");
+  const legacyCallback = await fetch(`http://127.0.0.1:${port}/api/codex-tasks/legacy/callback`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  assert.equal(legacyCallback.status, 410);
+
+  const createScenarioItem = async (sourceKey, title) => (await (await fetch(`http://127.0.0.1:${port}/api/work-items`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ title, sourceKey, companySlug: "firm" }) })).json());
+  const prepareScenario = async (itemId, instruction, mode = "return_here") => {
+    const prepared = await (await fetch(`http://127.0.0.1:${port}/api/work-items/${itemId}/instructions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ mode, instruction }) })).json();
+    const capability = prepared.handoffPacket.prompt.match(/^Authorization: Bearer ([A-Za-z0-9_-]+)$/m)?.[1];
+    return { ...prepared, callbackHeaders: { "content-type": "application/json", authorization: `Bearer ${capability}` } };
+  };
+  const failedItem = await createScenarioItem("assignment-failure-scenario", "Assignment failure scenario");
+  const failedPrepared = await prepareScenario(failedItem.id, "Attempt the failure scenario.");
+  await fetch(`http://127.0.0.1:${port}/api/assignments/${failedPrepared.assignment.id}/events`, { method: "POST", headers: failedPrepared.callbackHeaders, body: JSON.stringify({ eventId: "failure-accepted", type: "accepted", ownerId: "failure-owner" }) });
+  await fetch(`http://127.0.0.1:${port}/api/assignments/${failedPrepared.assignment.id}/events`, { method: "POST", headers: failedPrepared.callbackHeaders, body: JSON.stringify({ eventId: "failure-started", type: "started", ownerId: "failure-owner" }) });
+  const failedReceipt = await (await fetch(`http://127.0.0.1:${port}/api/assignments/${failedPrepared.assignment.id}/events`, { method: "POST", headers: failedPrepared.callbackHeaders, body: JSON.stringify({ eventId: "failure-terminal", type: "failed", ownerId: "failure-owner", error: "Deterministic QA failure." }) })).json();
+  assert.equal(failedReceipt.assignment.status, "failed");
+  assert.equal((await (await fetch(`http://127.0.0.1:${port}/api/work-items/${failedItem.id}`)).json()).status, "error");
+
+  const cancelledItem = await createScenarioItem("assignment-cancel-scenario", "Assignment cancellation scenario");
+  const cancelledPrepared = await prepareScenario(cancelledItem.id, "Prepare but do not start.", "separate_task");
+  const cancelled = await (await fetch(`http://127.0.0.1:${port}/api/assignments/${cancelledPrepared.assignment.id}/cancel`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).json();
+  assert.equal(cancelled.assignment.status, "cancelled");
+  assert.equal((await (await fetch(`http://127.0.0.1:${port}/api/work-items/${cancelledItem.id}`)).json()).status, "to_review");
+
+  const releaseItem = await createScenarioItem("assignment-release-scenario", "Assignment interruption scenario");
+  const releasePrepared = await prepareScenario(releaseItem.id, "Exercise owner release.");
+  await fetch(`http://127.0.0.1:${port}/api/assignments/${releasePrepared.assignment.id}/events`, { method: "POST", headers: releasePrepared.callbackHeaders, body: JSON.stringify({ eventId: "release-accepted", type: "accepted", ownerId: "release-owner" }) });
+  const released = await (await fetch(`http://127.0.0.1:${port}/api/assignments/${releasePrepared.assignment.id}/events`, { method: "POST", headers: releasePrepared.callbackHeaders, body: JSON.stringify({ eventId: "release-terminal", type: "ownership_released", ownerId: "release-owner", result: "Interrupted safely." }) })).json();
+  assert.equal(released.assignment.status, "ownership_released");
+  assert.equal((await (await fetch(`http://127.0.0.1:${port}/api/work-items/${releaseItem.id}`)).json()).status, "to_review");
+
+  const reconciledItem = await createScenarioItem("assignment-external-reconcile", "External reconciliation scenario");
+  const reconciledPrepared = await prepareScenario(reconciledItem.id, "Return after external completion.");
+  await fetch(`http://127.0.0.1:${port}/api/assignments/${reconciledPrepared.assignment.id}/events`, { method: "POST", headers: reconciledPrepared.callbackHeaders, body: JSON.stringify({ eventId: "reconcile-accepted", type: "accepted", ownerId: "reconcile-owner" }) });
+  await fetch(`http://127.0.0.1:${port}/api/assignments/${reconciledPrepared.assignment.id}/events`, { method: "POST", headers: reconciledPrepared.callbackHeaders, body: JSON.stringify({ eventId: "reconcile-started", type: "started", ownerId: "reconcile-owner" }) });
+  await fetch(`http://127.0.0.1:${port}/api/work-items/${reconciledItem.id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ status: "done", resolution: "Completed outside the card." }) });
+  await fetch(`http://127.0.0.1:${port}/api/assignments/${reconciledPrepared.assignment.id}/events`, { method: "POST", headers: reconciledPrepared.callbackHeaders, body: JSON.stringify({ eventId: "reconcile-completed", type: "completed", ownerId: "reconcile-owner", result: "Late receipt preserved." }) });
+  const externallyReconciled = await (await fetch(`http://127.0.0.1:${port}/api/work-items/${reconciledItem.id}`)).json();
+  assert.equal(externallyReconciled.status, "done");
+  assert.equal(externallyReconciled.assignments[0].result, "Late receipt preserved.");
   assert.equal(captured.decisionState, "committed");
   assert.equal(captured.preparationMode, "auto");
   assert.equal(captured.sources[0].provider, "manual");
@@ -246,17 +343,14 @@ test("migrates a fresh local store and exposes adaptive Mail contracts", async (
   const previewWithNote = await (await fetch(`http://127.0.0.1:${port}/api/delegation-preview?workItemId=${item.id}`)).json();
   assert.ok(previewWithNote.contextManifest.noteIds.includes(note.id));
 
-  const waiting = await (await fetch(`http://127.0.0.1:${port}/api/agent-runs`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ workItemId: item.id, scope: "item", skillId: "zoom-transcript-router", intent: "Process the kickoff transcript." }) })).json();
-  assert.equal(waiting.status, "waiting_on_user");
-  assert.equal(waiting.executorType, "allowlisted_local_workflow");
-  const reusedWaiting = await (await fetch(`http://127.0.0.1:${port}/api/agent-runs`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ workItemId: item.id, scope: "item", skillId: "zoom-transcript-router", intent: "Process the kickoff transcript again." }) })).json();
-  assert.equal(reusedWaiting.id, waiting.id);
+  const retiredLaunch = await fetch(`http://127.0.0.1:${port}/api/agent-runs`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ workItemId: item.id, scope: "item", skillId: "zoom-transcript-router", intent: "Process the kickoff transcript." }) });
+  assert.equal(retiredLaunch.status, 410);
 
   const invalidOverride = await fetch(`http://127.0.0.1:${port}/api/delegation-preview?workItemId=${item.id}&skillId=arbitrary-shell`);
   assert.equal(invalidOverride.status, 400);
 
   const unlinkedClickUp = await fetch(`http://127.0.0.1:${port}/api/work-items/stockiq-transcript/complete-clickup`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
-  assert.equal(unlinkedClickUp.status, 400);
+  assert.equal(unlinkedClickUp.status, 410);
 
   const meetingDb = new DatabaseSync(path.join(dataDir, "serent-tend.sqlite"));
   meetingDb.prepare(`INSERT INTO calendar_events(id,graph_id,subject,start_at,end_at,attendees_json,freshness,last_synced_at,created_at,updated_at)

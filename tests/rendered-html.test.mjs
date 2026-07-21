@@ -25,7 +25,7 @@ test("server-renders the local Serent Command Center shell", async () => {
 });
 
 test("defines the inbox, project plan, workbench, notes, and review-only contracts", async () => {
-  const [page, runner, editor, styles, mailWorkspace, projectWorkspace, pmWorkspace, workViewModel] = await Promise.all([
+  const [page, runner, editor, styles, mailWorkspace, projectWorkspace, pmWorkspace, workViewModel, cardComposer, cardModel] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../scripts/local-control-server.mjs", import.meta.url), "utf8"),
     readFile(new URL("../app/markdown-editor.tsx", import.meta.url), "utf8"),
@@ -34,13 +34,16 @@ test("defines the inbox, project plan, workbench, notes, and review-only contrac
     readFile(new URL("../app/project-workspace.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/pm-agent-workspace.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/work-view.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/card-action-composer.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/card-workbench-model.ts", import.meta.url), "utf8"),
   ]);
   for (const label of ["My work", "Projects", "PM agent", "Calendar", "Mail", "Companies", "Documents", "Codex work", "Search"]) assert.match(page, new RegExp(label, "i"));
   assert.match(page, /Learning &(?:amp;)? sources/i);
-  for (const endpoint of ["/api/bootstrap", "/api/work-items", "/api/projects", "/api/projects/ingest", "/api/pm-agent", "/api/pm-agent/chat/open", "/api/calendar", "/api/calendar/refresh", "/api/mail", "/api/notes", "/api/agent-runs", "/api/delegation-preview", "/api/source-refresh", "/api/approvals", "/api/feedback-events", "/api/policies", "/api/search"]) assert.match(runner, new RegExp(endpoint.replaceAll("/", "\\/")));
+  for (const endpoint of ["/api/bootstrap", "/api/work-items", "/api/projects", "/api/projects/ingest", "/api/pm-agent", "/api/calendar", "/api/calendar/refresh", "/api/mail", "/api/notes", "/api/agent-runs", "/api/delegation-preview", "/api/source-refresh", "/api/approvals", "/api/feedback-events", "/api/policies", "/api/search"]) assert.match(runner, new RegExp(endpoint.replaceAll("/", "\\/")));
   assert.match(runner, /card-commands/);
-  for (const label of ["Your orchestration partner", "Control-plane observer", "Actually running", "Recent Codex radar", "Connections to confirm", "Ready to delegate", "Run PM check", "Open PM conversation in Codex", "Open in Codex"]) assert.match(pmWorkspace, new RegExp(label, "i"));
-  for (const contract of ["pm_agent_config", "pm_runs", "pm_thread_observations", "pm_recommendations", "pm_thread_links", "thread/resume", "maybeRunPmAgent"]) assert.match(runner, new RegExp(contract.replaceAll("/", "\\/"), "i"));
+  for (const label of ["Your orchestration partner", "Control-plane observer", "Actually running", "Recent Codex radar", "Connections to confirm", "Ready to delegate", "Read-only receipt view", "Nothing starts automatically"]) assert.match(pmWorkspace, new RegExp(label, "i"));
+  for (const contract of ["pm_agent_config", "pm_runs", "pm_thread_observations", "pm_recommendations", "pm_thread_links"]) assert.match(runner, new RegExp(contract, "i"));
+  assert.doesNotMatch(runner, /thread\/resume|thread\/start|turn\/start|app-server/);
   assert.doesNotMatch(runner, /thread\/read/);
   assert.match(styles, /\.pm-workspace\s*\{/);
   assert.match(runner, /project-plan-items/);
@@ -64,17 +67,14 @@ test("defines the inbox, project plan, workbench, notes, and review-only contrac
   assert.match(runner, /No external action was executed/i);
   assert.match(page, /Ask Codex to edit this document/i);
   assert.match(page, /Done in ClickUp/i);
-  assert.match(page, /Change this card or ask Codex to work on it/i);
-  assert.match(page, /Smart: update card or open Codex task/i);
-  assert.match(page, /Always open a separate Codex task/i);
-  assert.match(page, /Card instruction/i);
+  for (const label of ["Update card", "Ask Codex · Return here", "Prepare separate task", "No Codex work is started", "Preparing it does not start a task"]) assert.match(cardComposer, new RegExp(label, "i"));
+  assert.match(cardComposer, /Card instruction/i);
   assert.match(page, /undoCardCommand/);
-  assert.match(page, /work-items\/\$\{encodeURIComponent\(selected\.id\)\}\/command/);
-  for (const contract of ["card_commands", "parseCardCommand", "agent_run_reused", "repairMisroutedTranscriptRuns", "repairPreparedCodexTaskStates", "verified native Codex task ID"]) assert.match(runner, new RegExp(contract, "i"));
-  for (const label of ["Ready to open in Codex", "No Codex task is running yet", "Prepared only; no task is running", "Accepted by Codex; waiting to start", "verified native task callback"]) assert.match(page, new RegExp(label, "i"));
-  assert.match(page, /Always open a separate Codex task/i);
-  assert.match(page, /work-items\/\$\{encodeURIComponent\(selected\.id\)\}\/codex-task/);
+  assert.match(page, /work-items\/\$\{encodeURIComponent\(selected\.id\)\}\/instructions/);
+  for (const contract of ["card_commands", "parseCardCommand", "assignments", "assignment_events", "reconcileAssignmentAttention", "callback_capability_hash"]) assert.match(runner, new RegExp(contract, "i"));
+  for (const label of ["Prepared — not running", "Accepted", "Working", "Decision needed", "Check progress", "Ready for review", "Could not complete"]) assert.match(cardModel, new RegExp(label, "i"));
   assert.doesNotMatch(page, /codex-task-link/);
+  assert.doesNotMatch(page, /openDeepLink|reopenCodexTask|Open native Codex task/);
   assert.doesNotMatch(page, /window\.location\.assign\(launch\.deepLink\)/);
   assert.doesNotMatch(page, /window\.prompt/);
   for (const label of ["Open Work", "Codex Working", "Done"]) assert.match(workViewModel, new RegExp(label, "i"));
@@ -108,17 +108,12 @@ test("defines the inbox, project plan, workbench, notes, and review-only contrac
   assert.match(page, /Nothing is being sent or written to ClickUp/i);
   for (const label of ["Committed", "Accepted", "Likely owed", "Suggested"]) assert.match(page, new RegExp(label, "i"));
   assert.match(runner, /complete-clickup/);
-  assert.match(runner, /codex-task/);
-  assert.match(runner, /codex-task-link/);
-  assert.match(runner, /codex-tasks\/\(\[\^\/\]\+\)\\\/callback|codex-tasks/);
-  assert.match(runner, /codex:\/\/threads\/new/);
-  assert.match(runner, /explorer\.exe/);
-  assert.match(runner, /codex:\/\/threads\/\$\{threadId\}/);
-  assert.match(runner, /thread\/name\/set/);
-  assert.match(runner, /reconcilePersistentTasks/);
+  assert.match(runner, /legacy Codex-task endpoint is retired/i);
+  assert.match(runner, /assignments\/\(\[\^\/\]\+\)\\\/events|api\/assignments/);
+  assert.doesNotMatch(runner, /codex:\/\/threads|explorer\.exe|thread\/name\/set|reconcilePersistentTasks/);
   assert.doesNotMatch(runner, /thread\/read/);
   assert.doesNotMatch(runner, /function launchPersistentCodexTask/);
-  assert.match(runner, /codex_task_heartbeat_missed/);
+  assert.match(runner, /assignment_needs_attention/);
   assert.match(runner, /ownership_released/);
   assert.match(runner, /note_edit_proposals/);
   assert.match(runner, /status_repaired/);
