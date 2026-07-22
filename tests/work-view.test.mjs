@@ -16,3 +16,14 @@ test("keeps every unresolved state, including waiting and working, in Open Work"
   assert.equal(workViewFor({ status: "done" }), "done");
   assert.equal(workViewFor({ status: "dismissed" }), "done");
 });
+
+test("moves one completed card to Resolved and exact-status Undo moves it back", () => {
+  const before = ["waiting_external", "to_review", "done"];
+  const count = (statuses, view) => statuses.filter((status) => workViewFor({ status }) === view).length;
+  assert.deepEqual({ open: count(before, "open"), done: count(before, "done") }, { open: 2, done: 1 });
+  const completed = ["done", ...before.slice(1)];
+  assert.deepEqual({ open: count(completed, "open"), done: count(completed, "done") }, { open: 1, done: 2 });
+  const undone = [before[0], ...completed.slice(1)];
+  assert.deepEqual(undone, before);
+  assert.deepEqual({ open: count(undone, "open"), done: count(undone, "done") }, { open: 2, done: 1 });
+});

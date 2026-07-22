@@ -56,6 +56,20 @@ test("defines the connective-tissue navigation and simplified card contract", as
   assert.match(page, /showPriority\(item\.priority\)/);
   assert.doesNotMatch(page, /statusMeta\[item\.status\]/);
   assert.doesNotMatch(page, /CardActionComposer|AssignmentReceiptList|CardResultPanel/);
+  const cardStart = page.indexOf("const renderCard");
+  const cardEnd = page.indexOf('<section className="inbox-view">', cardStart);
+  const collapsedCard = page.slice(cardStart, cardEnd);
+  assert.match(collapsedCard, /<article className=/);
+  assert.match(collapsedCard, /className="issue-completion"/);
+  assert.match(collapsedCard, /type="button" aria-label=\{`Mark \$\{item\.title\} done`\}/);
+  assert.match(collapsedCard, /event\.stopPropagation\(\); onMarkDone\(item\)/);
+  assert.match(collapsedCard, /className="issue-card-open"[\s\S]*onClick=\{\(\) => setSelectedId\(item\.id\)\}/);
+  assert.doesNotMatch(collapsedCard, /className="issue-card-open"[^>]*>[\s\S]*<button/);
+  assert.match(page, /instruction: "Mark this done"/);
+  assert.match(page, /result\.updated\.status !== "done" \|\| !result\.undoToken/);
+  assert.match(page, /api\/card-commands\/\$\{encodeURIComponent\(pending\.token\)\}\/undo/);
+  assert.match(page, /className="completion-undo" role="status" aria-live="polite"/);
+  assert.match(page, />Undo<\/button>/);
 
   assert.match(workView, /if \(\["done", "dismissed"\]\.includes\(item\.status\)\) return "done";\s*return "open";/s);
   assert.doesNotMatch(workView, /codex_working/);
@@ -71,4 +85,6 @@ test("defines the connective-tissue navigation and simplified card contract", as
   assert.match(styles, /html, body \{ max-width: 100%; overflow-x: hidden; \}/);
   assert.match(styles, /@media \(max-width: 1024px\)/);
   assert.match(styles, /@media \(max-width: 720px\)/);
+  assert.match(styles, /\.issue-completion:focus-visible/);
+  assert.match(styles, /\.completion-undo\s*\{/);
 });

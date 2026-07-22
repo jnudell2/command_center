@@ -220,6 +220,12 @@ type SearchResult = {
   companyName?: string;
 };
 
+type CompletionUndo = {
+  token: string;
+  itemId: string;
+  title: string;
+};
+
 const runnerUrl = "http://127.0.0.1:4318";
 
 const navItems = [
@@ -323,6 +329,8 @@ export default function Home() {
   const [draftItemId, setDraftItemId] = useState("");
   const [waitingFor, setWaitingFor] = useState("");
   const [waitingItemId, setWaitingItemId] = useState("");
+  const [completingItemId, setCompletingItemId] = useState("");
+  const [completionUndo, setCompletionUndo] = useState<CompletionUndo | null>(null);
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
   const [commandOpen, setCommandOpen] = useState(false);
@@ -343,6 +351,7 @@ export default function Home() {
   const quickRef = useRef<HTMLInputElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const noteSaveVersion = useRef(0);
+  const completionUndoTimer = useRef<number | null>(null);
 
   const load = async (quiet = false) => {
     try {
@@ -406,6 +415,10 @@ export default function Home() {
   useEffect(() => {
     window.localStorage.setItem("serent-tend-company", companyFilter);
   }, [companyFilter]);
+
+  useEffect(() => () => {
+    if (completionUndoTimer.current !== null) window.clearTimeout(completionUndoTimer.current);
+  }, []);
 
   useEffect(() => {
     const refreshCalendar = () => void api("/api/calendar/refresh", { method: "POST", body: JSON.stringify({}) }).catch(() => {});
@@ -655,6 +668,48 @@ export default function Home() {
     setWaitingItemId("");
   };
 
+  const completeFromOpenWork = async (item: WorkItem) => {
+    if (["done", "dismissed"].includes(item.status) || completingItemId) return;
+    setCompletingItemId(item.id);
+    try {
+      const result = await api<{ updated: WorkItem; undoToken: string }>(`/api/work-items/${encodeURIComponent(item.id)}/command`, {
+        method: "POST",
+        body: JSON.stringify({ instruction: "Mark this done" }),
+      });
+      if (result.updated.status !== "done" || !result.undoToken) throw new Error("Completion could not be verified.");
+      setData((current) => current ? { ...current, items: current.items.map((candidate) => candidate.id === result.updated.id ? result.updated : candidate) } : current);
+      setCompletionUndo({ token: result.undoToken, itemId: item.id, title: item.title });
+      setNotice("");
+      if (completionUndoTimer.current !== null) window.clearTimeout(completionUndoTimer.current);
+      completionUndoTimer.current = window.setTimeout(() => setCompletionUndo(null), 10_000);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The item could not be completed.");
+    } finally {
+      setCompletingItemId("");
+    }
+  };
+
+  const undoOpenWorkCompletion = async () => {
+    const pending = completionUndo;
+    if (!pending || completingItemId) return;
+    setCompletingItemId(pending.itemId);
+    try {
+      const result = await api<{ updated: WorkItem; message: string }>(`/api/card-commands/${encodeURIComponent(pending.token)}/undo`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      setData((current) => current ? { ...current, items: current.items.map((candidate) => candidate.id === result.updated.id ? result.updated : candidate) } : current);
+      setCompletionUndo(null);
+      if (completionUndoTimer.current !== null) window.clearTimeout(completionUndoTimer.current);
+      completionUndoTimer.current = null;
+      setNotice(`Restored “${pending.title}” to ${simplifiedCardState(result.updated).label}.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The completion could not be undone.");
+    } finally {
+      setCompletingItemId("");
+    }
+  };
+
   const decideNoteProposal = async (decision: "accept" | "reject") => {
     if (!activeNote?.latestProposal) return;
     setBusy(true);
@@ -807,6 +862,8 @@ export default function Home() {
               setSelectedId(id);
               if (window.innerWidth <= 1024) setMobileWorkbenchOpen(true);
             }}
+            onMarkDone={(item) => void completeFromOpenWork(item)}
+            completingItemId={completingItemId}
             statusFilter={statusFilter}
             setStatusFilter={setStatusFilter}
             sourceFilter={sourceFilter}
@@ -1009,6 +1066,8 @@ export default function Home() {
         )}
       </aside>
 
+      {completionUndo ? <div className="completion-undo" role="status" aria-live="polite"><span>Marked “{completionUndo.title}” done.</span><button type="button" disabled={Boolean(completingItemId)} onClick={() => void undoOpenWorkCompletion()}>Undo</button></div> : null}
+
       {commandOpen ? <div className="command-overlay" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setCommandOpen(false); }}>
         <section className="command-menu" role="dialog" aria-modal="true" aria-label="Command menu">
           <header><span>Command Center</span><kbd>Esc</kbd></header>
@@ -1047,6 +1106,8 @@ function InboxView({
   items,
   selectedId,
   setSelectedId,
+  onMarkDone,
+  completingItemId,
   statusFilter,
   setStatusFilter,
   sourceFilter,
@@ -1063,6 +1124,8 @@ function InboxView({
   items: WorkItem[];
   selectedId: string;
   setSelectedId: (id: string) => void;
+  onMarkDone: (item: WorkItem) => void;
+  completingItemId: string;
   statusFilter: WorkView;
   setStatusFilter: (status: WorkView) => void;
   sourceFilter: string;
@@ -1091,13 +1154,16 @@ function InboxView({
   const renderCard = (item: WorkItem, board = false) => {
     const state = simplifiedCardState(item);
     const dueBucket = dueBucketFor(item, dayAnchor);
+    const unresolved = !["done", "dismissed"].includes(item.status);
     return (
-      <button className={`${board ? "issue-board-card" : "feed-card issue-row"}${selectedId === item.id ? " selected" : ""}`} data-company={item.companySlug || "unassigned"} key={item.id} onClick={() => setSelectedId(item.id)} type="button">
-        <span className={`issue-status-icon status-${item.status}`} aria-label={state.label} />
-        <span className="issue-row-main"><span className="issue-row-meta"><span className="feed-company"><i className="company-dot" aria-hidden="true" />{item.companyName || "Personal"}</span><span className={item.status === "error" ? "feed-state feed-state-critical" : item.status === "waiting_external" ? "feed-state feed-state-waiting" : "feed-state"}>{state.label}</span></span><strong>{item.title}</strong><span className="issue-next"><b>Next</b>{nextAction(item)}</span></span>
-        {showPriority(item.priority) ? <span className={`issue-priority-label priority-${item.priority}`}>{item.priority}</span> : null}
-        <time className={`due-chip due-${dueBucket}`}>{dueLabel(item, dayAnchor)}</time>
-      </button>
+      <article className={`${board ? "issue-board-card" : "feed-card issue-row"}${selectedId === item.id ? " selected" : ""}`} data-company={item.companySlug || "unassigned"} key={item.id}>
+        {unresolved ? <button className="issue-completion" type="button" aria-label={`Mark ${item.title} done`} title="Mark done" disabled={completingItemId === item.id} onClick={(event) => { event.stopPropagation(); onMarkDone(item); }}><span className={`issue-status-icon status-${item.status}`} aria-hidden="true" /></button> : <span className="issue-completion-static" aria-label={state.label}><span className={`issue-status-icon status-${item.status}`} aria-hidden="true" /></span>}
+        <button className="issue-card-open" type="button" aria-label={`Open ${item.title}`} onClick={() => setSelectedId(item.id)}>
+          <span className="issue-row-main"><span className="issue-row-meta"><span className="feed-company"><i className="company-dot" aria-hidden="true" />{item.companyName || "Personal"}</span><span className={item.status === "error" ? "feed-state feed-state-critical" : item.status === "waiting_external" ? "feed-state feed-state-waiting" : "feed-state"}>{state.label}</span></span><strong>{item.title}</strong><span className="issue-next"><b>Next</b>{nextAction(item)}</span></span>
+          {showPriority(item.priority) ? <span className={`issue-priority-label priority-${item.priority}`}>{item.priority}</span> : null}
+          <time className={`due-chip due-${dueBucket}`}>{dueLabel(item, dayAnchor)}</time>
+        </button>
+      </article>
     );
   };
   return (

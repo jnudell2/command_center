@@ -16,6 +16,8 @@ This pass used the live local Command Center with representative existing cards.
 ## Live behavior verified
 
 - Open Work displayed 20 unresolved representative items, including waiting and in-progress states.
+- Every unresolved collapsed card exposed two separate native button targets: an accessible `Mark [title] done` status control and an `Open [title]` detail control. The DOM contained no nested buttons.
+- Opening a representative card left all 20 Open Work items unchanged and did not display the completion Undo message, confirming that opening and completing are independent actions.
 - Collapsed cards showed company, title, one Next line, due date, one meaningful state, and only high or urgent priority.
 - The selected expanded card showed What needs to happen, Why it matters, Current state, Relevant context, Working area, and collapsed History.
 - No card action composer or simulated Codex dispatch control existed in the rendered app.
@@ -23,6 +25,13 @@ This pass used the live local Command Center with representative existing cards.
 - Transcripts opened a read-only workspace with linked commitments and meeting notes; explicit transcript processing remained on meeting cards.
 - Documents and Notes both opened the Markdown editor. Documents showed meeting/project/decision material; Notes showed daily and scratch material.
 - The final clean reload produced no new browser console warnings or errors.
+
+## Direct-completion refinement
+
+- Responsive re-checks at 1600 x 1000, 1024 x 900, and 390 x 844 found no page-level horizontal overflow, clipped due-date labels, invalid nested controls, or stale agent-composer copy.
+- The live browser check was intentionally read-only: no status circle was activated on a representative company card.
+- A disposable local database fixture verified the complete mutation path: `waiting_external` became `done`, Open and Resolved counts moved by exactly one, and Undo restored the same item to `waiting_external` with the original counts.
+- The completion result is announced in an `aria-live` status message with a ten-second Undo action. The status control is a labeled native button with an explicit keyboard focus treatment.
 
 ## Non-blocking observation
 
