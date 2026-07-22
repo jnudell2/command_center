@@ -3465,7 +3465,7 @@ async function launchMeetingProcessing(workflow, event, sourcePath) {
   const activeItems = db.prepare("SELECT id,title,company_slug,status,summary FROM work_items WHERE status NOT IN ('done','dismissed') AND id<>? ORDER BY updated_at DESC LIMIT 80").all(workflow.work_item_id);
   const intent = `Process the transcript for ${event.subject} into a meeting note and proposed actions.`;
   db.prepare(`INSERT INTO agent_runs(id,work_item_id,company_slug,scope,intent,title,allowed_sources,status,result,error,revision_of,input_hash,skill_id,executor_type,context_manifest,created_at,updated_at)
-    VALUES(?,?,?,?,?,?,?,'working','','',NULL,?,'zoom-transcript-router','codex_readonly',?,?,?)`)
+    VALUES(?,?,?,?,?,?,?,'working','','',NULL,?,'zoom-transcript-router','allowlisted_local_workflow',?,?,?)`)
     .run(runId, workflow.work_item_id, meetingCompany(event.subject), "meeting_transcript", intent, `${event.subject} · Meeting follow-through`, JSON.stringify(["transcripts", "calendar", "ai_os", "project_files"]), createHash("sha256").update(`${event.graph_id}:${sourcePath}`).digest("hex").slice(0, 12), JSON.stringify({ meetingWorkflowId: workflow.id, calendarEventId: event.graph_id, transcriptPath: sourcePath }), now, now);
   db.prepare("UPDATE meeting_workflows SET state='processing',candidate_path=?,agent_run_id=?,error='',updated_at=? WHERE id=?").run(sourcePath, runId, now, workflow.id);
   eventFor(workflow.work_item_id, "meeting_processing", `Processing ${path.basename(sourcePath)} with the Zoom Transcript Router.`);
@@ -4075,7 +4075,9 @@ const server = createServer(async (request, response) => {
         db.prepare("UPDATE meeting_workflows SET state=?,error='',updated_at=? WHERE id=?").run(state, nowIso(), workflow.id);
         return responseJson(response, 200, await meetingWorkflowDetail(workItemId));
       }
-      throw requestError("The transcript was found, but Command Center no longer launches a worker. Use Ask Codex and return here on this card.", 409);
+      if (!localWorkflowsEnabled) throw requestError("Local transcript processing is disabled.", 503);
+      await launchMeetingProcessing(workflow, event, sourcePath);
+      return responseJson(response, 202, await meetingWorkflowDetail(workItemId));
     }
     const meetingSuggestionMatch = url.pathname.match(/^\/api\/meeting-workflows\/([^/]+)\/suggestions\/([^/]+)$/);
     if (request.method === "PATCH" && meetingSuggestionMatch) {
