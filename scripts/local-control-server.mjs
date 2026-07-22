@@ -8,7 +8,7 @@ import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { clearSerentTokenCache, fetchActiveMail, fetchCalendarEvents, fetchMailAttachments, fetchMailBody, htmlToText } from "./graph-mail.mjs";
 import { isDirectlyAddressedToJake, isLikelyAutomatedMail, normalizedSubject } from "./mail-triage.mjs";
-import { isAllowedTranscriptPath, isEligibleCompletedMeeting, normalizeMeetingAction, safeMeetingName, scoreTranscriptCandidate } from "./meeting-workflow.mjs";
+import { isAllowedTranscriptPath, isEligibleCompletedMeeting, normalizeMeetingAction, safeMeetingName, scoreTranscriptCandidate, suggestedMeetingActionDueAt } from "./meeting-workflow.mjs";
 import { buildPmSnapshot, isPmThreadActive } from "./pm-orchestrator.mjs";
 import { classifyProjectPlanItem, parseDependencies, projectExecutionGuidance, projectFollowUpBucket } from "./project-execution.mjs";
 import { parseCardCommand } from "./card-command.mjs";
@@ -3442,10 +3442,11 @@ async function finishMeetingProcessing({ workflow, event, sourcePath, parsed, ru
   for (const raw of actions) {
     const action = normalizeMeetingAction(raw, companySlugs);
     if (!action) continue;
+    const dueAt = action.dueAt || suggestedMeetingActionDueAt(action.priority, event.end_at);
     const existing = action.existingWorkItemId ? db.prepare("SELECT id FROM work_items WHERE id=?").get(action.existingWorkItemId) : null;
     db.prepare(`INSERT INTO meeting_action_suggestions(id,meeting_workflow_id,title,summary,company_slug,type,priority,owner_state,suggested_action,evidence_timestamp,due_at,existing_work_item_id,decision,created_at,updated_at)
       VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'proposed',?,?)`)
-      .run(randomUUID(), workflow.id, action.title, action.summary, action.companySlug || companySlug, action.type, action.priority, action.owner, action.suggestedAction, action.evidenceTimestamp, action.dueAt, existing?.id || null, finished, finished);
+      .run(randomUUID(), workflow.id, action.title, action.summary, action.companySlug || companySlug, action.type, action.priority, action.owner, action.suggestedAction, action.evidenceTimestamp, dueAt, existing?.id || null, finished, finished);
   }
   const count = db.prepare("SELECT COUNT(*) AS count FROM meeting_action_suggestions WHERE meeting_workflow_id=? AND decision='proposed'").get(workflow.id).count;
   db.prepare("UPDATE meeting_workflows SET state='review',transcript_path=?,note_id=?,agent_run_id=?,error='',updated_at=? WHERE id=?")
@@ -4091,8 +4092,10 @@ const server = createServer(async (request, response) => {
       else if (body.decision === "edit") {
         const current = db.prepare("SELECT * FROM meeting_action_suggestions WHERE id=?").get(suggestionId);
         if (current.decision !== "proposed") throw new Error("Only an unreviewed follow-up can be edited.");
-        db.prepare("UPDATE meeting_action_suggestions SET title=?,summary=?,suggested_action=?,priority=?,owner_state=?,updated_at=? WHERE id=?")
-          .run(String(body.title || current.title).slice(0,240), String(body.summary ?? current.summary).slice(0,4000), String(body.suggestedAction ?? current.suggested_action).slice(0,4000), ["urgent","high","normal","low"].includes(body.priority) ? body.priority : current.priority, ["jake","external"].includes(body.ownerState) ? body.ownerState : current.owner_state, nowIso(), suggestionId);
+        if (body.dueAt && !Number.isFinite(Date.parse(body.dueAt))) throw new Error("Choose a valid due date.");
+        const dueAt = body.dueAt === undefined ? current.due_at : body.dueAt ? new Date(body.dueAt).toISOString() : null;
+        db.prepare("UPDATE meeting_action_suggestions SET title=?,summary=?,suggested_action=?,priority=?,owner_state=?,due_at=?,updated_at=? WHERE id=?")
+          .run(String(body.title || current.title).slice(0,240), String(body.summary ?? current.summary).slice(0,4000), String(body.suggestedAction ?? current.suggested_action).slice(0,4000), ["urgent","high","normal","low"].includes(body.priority) ? body.priority : current.priority, ["jake","external"].includes(body.ownerState) ? body.ownerState : current.owner_state, dueAt, nowIso(), suggestionId);
       } else throw new Error("Choose accept, edit, or reject.");
       return responseJson(response, 200, await meetingWorkflowDetail(workItemId));
     }

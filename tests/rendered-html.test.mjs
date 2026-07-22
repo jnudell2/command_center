@@ -78,6 +78,8 @@ test("defines the connective-tissue navigation and simplified card contract", as
   assert.match(transcripts, /Meeting follow-through/i);
   assert.match(page, /MEETING TO ACTIONS/i);
   assert.match(page, /I downloaded it — find transcript/i);
+  assert.match(page, /The card will use this date when you add it/i);
+  assert.match(page, /Due date for \$\{suggestion\.title\}/);
   assert.match(runner, /zoom-transcript-router/);
   assert.match(runner, /await launchMeetingProcessing\(workflow, event, sourcePath\)/);
   assert.doesNotMatch(runner, /The transcript was found, but Command Center no longer launches a worker/);

@@ -371,7 +371,7 @@ export default function Home() {
   const [policies, setPolicies] = useState<PreferenceRule[]>([]);
   const [mailTargetId, setMailTargetId] = useState("");
   const [meetingWorkflow, setMeetingWorkflow] = useState<MeetingWorkflow | null>(null);
-  const [meetingEdit, setMeetingEdit] = useState<{ id: string; title: string; suggestedAction: string } | null>(null);
+  const [meetingEdit, setMeetingEdit] = useState<{ id: string; title: string; suggestedAction: string; dueAt: string } | null>(null);
   const quickRef = useRef<HTMLInputElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const noteSaveVersion = useRef(0);
@@ -656,11 +656,22 @@ export default function Home() {
     if (!selected || !meetingEdit?.title.trim()) return;
     setBusy(true);
     try {
-      const next = await api<MeetingWorkflow>(`/api/meeting-workflows/${encodeURIComponent(selected.id)}/suggestions/${encodeURIComponent(meetingEdit.id)}`, { method: "PATCH", body: JSON.stringify({ decision: "edit", title: meetingEdit.title.trim(), suggestedAction: meetingEdit.suggestedAction.trim() }) });
+      const next = await api<MeetingWorkflow>(`/api/meeting-workflows/${encodeURIComponent(selected.id)}/suggestions/${encodeURIComponent(meetingEdit.id)}`, { method: "PATCH", body: JSON.stringify({ decision: "edit", title: meetingEdit.title.trim(), suggestedAction: meetingEdit.suggestedAction.trim(), dueAt: dueDateEndOfLocalDayIso(meetingEdit.dueAt) }) });
       setMeetingWorkflow(next);
       setMeetingEdit(null);
       setNotice("Updated the proposed follow-up. It still needs your approval before becoming a card.");
     } catch (error) { setNotice(error instanceof Error ? error.message : "The follow-up could not be edited."); }
+    finally { setBusy(false); }
+  };
+
+  const updateMeetingSuggestionDueDate = async (suggestionId: string, localDate: string) => {
+    if (!selected) return;
+    setBusy(true);
+    try {
+      const next = await api<MeetingWorkflow>(`/api/meeting-workflows/${encodeURIComponent(selected.id)}/suggestions/${encodeURIComponent(suggestionId)}`, { method: "PATCH", body: JSON.stringify({ decision: "edit", dueAt: dueDateEndOfLocalDayIso(localDate) }) });
+      setMeetingWorkflow(next);
+      setNotice(localDate ? `Suggested due date set to ${localDate}.` : "Suggested due date cleared.");
+    } catch (error) { setNotice(error instanceof Error ? error.message : "The due date could not be updated."); }
     finally { setBusy(false); }
   };
 
@@ -1133,7 +1144,27 @@ export default function Home() {
                 <div className="meeting-suggestions"><div className="meeting-suggestions-title"><strong>Proposed follow-ups</strong><span>{activeMeetingWorkflow.suggestions.filter((item) => item.decision === "proposed").length} to review</span></div>
                   {activeMeetingWorkflow.suggestions.length ? activeMeetingWorkflow.suggestions.map((suggestion) => <article key={suggestion.id} className={`meeting-suggestion decision-${suggestion.decision}`}>
                     <div className="meeting-suggestion-meta"><span>{suggestion.ownerState === "jake" ? "Jake owns" : "Waiting on someone else"}</span><span>{suggestion.priority}</span>{suggestion.existingWorkItemId ? <span>Matches existing card</span> : null}</div>
-                    {meetingEdit?.id === suggestion.id ? <div className="meeting-suggestion-editor"><label>Action<input value={meetingEdit.title} onChange={(event) => setMeetingEdit({ ...meetingEdit, title: event.target.value })} /></label><label>Next step<textarea value={meetingEdit.suggestedAction} onChange={(event) => setMeetingEdit({ ...meetingEdit, suggestedAction: event.target.value })} /></label><div><button type="button" disabled={busy || !meetingEdit.title.trim()} onClick={() => void saveMeetingSuggestionEdit()}>Save edit</button><button className="secondary" type="button" disabled={busy} onClick={() => setMeetingEdit(null)}>Cancel</button></div></div> : <><h4>{suggestion.title}</h4><p>{suggestion.summary}</p><strong className="meeting-next-step">Next: {suggestion.suggestedAction}</strong>{suggestion.evidenceTimestamp ? <small>Evidence: {suggestion.evidenceTimestamp}</small> : null}{suggestion.decision === "proposed" ? <div><button type="button" disabled={busy} onClick={() => void decideMeetingSuggestion(suggestion.id, "accept")}>{suggestion.existingWorkItemId ? "Link to existing card" : suggestion.ownerState === "external" ? "Add to Waiting" : "Add to Open Work"}</button><button className="secondary" type="button" disabled={busy} onClick={() => setMeetingEdit({ id: suggestion.id, title: suggestion.title, suggestedAction: suggestion.suggestedAction })}>Edit</button><button className="secondary" type="button" disabled={busy} onClick={() => void decideMeetingSuggestion(suggestion.id, "reject")}>Ignore</button></div> : <div className="suggestion-decision">{suggestion.decision === "accepted" ? "Added" : "Ignored"}</div>}</>}
+                    {meetingEdit?.id === suggestion.id ? (
+                      <div className="meeting-suggestion-editor">
+                        <label>Action<input value={meetingEdit.title} onChange={(event) => setMeetingEdit({ ...meetingEdit, title: event.target.value })} /></label>
+                        <label>Next step<textarea value={meetingEdit.suggestedAction} onChange={(event) => setMeetingEdit({ ...meetingEdit, suggestedAction: event.target.value })} /></label>
+                        <label>Due date<input aria-label={`Edit due date for ${suggestion.title}`} type="date" value={meetingEdit.dueAt} onChange={(event) => setMeetingEdit({ ...meetingEdit, dueAt: event.target.value })} /></label>
+                        <div><button type="button" disabled={busy || !meetingEdit.title.trim()} onClick={() => void saveMeetingSuggestionEdit()}>Save edit</button><button className="secondary" type="button" disabled={busy} onClick={() => setMeetingEdit(null)}>Cancel</button></div>
+                      </div>
+                    ) : <>
+                      <h4>{suggestion.title}</h4>
+                      <p>{suggestion.summary}</p>
+                      <strong className="meeting-next-step">Next: {suggestion.suggestedAction}</strong>
+                      {suggestion.evidenceTimestamp ? <small>Evidence: {suggestion.evidenceTimestamp}</small> : null}
+                      {suggestion.decision === "proposed" ? <>
+                        <label className="meeting-suggestion-due">
+                          <span>{suggestion.dueAt ? "Suggested due" : "Set due date"}</span>
+                          <input aria-label={`Due date for ${suggestion.title}`} type="date" value={dueDateInputValue(suggestion.dueAt)} disabled={busy} onChange={(event) => void updateMeetingSuggestionDueDate(suggestion.id, event.target.value)} />
+                          <small>The card will use this date when you add it.</small>
+                        </label>
+                        <div><button type="button" disabled={busy} onClick={() => void decideMeetingSuggestion(suggestion.id, "accept")}>{suggestion.existingWorkItemId ? "Link to existing card" : suggestion.ownerState === "external" ? "Add to Waiting" : "Add to Open Work"}</button><button className="secondary" type="button" disabled={busy} onClick={() => setMeetingEdit({ id: suggestion.id, title: suggestion.title, suggestedAction: suggestion.suggestedAction, dueAt: dueDateInputValue(suggestion.dueAt) })}>Edit</button><button className="secondary" type="button" disabled={busy} onClick={() => void decideMeetingSuggestion(suggestion.id, "reject")}>Ignore</button></div>
+                      </> : <div className="suggestion-decision">{suggestion.decision === "accepted" ? "Added" : "Ignored"}</div>}
+                    </>}
                   </article>) : <p className="muted-copy">No follow-up actions were identified. The meeting note is still saved.</p>}
                 </div>
                 {activeMeetingWorkflow.state === "review" ? <button className="finish-meeting-review" type="button" disabled={busy || activeMeetingWorkflow.suggestions.some((item) => item.decision === "proposed")} onClick={() => void finishMeetingReview()}>Finish meeting review</button> : null}

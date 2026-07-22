@@ -85,6 +85,20 @@ export function normalizeMeetingAction(raw, validCompanies = ["avionte", "stocki
   };
 }
 
+export function suggestedMeetingActionDueAt(priority, meetingEndAt) {
+  const businessDays = { urgent: 1, high: 2, normal: 5, low: 10 }[priority] ?? 5;
+  const due = new Date(meetingEndAt || Date.now());
+  if (Number.isNaN(due.getTime())) return null;
+  due.setHours(12, 0, 0, 0);
+  let added = 0;
+  while (added < businessDays) {
+    due.setDate(due.getDate() + 1);
+    if (due.getDay() !== 0 && due.getDay() !== 6) added += 1;
+  }
+  due.setHours(23, 59, 59, 999);
+  return due.toISOString();
+}
+
 export function safeMeetingName(subject, fallback = "Meeting") {
   return String(subject || fallback)
     .normalize("NFKD")

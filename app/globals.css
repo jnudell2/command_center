@@ -193,6 +193,9 @@
 .meeting-suggestion p { margin: 0 0 7px; color: #536078; font-size: 11px; line-height: 1.45; }
 .meeting-next-step { display: block; margin: 0 0 8px; color: #2d486c; font-size: 11px; line-height: 1.4; }
 .meeting-suggestion small { display: block; margin-bottom: 9px; color: #748198; font-size: 10px; }
+.meeting-suggestion-due { display: grid; grid-template-columns: auto minmax(135px,180px) 1fr; align-items: center; gap: 8px; margin: 10px 0; padding: 8px 9px; border-radius: 8px; background: #f4f7fb; color: #52627b; font-size: 10px; font-weight: 700; text-transform: uppercase; }
+.meeting-suggestion-due input { min-height: 38px; padding: 7px 9px; border: 1px solid #b8c4d5; border-radius: 7px; background: #fff; color: #17243a; font: inherit; font-size: 12px; }
+.meeting-suggestion-due small { margin: 0; font-weight: 500; line-height: 1.35; text-transform: none; }
 .meeting-suggestion > div:last-child { display: flex; gap: 7px; }
 .meeting-suggestion button.secondary { border: 1px solid #aebbd0; background: transparent; color: #475c7a; }
 .meeting-suggestion-editor { display: grid !important; gap: 9px !important; margin-top: 10px; }
@@ -217,6 +220,11 @@
   font-weight: 700;
 }
 .no-transcript-action:disabled { cursor: not-allowed; opacity: .48; }
+
+@media (max-width: 560px) {
+  .meeting-suggestion-due { grid-template-columns: 1fr; align-items: stretch; }
+  .meeting-suggestion-due input { width: 100%; }
+}
 
 @media (max-width: 520px) {
   .meeting-steps { grid-template-columns: repeat(2, 1fr); }

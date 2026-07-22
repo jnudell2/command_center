@@ -5,6 +5,7 @@ import {
   isEligibleCompletedMeeting,
   normalizeMeetingAction,
   scoreTranscriptCandidate,
+  suggestedMeetingActionDueAt,
   transcriptTimestamp,
 } from "../scripts/meeting-workflow.mjs";
 
@@ -38,4 +39,21 @@ test("normalizes reviewable actions and enforces transcript roots", () => {
   assert.equal(action.dueAt, "2026-07-15T00:00:00.000Z");
   assert.equal(isAllowedTranscriptPath("C:\\Users\\Jake\\Downloads\\meeting.vtt", ["C:\\Users\\Jake\\Downloads"]), true);
   assert.equal(isAllowedTranscriptPath("C:\\Windows\\meeting.vtt", ["C:\\Users\\Jake\\Downloads"]), false);
+});
+
+test("suggests editable meeting follow-up dates by urgency and skips weekends", () => {
+  const meetingEndAt = "2026-07-24T12:00:00";
+  const expected = {
+    urgent: [2026, 6, 27],
+    high: [2026, 6, 28],
+    normal: [2026, 6, 31],
+    low: [2026, 7, 7],
+  };
+  for (const [priority, [year, month, day]] of Object.entries(expected)) {
+    const due = new Date(suggestedMeetingActionDueAt(priority, meetingEndAt));
+    assert.deepEqual([due.getFullYear(), due.getMonth(), due.getDate()], [year, month, day]);
+    assert.deepEqual([due.getHours(), due.getMinutes(), due.getSeconds(), due.getMilliseconds()], [23, 59, 59, 999]);
+    assert.notEqual(due.getDay(), 0);
+    assert.notEqual(due.getDay(), 6);
+  }
 });
