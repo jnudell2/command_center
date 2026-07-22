@@ -10,6 +10,8 @@ import { type Assignment } from "./card-workbench-model";
 import { cardState as simplifiedCardState, contextKind, definitionOfDone, nextAction, showPriority, workingSurface as simplifiedWorkingSurface } from "./card-view-model";
 import { dueDateEndOfLocalDayIso, dueDateInputValue } from "./due-date";
 import { workViewFor, workViews, type WorkView } from "./work-view";
+import { CEORead, type IntelligenceReviewView, type RelationshipView } from "./ceo-read";
+import { UILab } from "./ui-lab";
 
 type WorkStatus =
   | "to_review"
@@ -122,6 +124,8 @@ type WorkItem = {
   suggestedAction: string;
   draft: string;
   owner: string;
+  waitingOn: string;
+  followUpAt: string | null;
   dueAt: string | null;
   plannedAt: string | null;
   plannedMinutes: number;
@@ -139,6 +143,8 @@ type WorkItem = {
   externalActions: Array<{ id: string; provider: string; actionType: string; targetId: string; status: string; receipt: string; error: string; createdAt: string; updatedAt: string }>;
   codexTasks: CodexTaskReceipt[];
   assignments: Assignment[];
+  relationships: RelationshipView[];
+  intelligenceReview: IntelligenceReviewView | null;
   projectContext: null | {
     projectId: string;
     projectTitle: string;
@@ -226,6 +232,12 @@ type CompletionUndo = {
   title: string;
 };
 
+type DeterministicUndo = {
+  mutationId: string;
+  title: string;
+  message: string;
+};
+
 const runnerUrl = "http://127.0.0.1:4318";
 
 const navItems = [
@@ -239,7 +251,7 @@ const navItems = [
   ["companies", "Companies"],
   ["search", "Search"],
 ] as const;
-type ViewId = (typeof navItems)[number][0] | "settings";
+type ViewId = (typeof navItems)[number][0] | "settings" | "ui_lab";
 const focusNavItems = navItems.filter(([id]) => ["inbox", "mail", "calendar"].includes(id));
 const workspaceNavItems = navItems.filter(([id]) => ["projects", "documents", "transcripts", "notes", "companies"].includes(id));
 const intelligenceNavItems = navItems.filter(([id]) => id === "search");
@@ -310,6 +322,10 @@ function dueLabel(item: WorkItem, anchor: Date) {
   return calendarDate;
 }
 
+function directBusinessStatusValue(status: WorkStatus) {
+  return ["to_review", "waiting_on_user", "waiting_external", "back_for_review", "needs_attention", "done", "dismissed", "queued", "working"].includes(status) ? status : "to_review";
+}
+
 export default function Home() {
   const [data, setData] = useState<Bootstrap | null>(null);
   const [view, setView] = useState<ViewId>("inbox");
@@ -328,9 +344,14 @@ export default function Home() {
   const [draft, setDraft] = useState("");
   const [draftItemId, setDraftItemId] = useState("");
   const [waitingFor, setWaitingFor] = useState("");
+  const [waitingFollowUp, setWaitingFollowUp] = useState("");
   const [waitingItemId, setWaitingItemId] = useState("");
+  const [evidenceLabel, setEvidenceLabel] = useState("");
+  const [evidenceUrl, setEvidenceUrl] = useState("");
+  const [canonicalWorkItemId, setCanonicalWorkItemId] = useState("");
   const [completingItemId, setCompletingItemId] = useState("");
   const [completionUndo, setCompletionUndo] = useState<CompletionUndo | null>(null);
+  const [deterministicUndo, setDeterministicUndo] = useState<DeterministicUndo | null>(null);
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
   const [commandOpen, setCommandOpen] = useState(false);
@@ -352,6 +373,7 @@ export default function Home() {
   const searchRef = useRef<HTMLInputElement>(null);
   const noteSaveVersion = useRef(0);
   const completionUndoTimer = useRef<number | null>(null);
+  const deterministicUndoTimer = useRef<number | null>(null);
 
   const load = async (quiet = false) => {
     try {
@@ -418,6 +440,7 @@ export default function Home() {
 
   useEffect(() => () => {
     if (completionUndoTimer.current !== null) window.clearTimeout(completionUndoTimer.current);
+    if (deterministicUndoTimer.current !== null) window.clearTimeout(deterministicUndoTimer.current);
   }, []);
 
   useEffect(() => {
@@ -493,7 +516,8 @@ export default function Home() {
     if (priorityFilter !== "all" && item.priority !== priorityFilter) return false;
     return true;
   });
-  const effectiveSelectedId = items.some((item) => item.id === selectedId) ? selectedId : filteredItems[0]?.id || "";
+  const selectedPool = view === "inbox" ? filteredItems : items;
+  const effectiveSelectedId = selectedPool.some((item) => item.id === selectedId) ? selectedId : selectedPool[0]?.id || "";
   const selected = items.find((item) => item.id === effectiveSelectedId) || null;
   const selectedWorkingSurface = selected ? simplifiedWorkingSurface(selected) : null;
   const selectedState = selected ? simplifiedCardState(selected) : null;
@@ -663,9 +687,37 @@ export default function Home() {
   const markWaiting = async () => {
     if (!selected || waitingItemId !== selected.id || !waitingFor.trim()) return;
     const person = waitingFor.trim();
-    await patchItem({ status: "waiting_external", eventDetail: `Waiting on ${person}.` });
+    await mutateSelected("waiting", { waitingOn: person, followUpAt: waitingFollowUp ? dueDateEndOfLocalDayIso(waitingFollowUp) : null }, `Waiting on ${person}.`);
     setWaitingFor("");
+    setWaitingFollowUp("");
     setWaitingItemId("");
+  };
+
+  const createCommittedTask = async (title: string, dueDate: string) => {
+    setBusy(true);
+    try {
+      const created = await api<WorkItem>("/api/work-items", { method: "POST", body: JSON.stringify({ title, type: "task", companySlug: companyFilter === "all" ? null : companyFilter, dueAt: dueDateEndOfLocalDayIso(dueDate), sourceKey: `direct-ui:${crypto.randomUUID()}` }) });
+      setData((current) => current ? { ...current, items: [created, ...current.items], companyCounts: { ...current.companyCounts, ...(created.companySlug ? { [created.companySlug]: (current.companyCounts[created.companySlug] || 0) + 1 } : {}) } } : current);
+      setSelectedId(created.id);
+      setNotice("Committed task captured locally. No agent was involved.");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The committed task could not be captured.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const addEvidenceLink = async () => {
+    if (!selected || !evidenceLabel.trim() || !evidenceUrl.trim()) return;
+    await mutateSelected("add_evidence", { label: evidenceLabel.trim(), sourceUrl: evidenceUrl.trim(), provider: "manual" }, "Evidence link added locally.");
+    setEvidenceLabel("");
+    setEvidenceUrl("");
+  };
+
+  const linkCanonicalDuplicate = async () => {
+    if (!selected || !canonicalWorkItemId.trim()) return;
+    await mutateSelected("link_duplicate", { canonicalWorkItemId: canonicalWorkItemId.trim(), rationale: "Jake explicitly linked this card to its canonical commitment." }, "Duplicate relationship linked without changing either card's business status.");
+    setCanonicalWorkItemId("");
   };
 
   const completeFromOpenWork = async (item: WorkItem) => {
@@ -686,6 +738,46 @@ export default function Home() {
       setNotice(error instanceof Error ? error.message : "The item could not be completed.");
     } finally {
       setCompletingItemId("");
+    }
+  };
+
+  const mutateSelected = async (type: "update" | "done" | "dismiss" | "waiting" | "add_evidence" | "link_duplicate", payload: Record<string, unknown>, confirmation: string) => {
+    if (!selected) return;
+    setBusy(true);
+    try {
+      const result = await api<{ mutationId: string; replayed: boolean; updated: WorkItem; undoAvailable: boolean }>(`/api/work-items/${encodeURIComponent(selected.id)}/mutations`, {
+        method: "POST",
+        body: JSON.stringify({ type, idempotencyKey: `ui:${selected.id}:${type}:${crypto.randomUUID()}`, ...payload }),
+      });
+      setData((current) => current ? { ...current, items: current.items.map((item) => item.id === result.updated.id ? result.updated : item) } : current);
+      if (result.undoAvailable) {
+        setDeterministicUndo({ mutationId: result.mutationId, title: selected.title, message: confirmation });
+        if (deterministicUndoTimer.current !== null) window.clearTimeout(deterministicUndoTimer.current);
+        deterministicUndoTimer.current = window.setTimeout(() => setDeterministicUndo(null), 12_000);
+      }
+      setNotice(confirmation);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The local change could not be verified.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const undoDeterministicChange = async () => {
+    const pending = deterministicUndo;
+    if (!pending || busy) return;
+    setBusy(true);
+    try {
+      const result = await api<{ updated: WorkItem; message: string }>(`/api/deterministic-mutations/${encodeURIComponent(pending.mutationId)}/undo`, { method: "POST", body: "{}" });
+      setData((current) => current ? { ...current, items: current.items.map((item) => item.id === result.updated.id ? result.updated : item) } : current);
+      setDeterministicUndo(null);
+      if (deterministicUndoTimer.current !== null) window.clearTimeout(deterministicUndoTimer.current);
+      deterministicUndoTimer.current = null;
+      setNotice(result.message);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Undo is no longer safe for this change.");
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -833,7 +925,7 @@ export default function Home() {
         </section>
 
         <div className="rail-footer">
-          <button className={view === "settings" ? "settings-link active" : "settings-link"} onClick={() => void openSettings()} type="button">Learning &amp; sources</button>
+          <button className={["settings", "ui_lab"].includes(view) ? "settings-link active" : "settings-link"} onClick={() => void openSettings()} type="button">Learning &amp; sources</button>
           <div className="runner-state"><span className="ready-dot" />Local runner ready</div>
           <small>{data.runner.activeJobs} active · Cached {fullDate(data.generatedAt)}</small>
         </div>
@@ -863,6 +955,7 @@ export default function Home() {
               if (window.innerWidth <= 1024) setMobileWorkbenchOpen(true);
             }}
             onMarkDone={(item) => void completeFromOpenWork(item)}
+            onCreateTask={(title, dueDate) => void createCommittedTask(title, dueDate)}
             completingItemId={completingItemId}
             statusFilter={statusFilter}
             setStatusFilter={setStatusFilter}
@@ -965,11 +1058,13 @@ export default function Home() {
 
         {view === "settings" ? (
           <section className="content-view">
-            <div className="view-heading"><p className="kicker">LEARNING &amp; SOURCES</p><h2>What Command Center sees and learns</h2><p>Sources refresh independently. Lasting behavior changes apply only after you accept a proposed rule.</p></div>
+            <div className="view-heading view-heading-actions"><div><p className="kicker">LEARNING &amp; SOURCES</p><h2>What Command Center sees and learns</h2><p>Sources refresh independently. Lasting behavior changes apply only after you accept a proposed rule.</p></div><button className="button-secondary" type="button" onClick={() => setView("ui_lab")}>Open UI lab</button></div>
             <div className="source-list">{data.sources.map((source) => <div className="source-row" key={source.source}><div><strong>{source.source}</strong><span className={`source-state source-${source.status}`}>{source.status}</span></div><p>{source.error || source.detail}</p><small>{fullDate(source.checkedAt)}</small><button disabled={busy || source.status === "working"} onClick={() => void refreshSource(source.source)} type="button">{source.status === "working" ? "Refreshing…" : "Refresh"}</button></div>)}</div>
             <div className="policy-section"><h3>Reviewed learning</h3>{policies.length ? policies.map((policy) => <article key={policy.id} className={`policy-${policy.status}`}><div className="policy-heading"><strong>{policy.title}</strong><span>{policy.status}</span></div><p>{policy.rationale}</p><textarea value={policy.instruction} onChange={(event) => setPolicies((current) => current.map((item) => item.id === policy.id ? { ...item, instruction: event.target.value } : item))} aria-label={`Rule instruction for ${policy.title}`} /><small>{policy.scopeType}{policy.scopeValue ? ` · ${policy.scopeValue}` : ""} · {policy.category}</small><div className="policy-actions">{policy.status === "proposed" ? <><button type="button" onClick={async () => { const updated = await api<PreferenceRule>(`/api/policies/${policy.id}`, { method: "PATCH", body: JSON.stringify({ status: "accepted", instruction: policy.instruction }) }); setPolicies((current) => current.map((item) => item.id === updated.id ? updated : item)); }}>Accept rule</button><button type="button" onClick={async () => { const updated = await api<PreferenceRule>(`/api/policies/${policy.id}`, { method: "PATCH", body: JSON.stringify({ status: "rejected" }) }); setPolicies((current) => current.map((item) => item.id === updated.id ? updated : item)); }}>Reject</button></> : null}{policy.status === "accepted" ? <button type="button" onClick={async () => { const updated = await api<PreferenceRule>(`/api/policies/${policy.id}`, { method: "PATCH", body: JSON.stringify({ status: "retired" }) }); setPolicies((current) => current.map((item) => item.id === updated.id ? updated : item)); }}>Retire</button> : null}</div></article>) : <p>No learning rules have been proposed yet. Command Center will suggest them after meaningful corrections, dismissals, and edited replies.</p>}</div>
           </section>
         ) : null}
+
+        {view === "ui_lab" ? <UILab onClose={() => void openSettings()} /> : null}
       </section>
 
       <aside className={mobileWorkbenchOpen ? "workbench mobile-open" : "workbench"} data-company={selected?.companySlug || "unassigned"}>
@@ -985,9 +1080,9 @@ export default function Home() {
               <div className="card-section-heading"><span>1</span><div><p>What needs to happen</p><h3>The next move</h3></div></div>
               <dl className="card-definition-list"><div><dt>Next</dt><dd>{nextAction(selected)}</dd></div><div><dt>Done when</dt><dd>{definitionOfDone(selected)}</dd></div></dl>
               <div className="card-edit-row">
-                <label htmlFor={`card-due-date-${selected.id}`}>Change due date<input id={`card-due-date-${selected.id}`} aria-label="Card due date" type="date" value={dueDateInputValue(selected.dueAt)} disabled={busy} onChange={(event) => { const localDate = event.target.value; void patchItem({ dueAt: dueDateEndOfLocalDayIso(localDate), eventDetail: localDate ? `Jake set the due date to ${localDate}.` : "Jake cleared the due date." }); }} /></label>
-                <label>Priority<select aria-label="Card priority" value={selected.priority} disabled={busy} onChange={(event) => void patchItem({ priority: event.target.value, eventDetail: `Jake changed priority to ${event.target.value}.` })}><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label>
-                {selected.dueAt ? <button className="text-action" type="button" disabled={busy} onClick={() => void patchItem({ dueAt: null, eventDetail: "Jake cleared the due date." })}>Clear date</button> : null}
+                <label htmlFor={`card-due-date-${selected.id}`}>Change due date<input id={`card-due-date-${selected.id}`} aria-label="Card due date" type="date" value={dueDateInputValue(selected.dueAt)} disabled={busy} onChange={(event) => { const localDate = event.target.value; void mutateSelected("update", { changes: { dueAt: dueDateEndOfLocalDayIso(localDate) } }, localDate ? `Due date set to ${localDate}.` : "Due date cleared."); }} /></label>
+                <label>Priority<select aria-label="Card priority" value={selected.priority} disabled={busy} onChange={(event) => void mutateSelected("update", { changes: { priority: event.target.value } }, `Priority changed to ${event.target.value}.`)}><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label>
+                {selected.dueAt ? <button className="text-action" type="button" disabled={busy} onClick={() => void mutateSelected("update", { changes: { dueAt: null } }, "Due date cleared.")}>Clear date</button> : null}
               </div>
             </section>
 
@@ -1000,16 +1095,22 @@ export default function Home() {
 
             <section className="card-section card-current-state">
               <div className="card-section-heading"><span>3</span><div><p>Current state</p><h3>{selectedState?.label}</h3></div></div>
-              <div className="current-owner"><strong>{selectedState?.owner}</strong><p>{selectedState?.detail}</p></div>
-              {selectedLatestAssignment || selectedLatestResult ? <div className="latest-review"><strong>{selectedLatestAssignment?.status === "needs_input" || selectedLatestResult?.status === "error" ? "A decision or fix is needed" : "Latest reviewable result"}</strong><p>{selectedLatestAssignment?.result || selectedLatestAssignment?.error || selectedLatestResult?.result || selectedLatestResult?.error}</p></div> : null}
-              <div className="card-primary-controls">
-                {!['done','dismissed'].includes(selected.status) ? <button type="button" disabled={busy} onClick={() => void patchItem({ status: "done", resolution: "Completed from Command Center." })}>Done</button> : null}
-                <button className="secondary" type="button" disabled={busy} onClick={() => { setWaitingItemId(selected.id); setWaitingFor(""); }}>Waiting on…</button>
-                <button className="secondary" type="button" disabled={busy} onClick={() => void patchItem({ status: "back_for_review", eventDetail: "Jake marked this item ready to review." })}>Ready to review</button>
-                {!['done','dismissed'].includes(selected.status) ? <button className="secondary" type="button" disabled={busy} onClick={() => void patchItem({ status: "dismissed", eventDetail: "Jake marked this item as not needed." })}>Not needed</button> : null}
+              <div className="current-owner"><strong>{selectedState?.owner}</strong><p>{selectedState?.detail}</p>{selected.waitingOn ? <small>Dependency: {selected.waitingOn}{selected.followUpAt ? ` · Follow up ${new Date(selected.followUpAt).toLocaleDateString()}` : ""}</small> : null}</div>
+              {selectedLatestAssignment || selectedLatestResult ? <div className="latest-review technical-evidence"><strong>Technical evidence · does not change business state</strong><p>{selectedLatestAssignment?.result || selectedLatestAssignment?.error || selectedLatestResult?.result || selectedLatestResult?.error}</p></div> : null}
+              <div className="direct-edit-grid">
+                <label>Owner<input key={`owner-${selected.id}-${selected.owner}`} aria-label="Card owner" defaultValue={selected.owner || "Jake"} disabled={busy} onBlur={(event) => { const owner = event.currentTarget.value.trim() || "Jake"; if (owner !== selected.owner) void mutateSelected("update", { changes: { owner } }, `Owner changed to ${owner}.`); }} /></label>
+                <label>Business status<select aria-label="Card business status" value={directBusinessStatusValue(selected.status)} disabled={busy} onChange={(event) => { if (event.target.value === "waiting_external") { setWaitingItemId(selected.id); setWaitingFor(selected.waitingOn || ""); setWaitingFollowUp(dueDateInputValue(selected.followUpAt)); } else void mutateSelected("update", { changes: { status: event.target.value } }, "Business status updated."); }}><option value="to_review">Open</option><option value="waiting_on_user">Waiting on Jake</option><option value="waiting_external">Waiting on someone</option><option value="back_for_review">Ready for Jake</option><option value="needs_attention">Needs attention</option><option value="done">Done</option><option value="dismissed">Not needed</option>{["queued", "working"].includes(selected.status) ? <option value={selected.status}>Legacy · needs reconciliation</option> : null}</select></label>
               </div>
-              {waitingItemId === selected.id ? <form className="waiting-editor" onSubmit={(event) => { event.preventDefault(); void markWaiting(); }}><label htmlFor={`waiting-on-${selected.id}`}>Who or what are you waiting on?</label><div><input id={`waiting-on-${selected.id}`} autoFocus value={waitingFor} onChange={(event) => setWaitingFor(event.target.value)} placeholder="Kyle, customer data, legal review…" /><button type="submit" disabled={busy || !waitingFor.trim()}>Save</button><button className="secondary" type="button" onClick={() => { setWaitingItemId(""); setWaitingFor(""); }}>Cancel</button></div></form> : null}
+              <div className="card-primary-controls">
+                {!['done','dismissed'].includes(selected.status) ? <button type="button" disabled={busy} onClick={() => void mutateSelected("done", {}, "Marked done.")}>Done</button> : null}
+                <button className="secondary" type="button" disabled={busy} onClick={() => { setWaitingItemId(selected.id); setWaitingFor(selected.waitingOn || ""); setWaitingFollowUp(dueDateInputValue(selected.followUpAt)); }}>Waiting on…</button>
+                <button className="secondary" type="button" disabled={busy} onClick={() => void mutateSelected("update", { changes: { status: "back_for_review" } }, "Marked ready for Jake's review.")}>Ready to review</button>
+                {!['done','dismissed'].includes(selected.status) ? <button className="secondary" type="button" disabled={busy} onClick={() => void mutateSelected("dismiss", {}, "Marked not needed.")}>Not needed</button> : null}
+              </div>
+              {waitingItemId === selected.id ? <form className="waiting-editor" onSubmit={(event) => { event.preventDefault(); void markWaiting(); }}><label htmlFor={`waiting-on-${selected.id}`}>Who or what are you waiting on?</label><div><input id={`waiting-on-${selected.id}`} autoFocus value={waitingFor} onChange={(event) => setWaitingFor(event.target.value)} placeholder="Kyle, customer data, legal review…" /><label htmlFor={`waiting-follow-up-${selected.id}`}>Follow up<input id={`waiting-follow-up-${selected.id}`} type="date" value={waitingFollowUp} onChange={(event) => setWaitingFollowUp(event.target.value)} /></label><button type="submit" disabled={busy || !waitingFor.trim()}>Save</button><button className="secondary" type="button" onClick={() => { setWaitingItemId(""); setWaitingFor(""); setWaitingFollowUp(""); }}>Cancel</button></div></form> : null}
             </section>
+
+            <CEORead review={selected.intelligenceReview} relationships={selected.relationships} onOpenWorkItem={(id) => { setSelectedId(id); setMobileWorkbenchOpen(true); }} />
 
             <section className="card-section card-context">
               <div className="card-section-heading"><span>4</span><div><p>Relevant context</p><h3>{contextKind(selected)}</h3></div></div>
@@ -1018,6 +1119,7 @@ export default function Home() {
               <div className="context-links">{selected.sources.slice(0, 3).map((source) => source.sourceUrl ? <a href={source.sourceUrl} target="_blank" rel="noreferrer" key={source.id}>Open {source.label || source.provider}</a> : <span key={source.id} title={source.sourcePath}>{source.label || source.provider}</span>)}</div>
               {selected.notes.slice(0, 2).map((note) => <button className="linked-note" key={note.id} type="button" onClick={() => void selectNote(note).then(() => setView("notes"))}><strong>{note.title}</strong><span>{note.body.slice(0, 100) || "Empty note"}</span></button>)}
               {!selected.sources.length && !selected.notes.length && !selected.projectContext ? <p className="muted-copy">No linked source has been added yet.</p> : null}
+              <form className="add-evidence-form" onSubmit={(event) => { event.preventDefault(); void addEvidenceLink(); }}><strong>Add evidence link</strong><label>Label<input value={evidenceLabel} onChange={(event) => setEvidenceLabel(event.target.value)} placeholder="Kickoff deck commitment" /></label><label>URL<input type="url" value={evidenceUrl} onChange={(event) => setEvidenceUrl(event.target.value)} placeholder="https://…" /></label><button type="submit" disabled={busy || !evidenceLabel.trim() || !evidenceUrl.trim()}>Add locally</button></form>
             </section>
 
             {selected.type === "meeting_follow_up" ? <section className="meeting-followthrough" aria-live="polite">
@@ -1058,6 +1160,7 @@ export default function Home() {
               {selected.agentRuns.length ? <div className="audit-group"><h4>Native work history</h4>{selected.agentRuns.map((run) => <article key={run.id}><strong>{run.status.replaceAll("_", " ")}</strong><p>{run.result || run.error || run.waitingReason || run.intent}</p><small>{fullDate(run.updatedAt)}</small></article>)}</div> : null}
               {selected.codexTasks.length ? <div className="audit-group"><h4>Legacy task receipts</h4>{selected.codexTasks.map((task) => <article key={task.id}><strong>{task.title}</strong><span>{task.status.replaceAll("_", " ")}</span><p>{task.result || task.error || task.instruction}</p></article>)}</div> : null}
               {selected.externalActions.length ? <div className="audit-group"><h4>System receipts</h4>{selected.externalActions.map((action) => <article key={action.id}><strong>{action.provider} · {action.actionType.replaceAll("_", " ")}</strong><span>{action.status}</span><p>{action.receipt || action.error || action.targetId}</p></article>)}</div> : null}
+              <details className="canonical-link-control"><summary>Link an explicit duplicate</summary><p>This records a canonical relationship only. It does not dismiss or merge either card.</p><form onSubmit={(event) => { event.preventDefault(); void linkCanonicalDuplicate(); }}><label>Canonical work-item ID<input value={canonicalWorkItemId} onChange={(event) => setCanonicalWorkItemId(event.target.value)} placeholder="Existing work-item ID" /></label><button type="submit" disabled={busy || !canonicalWorkItemId.trim()}>Confirm link</button></form></details>
               <button className="text-action" type="button" onClick={() => void createContextNote()}>+ Add contextual note</button>
             </details>
           </>
@@ -1067,6 +1170,7 @@ export default function Home() {
       </aside>
 
       {completionUndo ? <div className="completion-undo" role="status" aria-live="polite"><span>Marked “{completionUndo.title}” done.</span><button type="button" disabled={Boolean(completingItemId)} onClick={() => void undoOpenWorkCompletion()}>Undo</button></div> : null}
+      {deterministicUndo ? <div className="deterministic-undo" role="status" aria-live="polite"><span>{deterministicUndo.message}</span><button type="button" disabled={busy} onClick={() => void undoDeterministicChange()}>Undo</button></div> : null}
 
       {commandOpen ? <div className="command-overlay" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setCommandOpen(false); }}>
         <section className="command-menu" role="dialog" aria-modal="true" aria-label="Command menu">
@@ -1107,6 +1211,7 @@ function InboxView({
   selectedId,
   setSelectedId,
   onMarkDone,
+  onCreateTask,
   completingItemId,
   statusFilter,
   setStatusFilter,
@@ -1125,6 +1230,7 @@ function InboxView({
   selectedId: string;
   setSelectedId: (id: string) => void;
   onMarkDone: (item: WorkItem) => void;
+  onCreateTask: (title: string, dueDate: string) => void;
   completingItemId: string;
   statusFilter: WorkView;
   setStatusFilter: (status: WorkView) => void;
@@ -1137,6 +1243,9 @@ function InboxView({
 }) {
   const [dayAnchor] = useState(() => new Date());
   const [layoutMode, setLayoutMode] = useState<"list" | "board">("list");
+  const [newTaskOpen, setNewTaskOpen] = useState(false);
+  const [newTaskTitle, setNewTaskTitle] = useState("");
+  const [newTaskDue, setNewTaskDue] = useState("");
   const companyName = companyFilter === "all" ? "All companies" : companies.find((company) => company.slug === companyFilter)?.displayName || "Company";
   const sources = [...new Set(items.flatMap((item) => item.sources.map((source) => source.provider)))];
   const types = [...new Set(items.map((item) => item.type))];
@@ -1151,6 +1260,7 @@ function InboxView({
     return leftDue - rightDue || right.updatedAt.localeCompare(left.updatedAt);
   });
   const groupedItems = dueBuckets.map((bucket) => ({ ...bucket, items: sortedItems.filter((item) => dueBucketFor(item, dayAnchor) === bucket.id) })).filter((bucket) => bucket.items.length);
+  const reconciliationItems = items.filter((item) => (companyFilter === "all" || item.companySlug === companyFilter) && ["new_evidence", "needs_reconciliation"].includes(item.intelligenceReview?.status || ""));
   const renderCard = (item: WorkItem, board = false) => {
     const state = simplifiedCardState(item);
     const dueBucket = dueBucketFor(item, dayAnchor);
@@ -1159,7 +1269,7 @@ function InboxView({
       <article className={`${board ? "issue-board-card" : "feed-card issue-row"}${selectedId === item.id ? " selected" : ""}`} data-company={item.companySlug || "unassigned"} key={item.id}>
         {unresolved ? <button className="issue-completion" type="button" aria-label={`Mark ${item.title} done`} title="Mark done" disabled={completingItemId === item.id} onClick={(event) => { event.stopPropagation(); onMarkDone(item); }}><span className={`issue-status-icon status-${item.status}`} aria-hidden="true" /></button> : <span className="issue-completion-static" aria-label={state.label}><span className={`issue-status-icon status-${item.status}`} aria-hidden="true" /></span>}
         <button className="issue-card-open" type="button" aria-label={`Open ${item.title}`} onClick={() => setSelectedId(item.id)}>
-          <span className="issue-row-main"><span className="issue-row-meta"><span className="feed-company"><i className="company-dot" aria-hidden="true" />{item.companyName || "Personal"}</span><span className={item.status === "error" ? "feed-state feed-state-critical" : item.status === "waiting_external" ? "feed-state feed-state-waiting" : "feed-state"}>{state.label}</span></span><strong>{item.title}</strong><span className="issue-next"><b>Next</b>{nextAction(item)}</span></span>
+          <span className="issue-row-main"><span className="issue-row-meta"><span className="feed-company"><i className="company-dot" aria-hidden="true" />{item.companyName || "Personal"}</span><span className={item.status === "error" ? "feed-state feed-state-critical" : item.status === "waiting_external" ? "feed-state feed-state-waiting" : "feed-state"}>{state.label}</span>{item.intelligenceReview?.status === "new_evidence" ? <span className="insight-indicator">New evidence</span> : item.intelligenceReview?.status === "needs_reconciliation" ? <span className="insight-indicator">Needs reconciliation</span> : null}</span><strong>{item.title}</strong><span className="issue-next"><b>Next</b>{nextAction(item)}</span></span>
           {showPriority(item.priority) ? <span className={`issue-priority-label priority-${item.priority}`}>{item.priority}</span> : null}
           <time className={`due-chip due-${dueBucket}`}>{dueLabel(item, dayAnchor)}</time>
         </button>
@@ -1170,8 +1280,10 @@ function InboxView({
     <section className="inbox-view">
       <div className="inbox-heading">
         <div><p className="issue-breadcrumb">Workspace / Open Work</p><h2>{viewLabel}</h2><p>{companyName} / {filteredItems.length} items. {viewCopy[statusFilter]}</p></div>
-        <div className="layout-toggle" aria-label="Layout"><button className={layoutMode === "list" ? "active" : ""} type="button" onClick={() => setLayoutMode("list")}>List</button><button className={layoutMode === "board" ? "active" : ""} type="button" onClick={() => setLayoutMode("board")}>Board</button></div>
+        <div className="inbox-heading-actions"><button className="new-task-trigger" type="button" onClick={() => setNewTaskOpen((current) => !current)}>+ New task</button><div className="layout-toggle" aria-label="Layout"><button className={layoutMode === "list" ? "active" : ""} type="button" onClick={() => setLayoutMode("list")}>List</button><button className={layoutMode === "board" ? "active" : ""} type="button" onClick={() => setLayoutMode("board")}>Board</button></div></div>
       </div>
+
+      {newTaskOpen ? <form className="new-task-form" onSubmit={(event) => { event.preventDefault(); if (!newTaskTitle.trim()) return; onCreateTask(newTaskTitle.trim(), newTaskDue); setNewTaskTitle(""); setNewTaskDue(""); setNewTaskOpen(false); }}><label>Committed task<input autoFocus value={newTaskTitle} onChange={(event) => setNewTaskTitle(event.target.value)} placeholder="What needs to happen?" /></label><label>Due date<input type="date" value={newTaskDue} onChange={(event) => setNewTaskDue(event.target.value)} /></label><button type="submit" disabled={!newTaskTitle.trim()}>Add to Open Work</button><button className="button-secondary" type="button" onClick={() => setNewTaskOpen(false)}>Cancel</button><small>Creates a committed local card. No agent is involved.</small></form> : null}
 
       <div className="status-tabs work-view-tabs" role="tablist" aria-label="Work view">
         {workViews.map((workView) => {
@@ -1180,6 +1292,8 @@ function InboxView({
           return <button className={statusFilter === workView.id ? "active" : ""} key={workView.id} type="button" onClick={() => setStatusFilter(workView.id)}>{workView.label}<span>{count}</span></button>;
         })}
       </div>
+
+      {statusFilter === "open" && reconciliationItems.length ? <section className="reconciliation-queue" aria-labelledby="reconciliation-queue-heading"><header><div><span className="eyebrow">CEO INTELLIGENCE SHADOW</span><h3 id="reconciliation-queue-heading">Needs reconciliation</h3></div><b>{reconciliationItems.length}</b></header><p>New evidence or a contradiction needs CEO / PM judgment. Durable card status has not been changed.</p><div>{reconciliationItems.slice(0, 4).map((item) => <button type="button" key={item.id} onClick={() => setSelectedId(item.id)}><span>{item.companyName}</span><strong>{item.title}</strong><small>{item.intelligenceReview?.status === "new_evidence" ? "New evidence" : "Needs reconciliation"}</small></button>)}</div></section> : null}
 
       <div className="filter-row" aria-label="View filters">
         <select value={companyFilter} onChange={(event) => setCompanyFilter(event.target.value)} aria-label="Filter by company"><option value="all">All companies</option>{companies.map((company) => <option key={company.slug} value={company.slug}>{company.displayName}</option>)}</select>

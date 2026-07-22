@@ -88,3 +88,52 @@ test("defines the connective-tissue navigation and simplified card contract", as
   assert.match(styles, /\.issue-completion:focus-visible/);
   assert.match(styles, /\.completion-undo\s*\{/);
 });
+
+test("defines deterministic autonomy, CEO intelligence shadow, and the UI system", async () => {
+  const [page, styles, runner, cardView, ceoRead, uiLab, capabilityContract, checkpoint] = await Promise.all([
+    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+    readFile(new URL("../scripts/local-control-server.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../app/card-view-model.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/ceo-read.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/ui-lab.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../docs/command-center-capability-contract-v2.md", import.meta.url), "utf8"),
+    readFile(new URL("../docs/checkpoints/intelligence-autonomy-ui-system-2026-07-21.md", import.meta.url), "utf8"),
+  ]);
+
+  for (const capabilityClass of ["Direct user controls", "Deterministic sensing and maintenance", "CEO / PM intelligence", "Gated external actions"]) assert.match(capabilityContract, new RegExp(capabilityClass.replace("/", "\\/"), "i"));
+  assert.match(capabilityContract, /Technical completion may add evidence[\s\S]*may not set a work item to Done, Ready to review, Waiting, or Working/i);
+  assert.match(checkpoint, /additive schema version 13/i);
+  for (const table of ["deterministic_mutations", "work_item_relationships", "intelligence_reviews", "reconciliation_packets"]) assert.match(runner, new RegExp(`CREATE TABLE IF NOT EXISTS ${table}`));
+  for (const route of ["/api/intelligence/reconciliation", "/api/intelligence/reviews", "/api/reconciliation-packets", "deterministic-mutations"]) assert.match(runner, new RegExp(route.replaceAll("/", "\\/")));
+  assert.match(runner, /ensureColumn\("work_items", "waiting_on"/);
+  assert.match(runner, /ensureColumn\("work_items", "follow_up_at"/);
+  assert.doesNotMatch(cardView, /item\.assignments\?\.some\(\(assignment\) => assignment\.status === "completed"\)/);
+  assert.match(cardView, /legacy technical status must be reconciled/i);
+
+  for (const label of ["CEO READ · SHADOW", "Recommended next move", "Owner / dependency", "Done when", "Connected work", "Evidence and freshness", "Last reconciled"]) assert.match(ceoRead, new RegExp(label, "i"));
+  assert.match(page, /<CEORead review=\{selected\.intelligenceReview\}/);
+  assert.match(page, /className="reconciliation-queue"/);
+  assert.match(page, /className="insight-indicator"/);
+  assert.match(page, /Committed task captured locally\. No agent was involved\./);
+  assert.match(page, /api\/work-items\/\$\{encodeURIComponent\(selected\.id\)\}\/mutations/);
+  assert.match(page, /api\/deterministic-mutations\/\$\{encodeURIComponent\(pending\.mutationId\)\}\/undo/);
+  assert.match(page, /className="deterministic-undo" role="status" aria-live="polite"/);
+  assert.match(page, /const selectedPool = view === "inbox" \? filteredItems : items/);
+  assert.match(page, /Card owner/);
+  assert.match(page, /Card business status/);
+  assert.match(page, /waitingFollowUp/);
+  assert.match(page, /addEvidenceLink/);
+  assert.match(page, /linkCanonicalDuplicate/);
+
+  for (const galleryArea of ["Foundations", "Collapsed commitments", "Direct controls", "Semantic states", "CEO Read and connected evidence", "System states", "Workspace navigation", "Expanded-card hierarchy"]) assert.match(uiLab, new RegExp(galleryArea, "i"));
+  for (const workspace of ["Mail", "Calendar", "Projects", "Documents", "Transcripts", "Notes", "Companies", "Search", "Learning & sources"]) assert.match(uiLab, new RegExp(workspace, "i"));
+  assert.match(styles, /--cc-space-1:/);
+  assert.match(styles, /--cc-reconcile:/);
+  assert.match(styles, /@media \(prefers-reduced-motion: reduce\)/);
+  assert.match(styles, /\.issue-completion, \.issue-completion-static \{ height: 40px; width: 40px; \}/);
+  assert.match(styles, /\.workspace-switcher > button[\s\S]*min-height: 40px/);
+  assert.match(styles, /\.ui-lab\s*\{/);
+  assert.match(styles, /\.ceo-read\s*\{/);
+  assert.match(styles, /\.reconciliation-queue\s*\{/);
+});

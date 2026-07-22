@@ -1,7 +1,8 @@
 # Intelligence, autonomy, and UI-system architecture checkpoint
 
-Date: 2026-07-21  
-Branch: `cto/intelligence-autonomy-ui-system-2026-07-21`  
+Date: 2026-07-21
+
+Branch: `cto/intelligence-autonomy-ui-system-2026-07-21`
 Baseline: `c6642ed261184ff230d7ffe8c9099353ddd59f24`
 
 ## Decision
