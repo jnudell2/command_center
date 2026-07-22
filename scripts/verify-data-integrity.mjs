@@ -10,12 +10,14 @@ const centralAcceptanceItem = db
 const result = {
   databasePath,
   schema13: Boolean(db.prepare("SELECT version FROM schema_migrations WHERE version=13").get()),
+  schema14: Boolean(db.prepare("SELECT version FROM schema_migrations WHERE version=14").get()),
   quickCheck: db.prepare("PRAGMA quick_check").all(),
   foreignKeyErrors: db.prepare("PRAGMA foreign_key_check").all(),
+  mailDraftRequests: db.prepare("SELECT COUNT(*) AS count FROM mail_draft_requests").get().count,
   centralAcceptanceItem,
 };
 
 db.close();
 console.log(JSON.stringify(result, null, 2));
 
-if (!result.schema13 || result.quickCheck.some((row) => row.quick_check !== "ok") || result.foreignKeyErrors.length) process.exitCode = 1;
+if (!result.schema13 || !result.schema14 || result.quickCheck.some((row) => row.quick_check !== "ok") || result.foreignKeyErrors.length) process.exitCode = 1;

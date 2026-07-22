@@ -348,6 +348,45 @@ const schemaStatements = [
     origin TEXT NOT NULL,
     created_at TEXT NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS mail_draft_requests (
+    id TEXT PRIMARY KEY,
+    request_key TEXT NOT NULL UNIQUE,
+    mail_message_id TEXT NOT NULL UNIQUE REFERENCES mail_messages(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'requested',
+    requested_by TEXT NOT NULL DEFAULT 'Jake',
+    error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS mail_draft_request_capabilities (
+    id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL REFERENCES mail_draft_requests(id) ON DELETE CASCADE,
+    capability_hash TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS mail_draft_writebacks (
+    id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL REFERENCES mail_draft_requests(id) ON DELETE CASCADE,
+    revision_key TEXT NOT NULL,
+    body TEXT NOT NULL DEFAULT '',
+    provenance TEXT NOT NULL DEFAULT 'Command Center CEO / PM',
+    source_basis TEXT NOT NULL DEFAULT '',
+    source_freshness TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'ready',
+    error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(request_id, revision_key)
+  )`,
+  `CREATE TABLE IF NOT EXISTS mail_draft_request_events (
+    id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL REFERENCES mail_draft_requests(id) ON DELETE CASCADE,
+    event_key TEXT NOT NULL UNIQUE,
+    type TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+  )`,
   `CREATE TABLE IF NOT EXISTS mail_note_links (
     mail_message_id TEXT NOT NULL REFERENCES mail_messages(id) ON DELETE CASCADE,
     note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
@@ -1175,11 +1214,14 @@ migrateLegacyAssignments();
 if (!db.prepare("SELECT version FROM schema_migrations WHERE version=13").get()) {
   db.prepare("INSERT INTO schema_migrations(version,applied_at) VALUES(13,?)").run(nowIso());
 }
+if (!db.prepare("SELECT version FROM schema_migrations WHERE version=14").get()) {
+  db.prepare("INSERT INTO schema_migrations(version,applied_at) VALUES(14,?)").run(nowIso());
+}
 
 function responseJson(response, status, payload) {
   response.writeHead(status, {
     "Access-Control-Allow-Origin": allowedOrigin,
-    "Access-Control-Allow-Headers": "content-type,x-serent-command-center",
+    "Access-Control-Allow-Headers": "authorization,content-type,x-serent-command-center",
     "Access-Control-Allow-Methods": "GET,POST,PATCH,OPTIONS",
     "Cache-Control": "no-store",
     "Content-Type": "application/json; charset=utf-8",
@@ -1440,6 +1482,18 @@ function mapMail(row, includeBody = false) {
     sourceBasis: row.source_basis || "",
     updatedAt: row.mail_draft_updated_at || row.updated_at,
   } : null;
+  const requestStatus = row.draft_request_status === "ready" ? "draft_ready" : row.draft_request_status || (draft ? "draft_ready" : "not_requested");
+  const draftRequest = row.draft_request_id ? {
+    id: row.draft_request_id,
+    status: requestStatus,
+    requestedBy: row.draft_requested_by || "Jake",
+    error: row.draft_request_error || "",
+    provenance: row.draft_provenance || "",
+    sourceBasis: row.draft_request_source_basis || "",
+    sourceFreshness: row.draft_source_freshness || "",
+    createdAt: row.draft_request_created_at,
+    updatedAt: row.draft_request_updated_at,
+  } : null;
   const rules = activeRules({ companySlug: row.company_slug, source: "outlook", workType: "email", skillId: "draft-executive-email" });
   return {
     id: row.id,
@@ -1466,17 +1520,28 @@ function mapMail(row, includeBody = false) {
     snoozedUntil: row.snoozed_until,
     draftState: row.draft_state,
     actionWorkItemId: row.action_work_item_id,
+    actionWorkItemStatus: row.action_work_item_status || null,
     freshness: row.freshness,
     lastSyncedAt: row.last_synced_at,
     draft,
+    draftRequestState: requestStatus,
+    draftRequest,
     activeRules: rules,
     notes: includeBody ? mailNotes(row.id, row.company_slug) : [],
   };
 }
 
 const mailSelect = `SELECT m.*,d.id AS draft_id,d.generated_body,d.current_body,d.status AS mail_draft_status,
-  d.skill_id AS mail_draft_skill,d.source_basis,d.updated_at AS mail_draft_updated_at
-  FROM mail_messages m LEFT JOIN mail_drafts d ON d.mail_message_id=m.id`;
+  d.skill_id AS mail_draft_skill,d.source_basis,d.updated_at AS mail_draft_updated_at,
+  r.id AS draft_request_id,r.status AS draft_request_status,r.requested_by AS draft_requested_by,r.error AS draft_request_error,
+  r.created_at AS draft_request_created_at,r.updated_at AS draft_request_updated_at,
+  w.provenance AS draft_provenance,w.source_basis AS draft_request_source_basis,w.source_freshness AS draft_source_freshness,
+  a.status AS action_work_item_status
+  FROM mail_messages m
+  LEFT JOIN mail_drafts d ON d.mail_message_id=m.id
+  LEFT JOIN mail_draft_requests r ON r.mail_message_id=m.id
+  LEFT JOIN mail_draft_writebacks w ON w.id=(SELECT latest.id FROM mail_draft_writebacks latest WHERE latest.request_id=r.id ORDER BY latest.created_at DESC LIMIT 1)
+  LEFT JOIN work_items a ON a.id=m.action_work_item_id`;
 
 function jsonValue(value, fallback) {
   try { return JSON.parse(value || ""); } catch { return fallback; }
@@ -1762,6 +1827,21 @@ function ensureMailAction(mailId, classification) {
   return id;
 }
 
+function promoteMailToOpenWork(mailId) {
+  const mail = db.prepare("SELECT * FROM mail_messages WHERE id=?").get(mailId);
+  if (!mail) throw requestError("Unknown mail message.", 404);
+  const actionId = ensureMailAction(mailId, { highImpact: true });
+  if (!actionId) throw requestError("Command Center could not create the Open Work obligation.");
+  const action = db.prepare("SELECT status FROM work_items WHERE id=?").get(actionId);
+  if (["done", "dismissed"].includes(action?.status)) {
+    const now = nowIso();
+    db.prepare("UPDATE work_items SET status='to_review',resolution='',resolved_at=NULL,updated_at=? WHERE id=?").run(now, actionId);
+    eventFor(actionId, "reopened_from_mail", "Jake explicitly promoted the source email back to Open Work.");
+  }
+  db.prepare("UPDATE mail_messages SET action_work_item_id=?,updated_at=? WHERE id=?").run(actionId, nowIso(), mailId);
+  return actionId;
+}
+
 async function runSerentTokenRefresh() {
   await new Promise((resolve, reject) => {
     const child = spawn("schtasks.exe", ["/Run", "/TN", "SerentCodexTokenRefresh"], { windowsHide: true });
@@ -2027,7 +2107,7 @@ function queryMail(filters = {}) {
   const view = filters.view || "needs_reply";
   if (view === "needs_reply") clauses.push("m.freshness='live' AND m.reply_state='needs_reply' AND m.review_state='unreviewed' AND (m.snoozed_until IS NULL OR datetime(m.snoozed_until) <= datetime('now'))");
   if (view === "unread") clauses.push("m.freshness='live' AND m.is_read=0");
-  if (view === "drafts") clauses.push("d.id IS NOT NULL");
+  if (view === "drafts") clauses.push("(d.id IS NOT NULL OR r.id IS NOT NULL)");
   if (view === "snoozed") clauses.push("datetime(m.snoozed_until) > datetime('now')");
   if (filters.company && filters.company !== "all") { clauses.push("m.company_slug=?"); params.push(filters.company); }
   if (filters.search) { clauses.push("(m.subject LIKE ? OR m.sender_name LIKE ? OR m.sender_email LIKE ? OR m.preview LIKE ?)"); const term = `%${String(filters.search).slice(0, 200)}%`; params.push(term, term, term, term); }
@@ -2035,7 +2115,7 @@ function queryMail(filters = {}) {
   const orderBy = view === "all" || view === "unread"
     ? "m.received_at DESC"
     : view === "drafts"
-      ? "d.updated_at DESC,m.received_at DESC"
+      ? "COALESCE(d.updated_at,r.updated_at) DESC,m.received_at DESC"
       : view === "snoozed"
         ? "m.snoozed_until ASC,m.received_at DESC"
         : "CASE m.importance WHEN 'high' THEN 0 ELSE 1 END,m.received_at DESC";
@@ -2053,6 +2133,160 @@ async function mailDetail(id) {
     row = db.prepare(`${mailSelect} WHERE m.id=?`).get(id);
   }
   return mapMail(row, true);
+}
+
+function mapMailDraftRequest(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    requestKey: row.request_key,
+    mailMessageId: row.mail_message_id,
+    status: row.status === "ready" ? "draft_ready" : row.status,
+    requestedBy: row.requested_by,
+    error: row.error,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function recordMailDraftRequestEvent(requestId, eventKey, type, detail, payload = {}) {
+  db.prepare(`INSERT OR IGNORE INTO mail_draft_request_events(id,request_id,event_key,type,detail,payload_json,created_at)
+    VALUES(?,?,?,?,?,?,?)`).run(randomUUID(), requestId, eventKey, type, detail, JSON.stringify(payload), nowIso());
+}
+
+function issueMailDraftRequestPacket(requestId) {
+  const request = db.prepare("SELECT * FROM mail_draft_requests WHERE id=?").get(requestId);
+  if (!request) throw requestError("Unknown mail drafting request.", 404);
+  const mail = db.prepare("SELECT * FROM mail_messages WHERE id=?").get(request.mail_message_id);
+  if (!mail) throw requestError("The source mail message no longer exists.", 404);
+  const capability = createHash("sha256").update(`${request.id}:${randomUUID()}:${Date.now()}`).digest("base64url");
+  const capabilityHash = createHash("sha256").update(capability).digest("hex");
+  db.prepare("INSERT INTO mail_draft_request_capabilities(id,request_id,capability_hash,created_at) VALUES(?,?,?,?)").run(randomUUID(), request.id, capabilityHash, nowIso());
+  const company = mail.company_slug ? db.prepare("SELECT display_name FROM companies WHERE slug=?").get(mail.company_slug)?.display_name || mail.company_slug : "Unfiled";
+  const rules = activeRules({ companySlug: mail.company_slug, source: "outlook", workType: "email", skillId: "draft-executive-email" });
+  const notes = mailNotes(mail.id, mail.company_slug);
+  const returnEndpoint = `http://${host}:${port}/api/mail-draft-requests/${request.id}/writeback`;
+  const context = {
+    requestId: request.id,
+    messageId: mail.id,
+    sender: { name: mail.sender_name, email: mail.sender_email },
+    subject: mail.subject,
+    receivedAt: mail.received_at,
+    message: mail.body_text || mail.preview,
+    preview: mail.preview,
+    company,
+    freshness: mail.freshness,
+    lastSyncedAt: mail.last_synced_at,
+    activeRules: rules.map((rule) => ({ id: rule.id, title: rule.title, instruction: rule.instruction })),
+    linkedNotes: notes.map((note) => ({ id: note.id, title: note.title, type: note.type, body: note.body })),
+    returnEndpoint,
+  };
+  const packetText = [
+    "Command Center mail drafting request",
+    `Request ID: ${request.id}`,
+    `Message ID: ${mail.id}`,
+    `From: ${mail.sender_name || mail.sender_email} <${mail.sender_email}>`,
+    `Subject: ${mail.subject}`,
+    `Received: ${mail.received_at}`,
+    `Company: ${company}`,
+    `Source freshness: ${mail.freshness}; last synced ${mail.last_synced_at}`,
+    "",
+    "Incoming message:",
+    mail.body_text || mail.preview || "No message body is cached.",
+    "",
+    "Accepted drafting rules:",
+    rules.length ? rules.map((rule) => `- ${rule.title}: ${rule.instruction}`).join("\n") : "- None recorded.",
+    "",
+    "Linked notes:",
+    notes.length ? notes.map((note) => `- ${note.title} (${note.type}): ${note.body}`).join("\n") : "- None linked.",
+    "",
+    "Return the finished draft locally. This does not send email or create an Outlook draft.",
+    `POST ${returnEndpoint}`,
+    `Authorization: Bearer ${capability}`,
+    `JSON: {\"revisionId\":\"stable-ceo-revision-id\",\"body\":\"finished reply body\",\"provenance\":\"Command Center CEO / PM\",\"sourceBasis\":[\"message\",\"active rules\",\"linked notes\"],\"sourceFreshness\":\"verified at writeback time\"}`,
+  ].join("\n");
+  recordMailDraftRequestEvent(request.id, `packet:${capabilityHash}`, "packet_issued", "Created a local fallback packet for the persistent CEO / PM.", { returnEndpoint });
+  return { request: mapMailDraftRequest(request), context, returnEndpoint, capability, packetText };
+}
+
+function requestMailDraft(mailMessageId) {
+  const mail = db.prepare("SELECT id FROM mail_messages WHERE id=?").get(mailMessageId);
+  if (!mail) throw requestError("Unknown mail message.", 404);
+  const requestKey = `mail-draft:${mailMessageId}`;
+  const existing = db.prepare("SELECT * FROM mail_draft_requests WHERE request_key=?").get(requestKey);
+  const now = nowIso();
+  let request = existing;
+  let reused = Boolean(existing);
+  if (!request) {
+    const id = randomUUID();
+    db.prepare(`INSERT INTO mail_draft_requests(id,request_key,mail_message_id,status,requested_by,error,created_at,updated_at)
+      VALUES(?,?,?,'requested','Jake','',?,?)`).run(id, requestKey, mailMessageId, now, now);
+    request = db.prepare("SELECT * FROM mail_draft_requests WHERE id=?").get(id);
+    recordMailDraftRequestEvent(id, `requested:${requestKey}`, "requested", "Jake requested a CEO / PM draft. No native task was invoked.", { mailMessageId });
+  } else if (["ready", "needs_attention"].includes(request.status)) {
+    db.prepare("UPDATE mail_draft_requests SET status='requested',error='',updated_at=? WHERE id=?").run(now, request.id);
+    request = db.prepare("SELECT * FROM mail_draft_requests WHERE id=?").get(request.id);
+    recordMailDraftRequestEvent(request.id, `revision_requested:${now}`, "revision_requested", "Jake requested a new CEO / PM draft revision. No native task was invoked.", { mailMessageId });
+  }
+  return { request: mapMailDraftRequest(request), reused, packet: issueMailDraftRequestPacket(request.id), mail: mapMail(db.prepare(`${mailSelect} WHERE m.id=?`).get(mailMessageId), true) };
+}
+
+function verifyMailDraftCapability(requestId, capability) {
+  if (!capability) return false;
+  const capabilityHash = createHash("sha256").update(capability).digest("hex");
+  return Boolean(db.prepare("SELECT id FROM mail_draft_request_capabilities WHERE request_id=? AND capability_hash=?").get(requestId, capabilityHash));
+}
+
+function writeBackMailDraft(requestId, body, capability) {
+  const request = db.prepare("SELECT * FROM mail_draft_requests WHERE id=?").get(requestId);
+  if (!request) throw requestError("Unknown mail drafting request.", 404);
+  if (!verifyMailDraftCapability(requestId, capability)) throw requestError("This CEO / PM writeback capability is invalid.", 403);
+  const revisionKey = String(body.revisionId || "").trim().slice(0, 240);
+  if (!revisionKey) throw requestError("A stable revisionId is required.");
+  const replay = db.prepare("SELECT * FROM mail_draft_writebacks WHERE request_id=? AND revision_key=?").get(requestId, revisionKey);
+  if (replay) return { replayed: true, request: mapMailDraftRequest(db.prepare("SELECT * FROM mail_draft_requests WHERE id=?").get(requestId)), mail: mapMail(db.prepare(`${mailSelect} WHERE m.id=?`).get(request.mail_message_id), true) };
+  const draftBody = String(body.body || "").trim().slice(0, 50000);
+  const error = String(body.error || "").trim().slice(0, 4000);
+  if (!draftBody && !error) throw requestError("A finished draft body or a specific error is required.");
+  const provenance = String(body.provenance || "Command Center CEO / PM").trim().slice(0, 240) || "Command Center CEO / PM";
+  if (provenance !== "Command Center CEO / PM") throw requestError("Mail draft writeback provenance must be Command Center CEO / PM.");
+  const sourceBasis = typeof body.sourceBasis === "string" ? body.sourceBasis : JSON.stringify(body.sourceBasis || []);
+  const sourceFreshness = String(body.sourceFreshness || "Not stated").trim().slice(0, 1000);
+  const writebackId = randomUUID();
+  const now = nowIso();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    if (error) {
+      db.prepare(`INSERT INTO mail_draft_writebacks(id,request_id,revision_key,provenance,source_basis,source_freshness,status,error,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,'needs_attention',?,?,?)`).run(writebackId, requestId, revisionKey, provenance, sourceBasis.slice(0, 12000), sourceFreshness, error, now, now);
+      db.prepare("UPDATE mail_draft_requests SET status='needs_attention',error=?,updated_at=? WHERE id=?").run(error, now, requestId);
+      recordMailDraftRequestEvent(requestId, `writeback:${revisionKey}`, "needs_attention", error, { writebackId, provenance, sourceBasis, sourceFreshness });
+    } else {
+      const existingDraft = db.prepare("SELECT * FROM mail_drafts WHERE mail_message_id=?").get(request.mail_message_id);
+      const preservesManualEdit = Boolean(existingDraft && existingDraft.current_body && existingDraft.current_body !== existingDraft.generated_body && existingDraft.status === "edited");
+      const draftId = existingDraft?.id || randomUUID();
+      db.prepare(`INSERT INTO mail_draft_writebacks(id,request_id,revision_key,body,provenance,source_basis,source_freshness,status,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,'ready',?,?)`).run(writebackId, requestId, revisionKey, draftBody, provenance, sourceBasis.slice(0, 12000), sourceFreshness, now, now);
+      if (existingDraft) {
+        db.prepare("UPDATE mail_drafts SET generated_body=?,current_body=?,status=?,origin_mode='ceo_pm',skill_id='ceo-pm-draft-writeback',source_basis=?,updated_at=? WHERE id=?")
+          .run(draftBody, preservesManualEdit ? existingDraft.current_body : draftBody, preservesManualEdit ? "edited" : "ready", sourceBasis.slice(0, 12000), now, draftId);
+      } else {
+        db.prepare(`INSERT INTO mail_drafts(id,mail_message_id,generated_body,current_body,status,origin_mode,skill_id,source_basis,created_at,updated_at)
+          VALUES(?,?,?,?,'ready','ceo_pm','ceo-pm-draft-writeback',?,?,?)`).run(draftId, request.mail_message_id, draftBody, draftBody, sourceBasis.slice(0, 12000), now, now);
+      }
+      db.prepare("INSERT INTO mail_draft_revisions(id,mail_draft_id,body,origin,created_at) VALUES(?,?,?,'ceo_pm',?)").run(randomUUID(), draftId, draftBody, now);
+      const requestStatus = preservesManualEdit ? "needs_attention" : "ready";
+      const requestErrorMessage = preservesManualEdit ? "A new CEO / PM draft arrived; Jake's local edits were preserved for comparison." : "";
+      db.prepare("UPDATE mail_draft_requests SET status=?,error=?,updated_at=? WHERE id=?").run(requestStatus, requestErrorMessage, now, requestId);
+      db.prepare("UPDATE mail_messages SET draft_state=?,updated_at=? WHERE id=?").run(preservesManualEdit ? "edited" : "ready", now, request.mail_message_id);
+      recordMailDraftRequestEvent(requestId, `writeback:${revisionKey}`, preservesManualEdit ? "needs_attention" : "draft_ready", preservesManualEdit ? requestErrorMessage : "The CEO / PM draft is ready for Jake's review.", { writebackId, provenance, sourceBasis, sourceFreshness });
+    }
+    db.exec("COMMIT");
+  } catch (errorDuringWriteback) {
+    db.exec("ROLLBACK");
+    throw errorDuringWriteback;
+  }
+  return { replayed: false, request: mapMailDraftRequest(db.prepare("SELECT * FROM mail_draft_requests WHERE id=?").get(requestId)), mail: mapMail(db.prepare(`${mailSelect} WHERE m.id=?`).get(request.mail_message_id), true) };
 }
 
 function projectDateAtEndOfDay(value) {
@@ -2267,7 +2501,10 @@ function bootstrapPayload(filters = {}) {
     all: db.prepare("SELECT COUNT(*) AS count FROM mail_messages").get().count,
     needs_reply: db.prepare("SELECT COUNT(*) AS count FROM mail_messages WHERE freshness='live' AND reply_state='needs_reply' AND review_state='unreviewed' AND (snoozed_until IS NULL OR datetime(snoozed_until) <= datetime('now'))").get().count,
     unread: db.prepare("SELECT COUNT(*) AS count FROM mail_messages WHERE freshness='live' AND is_read=0").get().count,
-    drafts: db.prepare("SELECT COUNT(*) AS count FROM mail_drafts").get().count,
+    drafts: db.prepare(`SELECT COUNT(*) AS count FROM mail_messages m
+      LEFT JOIN mail_drafts d ON d.mail_message_id=m.id
+      LEFT JOIN mail_draft_requests r ON r.mail_message_id=m.id
+      WHERE d.id IS NOT NULL OR r.id IS NOT NULL`).get().count,
     snoozed: db.prepare("SELECT COUNT(*) AS count FROM mail_messages WHERE datetime(snoozed_until) > datetime('now')").get().count,
   };
   return {
@@ -3178,24 +3415,6 @@ function acceptMeetingSuggestion(id) {
   return targetId;
 }
 
-async function launchMailDraft(mailMessageId, { automatic = false, feedback = "" } = {}) {
-  const active = db.prepare("SELECT * FROM agent_runs WHERE mail_message_id=? AND scope='mail_draft' AND status IN ('queued','working') ORDER BY created_at DESC LIMIT 1").get(mailMessageId);
-  if (active) return mapRun(active);
-  const mail = await mailDetail(mailMessageId);
-  const preview = delegationPreview({ mailMessageId, skillId: "draft-executive-email" });
-  const notes = mail.notes.map((note) => `- ${note.title}: ${note.body.slice(0, 1600)}`).join("\n");
-  const rules = mail.activeRules.map((rule) => `- ${rule.instruction}`).join("\n");
-  const intent = `Draft a reply from Jake to this incoming email.\n\nFrom: ${mail.senderName} <${mail.senderEmail}>\nSubject: ${mail.subject}\nReceived: ${mail.receivedAt}\n\nIncoming message:\n${mail.body || mail.preview}\n\nRelevant notes:\n${notes || "None."}\n\nApproved Command Center rules:\n${rules || "Use the skill's Jake-style defaults."}\n\nAdditional feedback:\n${feedback || "None."}`;
-  const now = nowIso();
-  const existingDraft = db.prepare("SELECT * FROM mail_drafts WHERE mail_message_id=?").get(mailMessageId);
-  const draftId = existingDraft?.id || randomUUID();
-  db.prepare(`INSERT INTO mail_drafts(id,mail_message_id,generated_body,current_body,status,origin_mode,skill_id,source_basis,created_at,updated_at)
-    VALUES(?,?, '', '', 'queued',?,'draft-executive-email',?,?,?)
-    ON CONFLICT(mail_message_id) DO UPDATE SET status='queued',origin_mode=excluded.origin_mode,skill_id='draft-executive-email',source_basis=excluded.source_basis,updated_at=excluded.updated_at`).run(draftId, mailMessageId, automatic ? "automatic" : "manual", JSON.stringify(preview.contextManifest), now, now);
-  db.prepare("UPDATE mail_messages SET draft_state='queued',updated_at=? WHERE id=?").run(now, mailMessageId);
-  return launchAgentRun({ mailMessageId, companySlug: mail.companySlug, scope: "mail_draft", intent, title: `Draft reply · ${mail.subject}`, allowedSources: ["outlook", "ai_os", "project_files", "notes"], skillId: "draft-executive-email", executorType: "codex_readonly", contextManifest: preview.contextManifest });
-}
-
 async function runFixedPowerShell(scriptPath) {
   return new Promise((resolve, reject) => {
     const child = spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath], { windowsHide: true });
@@ -3633,7 +3852,7 @@ const server = createServer(async (request, response) => {
 
     const mailDraftMatch = url.pathname.match(/^\/api\/mail\/([^/]+)\/draft$/);
     if (mailDraftMatch && request.method === "POST") {
-      throw requestError("Command Center no longer launches Codex draft workers. Create or link a card, then use Ask Codex and return here.", 410);
+      throw requestError("Command Center cannot launch a Codex draft worker. Create a local CEO / PM draft request instead.", 410);
     }
     if (mailDraftMatch && request.method === "PATCH") {
       const id = decodeURIComponent(mailDraftMatch[1]);
@@ -3651,6 +3870,20 @@ const server = createServer(async (request, response) => {
       return responseJson(response, 200, mapMail(db.prepare(`${mailSelect} WHERE m.id=?`).get(id), true));
     }
 
+    const mailDraftRequestMatch = url.pathname.match(/^\/api\/mail\/([^/]+)\/draft-request$/);
+    if (mailDraftRequestMatch && request.method === "POST") {
+      const result = requestMailDraft(decodeURIComponent(mailDraftRequestMatch[1]));
+      return responseJson(response, result.reused ? 200 : 201, result);
+    }
+    const mailDraftPacketMatch = url.pathname.match(/^\/api\/mail-draft-requests\/([^/]+)\/packet$/);
+    if (mailDraftPacketMatch && request.method === "POST") return responseJson(response, 200, issueMailDraftRequestPacket(decodeURIComponent(mailDraftPacketMatch[1])));
+    const mailDraftWritebackMatch = url.pathname.match(/^\/api\/mail-draft-requests\/([^/]+)\/writeback$/);
+    if (mailDraftWritebackMatch && request.method === "POST") {
+      const authorization = String(request.headers.authorization || "");
+      const capability = authorization.match(/^Bearer\s+(.+)$/i)?.[1] || "";
+      return responseJson(response, 200, writeBackMailDraft(decodeURIComponent(mailDraftWritebackMatch[1]), await readJsonBody(request), capability));
+    }
+
     const mailMatch = url.pathname.match(/^\/api\/mail\/([^/]+)$/);
     if (mailMatch && request.method === "GET") return responseJson(response, 200, await mailDetail(decodeURIComponent(mailMatch[1])));
     if (mailMatch && request.method === "PATCH") {
@@ -3666,8 +3899,8 @@ const server = createServer(async (request, response) => {
       const snoozedUntil = body.snoozedUntil === undefined ? current.snoozed_until : body.snoozedUntil || null;
       db.prepare("UPDATE mail_messages SET company_slug=?,review_state=?,reply_state=?,reply_override=?,snoozed_until=?,updated_at=? WHERE id=?").run(company, reviewState, replyState, replyOverride, snoozedUntil, nowIso(), id);
       if (company !== current.company_slug && current.action_work_item_id) db.prepare("UPDATE work_items SET company_slug=?,updated_at=? WHERE id=?").run(company, nowIso(), current.action_work_item_id);
-      if (body.promote && !current.action_work_item_id) ensureMailAction(id, { highImpact: true });
-      const actionId = current.action_work_item_id || (body.promote ? db.prepare("SELECT action_work_item_id FROM mail_messages WHERE id=?").get(id)?.action_work_item_id : null);
+      if (body.promote) promoteMailToOpenWork(id);
+      const actionId = body.promote ? db.prepare("SELECT action_work_item_id FROM mail_messages WHERE id=?").get(id)?.action_work_item_id : current.action_work_item_id;
       if (actionId && snoozedUntil && Date.parse(snoozedUntil) > Date.now()) db.prepare("UPDATE work_items SET status='waiting_external',updated_at=? WHERE id=? AND status NOT IN ('done','dismissed')").run(nowIso(),actionId);
       if (actionId && (!snoozedUntil || Date.parse(snoozedUntil) <= Date.now())) db.prepare("UPDATE work_items SET status='to_review',updated_at=? WHERE id=? AND status='waiting_external'").run(nowIso(),actionId);
       const action = body.promote ? "promoted" : snoozedUntil !== current.snoozed_until ? "snoozed" : company !== current.company_slug ? "company_corrected" : replyState !== current.reply_state ? "reply_state_corrected" : "reviewed";

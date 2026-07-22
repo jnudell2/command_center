@@ -1432,3 +1432,36 @@ html, body { max-width: 100%; overflow-x: hidden; }
   .current-read > header { align-items: start; flex-direction: column; }
   .next-move { margin-inline: -4px; padding: 16px; }
 }
+
+/* Mail draft requests are local receipts, never simulated native execution. */
+.mail-draft-workspace { scroll-margin-top: 16px; }
+.mail-draft-status-line { align-items: center; display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.mail-draft-status-line > small { color: var(--cc-muted); font-size: .62rem; line-height: 1.45; }
+.mail-draft-state { border-radius: 999px; font-size: .58rem; font-weight: 780; letter-spacing: .035em; padding: 5px 8px; text-transform: uppercase; }
+.draft-state-not_requested { background: #f1f2ef; color: var(--cc-muted); }
+.draft-state-requested { background: var(--cc-waiting-soft); color: #765200; }
+.draft-state-draft_ready { background: var(--cc-fresh-soft); color: var(--cc-fresh); }
+.draft-state-needs_attention { background: var(--cc-risk-soft); color: var(--cc-risk); }
+.mail-draft-empty { background: var(--cc-canvas); border-left: 3px solid var(--cc-line-strong); border-radius: 0 var(--cc-radius-sm) var(--cc-radius-sm) 0; max-width: 840px; padding: 13px 14px; }
+.mail-draft-empty > p { color: var(--cc-muted); font-size: .68rem; line-height: 1.55; margin: 0; }
+.mail-actions button,
+.mail-actions a,
+.mail-review-controls button,
+.mail-review-controls select {
+  align-items: center;
+  display: inline-flex;
+  min-height: 40px;
+}
+.mail-body {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.mail-draft-error { background: var(--cc-risk-soft); border-radius: var(--cc-radius-sm); color: var(--cc-risk); font-size: .66rem; line-height: 1.5; max-width: 840px; padding: 10px 12px; }
+.mail-draft-workspace .mail-actions { flex-wrap: wrap; }
+.mail-draft-workspace .mail-actions button, .mail-draft-workspace .mail-actions a { align-items: center; display: inline-flex; justify-content: center; min-height: 40px; }
+.mail-draft-workspace .mail-actions button.secondary { background: white; color: var(--cc-ink); }
+@media (max-width: 560px) {
+  .mail-draft-status-line { align-items: flex-start; flex-direction: column; }
+  .mail-draft-workspace .mail-actions { display: grid; grid-template-columns: 1fr; }
+  .mail-draft-workspace .mail-actions button, .mail-draft-workspace .mail-actions a { width: 100%; }
+}
