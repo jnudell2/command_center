@@ -6,8 +6,8 @@ const runnerUrl = "http://127.0.0.1:4318";
 
 type Company = { slug: string; displayName: string };
 type Rule = { id: string; title: string; instruction: string; status: string; scopeType: string; scopeValue: string };
-type Draft = { id: string; generatedBody: string; currentBody: string; status: string; skillId: string; sourceBasis: string; updatedAt: string };
-type DraftRequest = { id: string; status: "requested" | "draft_ready" | "needs_attention"; requestedBy: string; error: string; provenance: string; sourceBasis: string; sourceFreshness: string; createdAt: string; updatedAt: string };
+type Draft = { id: string; generatedBody: string; currentBody: string; status: string; skillId: string; sourceBasis: string; sourceFingerprint: string; pendingBody: string; pendingGenerationId: string; updatedAt: string };
+type DraftGeneration = { id: string; contentFingerprint: string; reason: string; status: "queued" | "working" | "ready" | "error"; attempt: number; error: string; requestedAt: string; startedAt: string; finishedAt: string };
 type Note = { id: string; title: string; body: string; type: string; origin: string };
 type Mail = {
   id: string;
@@ -34,14 +34,12 @@ type Mail = {
   freshness: string;
   lastSyncedAt: string;
   draft: Draft | null;
-  draftRequestState: "not_requested" | "requested" | "draft_ready" | "needs_attention";
-  draftRequest: DraftRequest | null;
+  draftGeneration: DraftGeneration | null;
   activeRules: Rule[];
   notes: Note[];
 };
 
-type DraftRequestResponse = { reused: boolean; request: DraftRequest; mail: Mail; packet: { packetText: string } };
-type DraftPacketResponse = { packetText: string };
+type DraftGenerationResponse = { generationId: string; mail: Mail };
 
 type MailResponse = {
   items: Mail[];
@@ -85,7 +83,7 @@ export default function MailWorkspace({ companies, selectedMessageId, onNotice, 
   const [draftDirty, setDraftDirty] = useState(false);
   const [busy, setBusy] = useState(false);
   const [mobileDetailOpen, setMobileDetailOpen] = useState(false);
-  const loadedDraftId = useRef("");
+  const loadedDraftVersion = useRef("");
   const draftSaveVersion = useRef(0);
 
   const loadList = useCallback(async (quiet = false) => {
@@ -126,7 +124,7 @@ export default function MailWorkspace({ companies, selectedMessageId, onNotice, 
     return () => window.removeEventListener("hashchange", closeFromHash);
   }, []);
 
-  const selectedDraftSignal = (() => { const selected = mail.items.find((item) => item.id === selectedId); return `${selected?.draftState || ""}:${selected?.draftRequestState || ""}`; })();
+  const selectedDraftSignal = (() => { const selected = mail.items.find((item) => item.id === selectedId); return `${selected?.draftState || ""}:${selected?.draftGeneration?.id || ""}:${selected?.draftGeneration?.status || ""}`; })();
 
   useEffect(() => {
     if (!selectedId) return;
@@ -134,10 +132,11 @@ export default function MailWorkspace({ companies, selectedMessageId, onNotice, 
     api<Mail>(`/api/mail/${encodeURIComponent(selectedId)}`).then((next) => {
       if (cancelled) return;
       setDetail(next);
-      if (loadedDraftId.current !== next.draft?.id) {
+      const version = next.draft ? `${next.draft.id}:${next.draft.updatedAt}` : "";
+      if (loadedDraftVersion.current !== version) {
         setDraft(next.draft?.currentBody || "");
         setDraftDirty(false);
-        loadedDraftId.current = next.draft?.id || "";
+        loadedDraftVersion.current = version;
       }
     }).catch((error) => onNotice(error instanceof Error ? error.message : "The message could not be opened."));
     return () => { cancelled = true; };
@@ -201,26 +200,42 @@ export default function MailWorkspace({ companies, selectedMessageId, onNotice, 
     return null;
   };
 
-  const requestDraft = async () => {
+  const regenerateDraft = async () => {
     if (!detail) return;
     setBusy(true);
     try {
-      const result = await api<DraftRequestResponse>(`/api/mail/${detail.id}/draft-request`, { method: "POST", body: "{}" });
+      const result = await api<DraftGenerationResponse>(`/api/mail/${detail.id}/draft`, { method: "POST", body: "{}" });
       setDetail(result.mail);
       await loadList(true);
-      onNotice(result.reused ? "The existing CEO / PM draft request is still recorded locally." : "CEO / PM draft request recorded locally. It has not been delivered automatically.");
-    } catch (error) { onNotice(error instanceof Error ? error.message : "The draft request could not be recorded."); }
+      onNotice("Regeneration started from the latest cached message context. Your current edits will be preserved.");
+    } catch (error) { onNotice(error instanceof Error ? error.message : "The draft could not be regenerated."); }
     finally { setBusy(false); }
   };
 
-  const copyDraftRequest = async () => {
-    if (!detail?.draftRequest) return;
+  const retryDraft = async () => {
+    if (!detail) return;
     setBusy(true);
     try {
-      const packet = await api<DraftPacketResponse>(`/api/mail-draft-requests/${detail.draftRequest.id}/packet`, { method: "POST", body: "{}" });
-      await navigator.clipboard.writeText(packet.packetText);
-      onNotice("Drafting request copied. Paste it into the persistent CEO / PM task; Command Center has not delivered it automatically.");
-    } catch (error) { onNotice(error instanceof Error ? error.message : "The drafting request could not be copied."); }
+      const result = await api<DraftGenerationResponse>(`/api/mail/${detail.id}/draft/retry`, { method: "POST", body: "{}" });
+      setDetail(result.mail);
+      await loadList(true);
+      onNotice("Draft generation is retrying from the same source fingerprint.");
+    } catch (error) { onNotice(error instanceof Error ? error.message : "The draft retry could not start."); }
+    finally { setBusy(false); }
+  };
+
+  const resolveGeneratedRevision = async (action: "use" | "keep") => {
+    if (!detail?.draft?.pendingGenerationId) return;
+    setBusy(true);
+    try {
+      const next = await api<Mail>(`/api/mail/${detail.id}/draft/revision`, { method: "POST", body: JSON.stringify({ action, generationId: detail.draft.pendingGenerationId }) });
+      setDetail(next);
+      setDraft(next.draft?.currentBody || "");
+      setDraftDirty(false);
+      loadedDraftVersion.current = next.draft ? `${next.draft.id}:${next.draft.updatedAt}` : "";
+      await loadList(true);
+      onNotice(action === "use" ? "Using the new generated draft." : "Kept your current draft and preserved the generated revision in history.");
+    } catch (error) { onNotice(error instanceof Error ? error.message : "The generated revision could not be resolved."); }
     finally { setBusy(false); }
   };
 
@@ -232,7 +247,7 @@ export default function MailWorkspace({ companies, selectedMessageId, onNotice, 
       return;
     }
     const next = await patchMail({ promote: true, detail: "Jake explicitly promoted this email to Open Work." });
-    if (next?.actionWorkItemId) onNotice("Added to Open Work. Drafting remains a separate CEO / PM request.");
+    if (next?.actionWorkItemId) onNotice("Added to Open Work. Mail drafting remains independent and review-only.");
   };
 
   const copyDraft = async () => {
@@ -255,12 +270,14 @@ export default function MailWorkspace({ companies, selectedMessageId, onNotice, 
   ] as const;
 
   const selectedSummary = useMemo(() => mail.items.find((item) => item.id === selectedId), [mail.items, selectedId]);
+  const generationStatus = detail?.draftGeneration?.status || (detail?.draft ? "ready" : "queued");
+  const generationLabel = detail?.draft?.pendingBody ? "New revision ready" : generationStatus === "working" || generationStatus === "queued" ? "Drafting" : generationStatus === "error" ? "Draft failed" : "Draft ready";
 
   return (
     <section className="mail-shell" aria-label="Mail workspace">
       <div className="mail-list-pane" id="mail-list">
         <header className="mail-heading">
-          <div><p className="kicker">MAIL</p><h2>What needs a reply</h2><p>Every incoming message stays visible. Command Center drafts only when you likely owe a response.</p></div>
+          <div><p className="kicker">MAIL</p><h2>Review and reply</h2><p>Every visible message gets a source-grounded proposed reply in the background.</p></div>
           <button type="button" disabled={mail.receipt?.status === "working"} onClick={() => void refresh(true)}>{mail.receipt?.status === "working" ? "Refreshing…" : "Refresh"}</button>
         </header>
         <div className="mail-coverage"><span className={`source-state source-${mail.receipt?.status || "cached"}`}>{mail.receipt?.status || "cached"}</span><p>{mail.receipt?.error || mail.receipt?.detail || "Cached mail is ready."}</p></div>
@@ -271,7 +288,7 @@ export default function MailWorkspace({ companies, selectedMessageId, onNotice, 
             <button className={item.id === selectedId ? "mail-row active" : "mail-row"} data-company={item.companySlug || "unassigned"} type="button" key={item.id} onClick={() => void selectMessage(item.id)}>
               <div><span className={item.replyState === "needs_reply" ? "reply-dot needs" : "reply-dot"} /><strong>{item.senderName || item.senderEmail}</strong><time>{mailDate(item.receivedAt)}</time></div>
               <h3>{item.subject}</h3><p>{item.preview}</p>
-              <footer><span className="mail-company">{item.companySlug ? companies.find((company) => company.slug === item.companySlug)?.displayName : "Unfiled"}</span><span>{item.draftState !== "none" ? `Draft ${item.draftState}` : item.replyState.replace("_", " ")}</span></footer>
+              <footer><span className="mail-company">{item.companySlug ? companies.find((company) => company.slug === item.companySlug)?.displayName : "Unfiled"}</span><span>{item.draftState === "ready" || item.draftState === "edited" ? "Draft ready" : item.draftState === "revision_ready" ? "New draft revision" : item.draftState === "error" ? "Draft failed" : "Drafting"}</span></footer>
             </button>
           )) : <div className="empty-message"><strong>No mail in this view</strong><p>Cached mail remains available while the next refresh runs.</p></div>}
         </div>
@@ -283,17 +300,18 @@ export default function MailWorkspace({ companies, selectedMessageId, onNotice, 
             <div className="mail-company-context company-badge">{detail.companySlug ? companies.find((company) => company.slug === detail.companySlug)?.displayName : "Unfiled"}</div>
             <a className="mobile-close" href="#mail-list" onClick={() => setMobileDetailOpen(false)}>← Back to mail</a>
             <header className="mail-message-header"><div><span className={`mail-reply-state state-${detail.replyState}`}>{detail.replyState.replace("_", " ")}</span><span>{Math.round(detail.replyConfidence * 100)}% confidence</span></div><p>From {detail.senderName || detail.senderEmail} &lt;{detail.senderEmail}&gt;</p><h2>{detail.subject}</h2><small>{new Date(detail.receivedAt).toLocaleString()} · {detail.freshness}</small></header>
-            <section className="why-card mail-next-step"><span>Recommended next step</span><h3>{detail.replyState === "needs_reply" ? detail.draft ? "Review the local draft, then reply in Outlook" : detail.draftRequestState === "requested" ? "Copy the request to the CEO / PM, then review the returned draft" : "Request a CEO / PM draft or promote the obligation to Open Work" : detail.replyState === "responded" ? "Confirm this is handled" : "Review, then file or promote it"}</h3><p>{detail.replyReason}</p>{detail.activeRules.length ? <div className="rule-chips">{detail.activeRules.map((rule) => <span key={rule.id}>{rule.title}</span>)}</div> : <small>No accepted rule changed this recommendation.</small>}</section>
+            <section className="why-card mail-next-step"><span>Recommended next step</span><h3>{detail.draft?.pendingBody ? "Review the new generated revision" : generationStatus === "error" ? detail.draft ? "Use the current draft or retry generation" : "Retry the proposed reply" : generationStatus === "working" || generationStatus === "queued" ? "Drafting a source-grounded reply" : "Review the proposed reply, then respond in Outlook"}</h3><p>{detail.replyReason}</p>{detail.activeRules.length ? <div className="rule-chips">{detail.activeRules.map((rule) => <span key={rule.id}>{rule.title}</span>)}</div> : <small>The installed email skill defaults are being used.</small>}</section>
             <div className="mail-review-controls mail-review-controls-top"><select value={detail.companySlug || ""} onChange={(event) => void patchMail({ companySlug: event.target.value || null, detail: "Corrected the company assignment." })} aria-label="Company assignment"><option value="">Unfiled</option>{companies.map((company) => <option key={company.slug} value={company.slug}>{company.displayName}</option>)}</select><button disabled={busy || detail.reviewState === "reviewed"} type="button" onClick={() => void patchMail({ reviewState: "reviewed" })}>{detail.reviewState === "reviewed" ? "Reviewed" : "Mark reviewed"}</button><button disabled={busy} type="button" onClick={() => void patchMail({ snoozedUntil: tomorrowMorning(), detail: "Snoozed until tomorrow morning." })}>Snooze</button><button disabled={busy} type="button" onClick={() => void promoteToOpenWork()}>{detail.actionWorkItemId && !["done", "dismissed"].includes(detail.actionWorkItemStatus || "") ? "Open in Open Work" : detail.actionWorkItemId ? "Restore to Open Work" : "Promote to Open Work"}</button></div>
             <details className="workbench-section mail-draft-workspace" open>
               <summary>Proposed reply</summary>
-              <div className="mail-draft-status-line" role="status"><span className={`mail-draft-state draft-state-${detail.draftRequestState}`}>{detail.draftRequestState === "not_requested" ? "Not requested" : detail.draftRequestState === "requested" ? "Requested" : detail.draftRequestState === "needs_attention" ? "Needs attention" : "Draft ready"}</span><small>{detail.draftRequest?.provenance ? `${detail.draftRequest.provenance} · ${detail.draftRequest.sourceFreshness || "Freshness not stated"}` : detail.draft ? "Existing local draft" : "Drafting requires the persistent CEO / PM intelligence layer."}</small></div>
-              {detail.draftRequestState === "needs_attention" && detail.draftRequest?.error ? <p className="mail-draft-error">{detail.draftRequest.error}</p> : null}
+              <div className="mail-draft-status-line" role="status" aria-live="polite"><span className={`mail-draft-state draft-state-${detail.draft?.pendingBody ? "revision_ready" : generationStatus}`}>{generationLabel}</span><small>Generated locally with draft-executive-email from the cached message and linked context.</small></div>
+              {generationStatus === "error" && detail.draftGeneration?.error ? <div className="mail-draft-error" role="alert"><p>{detail.draftGeneration.error}</p><button type="button" disabled={busy} onClick={() => void retryDraft()}>Retry</button></div> : null}
               {detail.draft ? <>
                 <textarea className="mail-draft-editor" value={draft} onChange={(event) => { setDraft(event.target.value); setDraftDirty(true); }} placeholder="Edit the proposed reply here." aria-label="Proposed reply draft" />
-                <div className="mail-actions"><button type="button" disabled={!draft.trim()} onClick={() => void copyDraft()}>Copy reply</button><button type="button" disabled={busy || detail.draftRequestState === "requested"} onClick={() => void requestDraft()}>{detail.draftRequestState === "requested" ? "Revision requested" : "Request CEO revision"}</button>{detail.draftRequest ? <button className="secondary" type="button" disabled={busy} onClick={() => void copyDraftRequest()}>Copy drafting request</button> : null}{detail.webLink ? <a href={detail.webLink} target="_blank" rel="noreferrer">Open in Outlook</a> : null}</div>
+                {detail.draft.pendingBody ? <section className="mail-draft-revision" aria-labelledby="generated-revision-title"><div><strong id="generated-revision-title">New generated revision</strong><span>Your current draft was preserved.</span></div><textarea readOnly value={detail.draft.pendingBody} aria-label="New generated draft revision" /><div className="mail-actions"><button type="button" disabled={busy} onClick={() => void resolveGeneratedRevision("use")}>Use new draft</button><button className="secondary" type="button" disabled={busy} onClick={() => void resolveGeneratedRevision("keep")}>Keep my draft</button></div></section> : null}
+                <div className="mail-actions"><button type="button" disabled={!draft.trim()} onClick={() => void copyDraft()}>Copy reply</button><button className="secondary" type="button" disabled={busy || generationStatus === "working" || generationStatus === "queued"} onClick={() => void regenerateDraft()}>{generationStatus === "working" || generationStatus === "queued" ? "Drafting…" : "Regenerate"}</button>{detail.webLink ? <a href={detail.webLink} target="_blank" rel="noreferrer">Open in Outlook</a> : null}</div>
                 <small className="approval-copy">{draftDirty ? "Saving locally…" : "Saved locally"}. Command Center cannot create or send Outlook drafts.</small>
-              </> : <div className="mail-draft-empty"><p>A browser click cannot invoke the native CEO / PM task because Codex exposes no host bridge. This records a local request only; it does not claim delivery or execution.</p><div className="mail-actions"><button className="primary-action" type="button" disabled={busy || detail.draftRequestState === "requested"} onClick={() => void requestDraft()}>{detail.draftRequestState === "requested" ? "CEO draft requested" : "Request CEO draft"}</button>{detail.draftRequest ? <button className="secondary" type="button" disabled={busy} onClick={() => void copyDraftRequest()}>Copy drafting request</button> : null}</div></div>}
+              </> : <div className="mail-draft-empty"><p>{generationStatus === "error" ? "The proposed reply could not be generated. Retry keeps the same source fingerprint and does not send or create anything in Outlook." : "Drafting is running in the background. You can keep reviewing the message while it finishes."}</p>{generationStatus === "error" ? <div className="mail-actions"><button className="primary-action" type="button" disabled={busy} onClick={() => void retryDraft()}>Retry</button></div> : <div className="mail-draft-progress" aria-hidden="true"><span /><span /><span /></div>}</div>}
             </details>
             <details className="workbench-section" open><summary>Incoming message</summary><div className="mail-body">{detail.body || detail.preview}</div>{detail.attachments.length ? <div className="attachment-list">{detail.attachments.map((item) => <span key={item.id}>{item.name} · {Math.max(1, Math.round(item.size / 1024))} KB</span>)}</div> : null}</details>
             <details className="workbench-section"><summary>Relevant context</summary>{detail.notes.length ? detail.notes.map((note) => <div className="context-note" key={note.id}><span>{note.origin === "manual" ? "Jake's note" : "Agent output"} · {note.type}</span><strong>{note.title}</strong><p>{note.body.slice(0, 400)}</p></div>) : <p className="muted-copy">No linked or company decision notes were included.</p>}</details>
