@@ -149,16 +149,6 @@ export function transitionAssignment(current, rawEvent) {
   return { eventType, previousStatus: state, nextStatus, ownerId: nextOwnerId, ownerType };
 }
 
-export function workItemStatusForAssignment({ nextStatus, priorWorkItemStatus }) {
-  if (nextStatus === "prepared") return null;
-  if (nextStatus === "accepted") return "queued";
-  if (nextStatus === "working") return "working";
-  if (nextStatus === "needs_input") return "waiting_on_user";
-  if (nextStatus === "needs_attention") return "needs_attention";
-  if (nextStatus === "completed") return "back_for_review";
-  if (nextStatus === "failed") return "error";
-  if (["ownership_released", "cancelled"].includes(nextStatus)) {
-    return ["done", "dismissed", "working", "queued"].includes(priorWorkItemStatus) ? "to_review" : priorWorkItemStatus || "to_review";
-  }
-  return null;
+export function workItemStatusForAssignment({ priorWorkItemStatus }) {
+  return priorWorkItemStatus || "to_review";
 }

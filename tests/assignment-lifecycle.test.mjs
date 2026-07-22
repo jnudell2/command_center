@@ -20,7 +20,7 @@ test("binds one owner and follows the verified lifecycle", () => {
   assert.equal(started.nextStatus, "working");
   const completed = transitionAssignment({ ...base, status: started.nextStatus, ownerId }, { type: "completed", ownerId });
   assert.equal(completed.nextStatus, "completed");
-  assert.equal(workItemStatusForAssignment({ nextStatus: completed.nextStatus, priorWorkItemStatus: "to_review" }), "back_for_review");
+  assert.equal(workItemStatusForAssignment({ nextStatus: completed.nextStatus, priorWorkItemStatus: "to_review" }), "to_review");
 });
 
 test("rejects conflicting owners, out-of-order events, and late terminal callbacks", () => {
@@ -29,10 +29,10 @@ test("rejects conflicting owners, out-of-order events, and late terminal callbac
   assert.throws(() => transitionAssignment({ ...base, status: "completed", ownerId }, { type: "heartbeat", ownerId }), /already terminal/i);
 });
 
-test("keeps attention distinct from user input and failure", () => {
-  assert.equal(workItemStatusForAssignment({ nextStatus: "needs_input", priorWorkItemStatus: "to_review" }), "waiting_on_user");
-  assert.equal(workItemStatusForAssignment({ nextStatus: "needs_attention", priorWorkItemStatus: "to_review" }), "needs_attention");
-  assert.equal(workItemStatusForAssignment({ nextStatus: "failed", priorWorkItemStatus: "to_review" }), "error");
+test("keeps technical lifecycle distinct from durable business status", () => {
+  assert.equal(workItemStatusForAssignment({ nextStatus: "needs_input", priorWorkItemStatus: "to_review" }), "to_review");
+  assert.equal(workItemStatusForAssignment({ nextStatus: "needs_attention", priorWorkItemStatus: "waiting_external" }), "waiting_external");
+  assert.equal(workItemStatusForAssignment({ nextStatus: "failed", priorWorkItemStatus: "back_for_review" }), "back_for_review");
 });
 
 test("creates and verifies callback capabilities without exposing equality shortcuts", () => {

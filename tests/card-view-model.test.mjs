@@ -39,7 +39,9 @@ test("shows a company PM only with a verified receipt owned by the exact persist
   const withSiq = cardState(item({ status: "working", assignments: [{ status: "started", ownerId: "019f5c8f-5994-7c73-a717-67a0ad7b0682", updatedAt: "2026-07-21T10:00:00Z" }] }));
   assert.equal(withSiq.label, "With SIQ PM");
   const fakePm = cardState(item({ status: "working", assignments: [{ status: "started", ownerId: "lookalike-task", updatedAt: "2026-07-21T10:00:00Z" }] }));
-  assert.equal(fakePm.label, "In progress");
+  assert.equal(fakePm.label, "Needs reconciliation");
+  const technicalResultOnly = cardState(item({ status: "to_review", assignments: [{ status: "completed", ownerId: "lookalike-task", updatedAt: "2026-07-21T10:00:00Z" }], agentRuns: [{ status: "review", updatedAt: "2026-07-21T10:00:00Z" }] }));
+  assert.equal(technicalResultOnly.label, "Open");
 });
 
 test("provides type-aware working areas, context labels, and definitions of done", () => {

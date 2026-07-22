@@ -22,7 +22,6 @@ import {
   normalizeAssignmentEvent,
   transitionAssignment,
   verifyCallbackCapability,
-  workItemStatusForAssignment,
 } from "./assignment-lifecycle.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
@@ -550,6 +549,68 @@ const schemaStatements = [
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS deterministic_mutations (
+    id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    mutation_type TEXT NOT NULL,
+    previous_json TEXT NOT NULL DEFAULT '{}',
+    next_json TEXT NOT NULL DEFAULT '{}',
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'applied',
+    created_at TEXT NOT NULL,
+    undone_at TEXT
+  )`,
+  `CREATE INDEX IF NOT EXISTS deterministic_mutations_item_idx ON deterministic_mutations(work_item_id,created_at DESC)`,
+  `CREATE TABLE IF NOT EXISTS work_item_relationships (
+    id TEXT PRIMARY KEY,
+    from_work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    to_work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    relation_type TEXT NOT NULL CHECK(relation_type IN ('part_of','depends_on','informs','duplicates','blocked_by','supports')),
+    state TEXT NOT NULL DEFAULT 'proposed' CHECK(state IN ('proposed','confirmed','dismissed')),
+    rationale TEXT NOT NULL DEFAULT '',
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    created_by TEXT NOT NULL DEFAULT 'command_center',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(from_work_item_id,to_work_item_id,relation_type)
+  )`,
+  `CREATE INDEX IF NOT EXISTS work_item_relationships_item_idx ON work_item_relationships(from_work_item_id,to_work_item_id,updated_at DESC)`,
+  `CREATE TABLE IF NOT EXISTS intelligence_reviews (
+    id TEXT PRIMARY KEY,
+    review_key TEXT NOT NULL UNIQUE,
+    work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    mode TEXT NOT NULL DEFAULT 'shadow' CHECK(mode='shadow'),
+    status TEXT NOT NULL DEFAULT 'current' CHECK(status IN ('current','new_evidence','needs_reconciliation')),
+    what_it_means TEXT NOT NULL DEFAULT '',
+    why_it_matters_now TEXT NOT NULL DEFAULT '',
+    recommended_next_move TEXT NOT NULL DEFAULT '',
+    owner_dependency TEXT NOT NULL DEFAULT '',
+    definition_of_done TEXT NOT NULL DEFAULT '',
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    evidence_watermark TEXT,
+    reviewed_by TEXT NOT NULL DEFAULT 'Command Center CEO / PM',
+    last_reconciled_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS intelligence_reviews_queue_idx ON intelligence_reviews(status,updated_at DESC)`,
+  `CREATE TABLE IF NOT EXISTS reconciliation_packets (
+    id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    intelligence_review_id TEXT REFERENCES intelligence_reviews(id) ON DELETE SET NULL,
+    expected_updated_at TEXT NOT NULL,
+    proposed_json TEXT NOT NULL DEFAULT '{}',
+    before_json TEXT NOT NULL DEFAULT '{}',
+    after_json TEXT NOT NULL DEFAULT '{}',
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'proposed' CHECK(status IN ('proposed','applied','stale','rejected')),
+    created_by TEXT NOT NULL DEFAULT 'Command Center CEO / PM',
+    created_at TEXT NOT NULL,
+    applied_at TEXT
+  )`,
+  `CREATE INDEX IF NOT EXISTS reconciliation_packets_item_idx ON reconciliation_packets(work_item_id,created_at DESC)`,
 ];
 for (const statement of schemaStatements) db.prepare(statement).run();
 
@@ -570,6 +631,8 @@ ensureColumn("work_items", "planned_minutes", "INTEGER NOT NULL DEFAULT 0");
 ensureColumn("work_items", "preparation_mode", "TEXT NOT NULL DEFAULT 'manual'");
 ensureColumn("work_items", "preparation_skill", "TEXT NOT NULL DEFAULT ''");
 ensureColumn("work_items", "preparation_instruction", "TEXT NOT NULL DEFAULT ''");
+ensureColumn("work_items", "waiting_on", "TEXT NOT NULL DEFAULT ''");
+ensureColumn("work_items", "follow_up_at", "TEXT");
 ensureColumn("codex_tasks", "last_checked_at", "TEXT");
 ensureColumn("codex_tasks", "resume_attempts", "INTEGER NOT NULL DEFAULT 0");
 ensureColumn("codex_tasks", "heartbeat_at", "TEXT");
@@ -928,12 +991,8 @@ function repairPreparedCodexTaskStates() {
   const prepared = db.prepare(`SELECT t.id AS task_id,t.work_item_id,w.status
     FROM codex_tasks t JOIN work_items w ON w.id=t.work_item_id
     WHERE t.status='waiting_on_user' AND t.thread_id='' AND w.status IN ('queued','working')`).all();
-  const repairedAt = nowIso();
   for (const receipt of prepared) {
-    const hasPriorResult = db.prepare("SELECT 1 FROM agent_runs WHERE work_item_id=? AND status IN ('review','error') LIMIT 1").get(receipt.work_item_id);
-    const restoredStatus = hasPriorResult ? "back_for_review" : "to_review";
-    db.prepare("UPDATE work_items SET status=?,updated_at=? WHERE id=?").run(restoredStatus, repairedAt, receipt.work_item_id);
-    eventFor(receipt.work_item_id, "codex_task_state_repaired", "The prepared native Codex task has not started. This card remains in Open Work until a verified task reports that it started.");
+    eventFor(receipt.work_item_id, "codex_task_state_observed", `Prepared native task ${receipt.task_id} has no verified owner. Durable business status was preserved at ${receipt.status}.`);
   }
 }
 
@@ -942,7 +1001,7 @@ function recoverInterruptedRuns() {
   const now = nowIso();
   for (const run of interrupted) {
     db.prepare("UPDATE agent_runs SET status='error',error='The local runner restarted before this assignment finished.',updated_at=? WHERE id=?").run(now, run.id);
-    if (run.work_item_id) db.prepare("UPDATE work_items SET status='back_for_review',updated_at=? WHERE id=?").run(now, run.work_item_id);
+    if (run.work_item_id) eventFor(run.work_item_id, "technical_run_interrupted", "The local technical run was interrupted. Durable business status was preserved.");
     if (run.mail_message_id) {
       db.prepare("UPDATE mail_drafts SET status='error',updated_at=? WHERE mail_message_id=?").run(now, run.mail_message_id);
       db.prepare("UPDATE mail_messages SET draft_state='error',updated_at=? WHERE id=?").run(now, run.mail_message_id);
@@ -951,15 +1010,6 @@ function recoverInterruptedRuns() {
   db.prepare("UPDATE source_receipts SET status='error',detail='The prior refresh was interrupted; cached data was preserved.',error='Runner restarted during refresh.',checked_at=? WHERE status='working'").run(now);
   db.prepare("UPDATE note_edit_proposals SET status='error',error='The runner restarted during this proposed edit.',updated_at=? WHERE status='working'").run(now);
   db.prepare("UPDATE external_actions SET status='error',error='The runner restarted before the external action was verified.',updated_at=? WHERE status IN ('queued','working')").run(now);
-  const staleWorkingItems = db.prepare(`SELECT w.id FROM work_items w
-    WHERE w.status IN ('queued','working')
-      AND NOT EXISTS (SELECT 1 FROM agent_runs r WHERE r.work_item_id=w.id AND r.status IN ('queued','working'))
-      AND NOT EXISTS (SELECT 1 FROM codex_tasks t WHERE t.work_item_id=w.id AND t.status IN ('starting','working'))
-      AND NOT EXISTS (SELECT 1 FROM external_actions e WHERE e.work_item_id=w.id AND e.status IN ('queued','working'))`).all();
-  for (const item of staleWorkingItems) {
-    db.prepare("UPDATE work_items SET status='back_for_review',updated_at=? WHERE id=?").run(now, item.id);
-    eventFor(item.id, "status_repaired", "Working status was cleared because no active process remained.");
-  }
 }
 
 repairPreparedCodexTaskStates();
@@ -975,8 +1025,6 @@ function repairMisroutedTranscriptRuns() {
     if (resolveSkillRoute({ item: candidate }).id === "zoom-transcript-router") continue;
     const detail = "This card was incorrectly routed to transcript processing. No transcript is required for this assignment.";
     db.prepare("UPDATE agent_runs SET status='error',error=?,updated_at=? WHERE id=?").run(detail, repairedAt, candidate.id);
-    const stillActive = db.prepare("SELECT 1 FROM agent_runs WHERE work_item_id=? AND id<>? AND status IN ('queued','working','waiting_on_user') LIMIT 1").get(candidate.work_item_id, candidate.id);
-    if (!stillActive) db.prepare("UPDATE work_items SET status='back_for_review',updated_at=? WHERE id=?").run(repairedAt, candidate.work_item_id);
     eventFor(candidate.work_item_id, "skill_route_repaired", detail);
   }
 }
@@ -1123,6 +1171,10 @@ function migrateLegacyAssignments() {
 }
 
 migrateLegacyAssignments();
+
+if (!db.prepare("SELECT version FROM schema_migrations WHERE version=13").get()) {
+  db.prepare("INSERT INTO schema_migrations(version,applied_at) VALUES(13,?)").run(nowIso());
+}
 
 function responseJson(response, status, payload) {
   response.writeHead(status, {
@@ -1426,6 +1478,51 @@ const mailSelect = `SELECT m.*,d.id AS draft_id,d.generated_body,d.current_body,
   d.skill_id AS mail_draft_skill,d.source_basis,d.updated_at AS mail_draft_updated_at
   FROM mail_messages m LEFT JOIN mail_drafts d ON d.mail_message_id=m.id`;
 
+function jsonValue(value, fallback) {
+  try { return JSON.parse(value || ""); } catch { return fallback; }
+}
+
+function mapIntelligenceReview(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    reviewKey: row.review_key,
+    workItemId: row.work_item_id,
+    mode: row.mode,
+    status: row.status,
+    whatItMeans: row.what_it_means,
+    whyItMattersNow: row.why_it_matters_now,
+    recommendedNextMove: row.recommended_next_move,
+    ownerDependency: row.owner_dependency,
+    definitionOfDone: row.definition_of_done,
+    evidence: jsonValue(row.evidence_json, []),
+    evidenceWatermark: row.evidence_watermark,
+    reviewedBy: row.reviewed_by,
+    lastReconciledAt: row.last_reconciled_at,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function mapRelationship(row, workItemId) {
+  const outgoing = row.from_work_item_id === workItemId;
+  return {
+    id: row.id,
+    direction: outgoing ? "outgoing" : "incoming",
+    relationType: row.relation_type,
+    state: row.state,
+    rationale: row.rationale,
+    evidence: jsonValue(row.evidence_json, []),
+    otherWorkItemId: outgoing ? row.to_work_item_id : row.from_work_item_id,
+    otherTitle: outgoing ? row.to_title : row.from_title,
+    otherStatus: outgoing ? row.to_status : row.from_status,
+    otherCompanySlug: outgoing ? row.to_company_slug : row.from_company_slug,
+    createdBy: row.created_by,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 function hydrateWorkItem(row) {
   const sources = db.prepare("SELECT * FROM source_references WHERE work_item_id = ? ORDER BY retrieved_at DESC").all(row.id).map((source) => ({
     id: source.id,
@@ -1455,6 +1552,15 @@ function hydrateWorkItem(row) {
     status: task.status, result: task.result, error: task.error, createdAt: task.created_at, updatedAt: task.updated_at,
   }));
   const assignments = db.prepare("SELECT * FROM assignments WHERE work_item_id=? ORDER BY updated_at DESC,created_at DESC LIMIT 20").all(row.id).map((assignment) => mapAssignment(assignment));
+  const relationships = db.prepare(`SELECT r.*,
+      source.title AS from_title,source.status AS from_status,source.company_slug AS from_company_slug,
+      target.title AS to_title,target.status AS to_status,target.company_slug AS to_company_slug
+    FROM work_item_relationships r
+    JOIN work_items source ON source.id=r.from_work_item_id
+    JOIN work_items target ON target.id=r.to_work_item_id
+    WHERE (r.from_work_item_id=? OR r.to_work_item_id=?) AND r.state<>'dismissed'
+    ORDER BY CASE r.state WHEN 'confirmed' THEN 0 ELSE 1 END,r.updated_at DESC`).all(row.id, row.id).map((relationship) => mapRelationship(relationship, row.id));
+  const intelligenceReview = mapIntelligenceReview(db.prepare("SELECT * FROM intelligence_reviews WHERE work_item_id=? ORDER BY updated_at DESC LIMIT 1").get(row.id));
   const projectContextRow = db.prepare(`SELECT p.id AS project_id,p.title AS project_title,pi.id AS plan_item_id,
       pi.title AS plan_item_title,pi.workstream,pi.due_date,ph.title AS phase_title
     FROM project_action_links l
@@ -1486,6 +1592,8 @@ function hydrateWorkItem(row) {
     suggestedAction: row.suggested_action,
     draft: row.draft,
     owner: row.owner,
+    waitingOn: row.waiting_on || "",
+    followUpAt: row.follow_up_at || null,
     dueAt: row.due_at,
     plannedAt: row.planned_at || null,
     plannedMinutes: Number(row.planned_minutes || 0),
@@ -1504,6 +1612,8 @@ function hydrateWorkItem(row) {
     externalActions,
     codexTasks,
     assignments,
+    relationships,
+    intelligenceReview,
     projectContext,
     activeRules: rules,
   };
@@ -2750,13 +2860,8 @@ function applyAssignmentEvent(assignmentId, body, capability) {
         transition.previousStatus, transition.nextStatus, JSON.stringify(body));
 
     const item = db.prepare("SELECT * FROM work_items WHERE id=?").get(current.work_item_id);
-    const projected = workItemStatusForAssignment({ nextStatus: transition.nextStatus, priorWorkItemStatus: current.prior_work_item_status });
-    if (projected && item && !["done", "dismissed"].includes(item.status)) {
-      if (transition.nextStatus === "completed" && item.preparation_skill === "draft-executive-email" && !String(item.draft || "").trim()) {
-        db.prepare("UPDATE work_items SET status=?,draft=?,updated_at=? WHERE id=?").run(projected, result, now, current.work_item_id);
-      } else {
-        db.prepare("UPDATE work_items SET status=?,updated_at=? WHERE id=?").run(projected, now, current.work_item_id);
-      }
+    if (transition.nextStatus === "completed" && item?.preparation_skill === "draft-executive-email" && !String(item.draft || "").trim()) {
+      db.prepare("UPDATE work_items SET draft=?,updated_at=? WHERE id=?").run(result, now, current.work_item_id);
     }
     const detail = ({
       accepted: "A native Codex owner accepted this assignment and is waiting to start.",
@@ -2808,8 +2913,6 @@ function reconcileAssignmentAttention() {
         VALUES(?,?,?,?,?,?,?,?,?,?,?,1,'')`)
         .run(randomUUID(), current.id, current.attempt, eventKey, "needs_attention", current.owner_id, now, now,
           transition.previousStatus, transition.nextStatus, JSON.stringify({ reason: "heartbeat_timeout", seconds: 600 }));
-      const item = db.prepare("SELECT status FROM work_items WHERE id=?").get(current.work_item_id);
-      if (item && !["done", "dismissed"].includes(item.status)) db.prepare("UPDATE work_items SET status='needs_attention',updated_at=? WHERE id=?").run(now, current.work_item_id);
       eventFor(current.work_item_id, "assignment_needs_attention", `${detail} Assignment key: ${current.assignment_key}`);
     });
   }
@@ -2830,10 +2933,7 @@ async function launchAgentRun({ workItemId = null, mailMessageId = null, company
   }
   db.prepare(`INSERT INTO agent_runs(id,work_item_id,company_slug,scope,intent,title,allowed_sources,status,result,error,revision_of,input_hash,skill_id,executor_type,context_manifest,mail_message_id,created_at,updated_at)
     VALUES(?,?,?,?,?,?,?,'queued','','',?,?,?,?,?,?,?,?)`).run(id, workItemId, companySlug, scope, safeIntent, title, JSON.stringify(allowedSources), revisionOf, inputHash, skillId, executorType, JSON.stringify(contextManifest), mailMessageId, now, now);
-  if (workItemId) {
-    db.prepare("UPDATE work_items SET status='queued', updated_at=? WHERE id=?").run(now, workItemId);
-    eventFor(workItemId, "queued", title);
-  }
+  if (workItemId) eventFor(workItemId, "technical_run_queued", title);
   if (sourceRefresh) {
     db.prepare(`INSERT INTO source_receipts(source,status,checked_at,detail,result,error)
       VALUES(?, 'working', ?, 'Refreshing independently.', '', '')
@@ -2849,7 +2949,6 @@ async function launchAgentRun({ workItemId = null, mailMessageId = null, company
     db.prepare("UPDATE mail_drafts SET status='working',updated_at=? WHERE mail_message_id=?").run(nowIso(), mailMessageId);
     db.prepare("UPDATE mail_messages SET draft_state='working',updated_at=? WHERE id=?").run(nowIso(), mailMessageId);
   }
-  if (workItemId) db.prepare("UPDATE work_items SET status='working', updated_at=? WHERE id=?").run(nowIso(), workItemId);
 
   let stdoutBuffer = "";
   let stderrBuffer = "";
@@ -2882,8 +2981,7 @@ async function launchAgentRun({ workItemId = null, mailMessageId = null, company
     if (code === 0 && finalMessage) {
       db.prepare("UPDATE agent_runs SET status='review', result=?, updated_at=? WHERE id=?").run(finalMessage, finished, id);
       if (workItemId) {
-        db.prepare("UPDATE work_items SET status='back_for_review', updated_at=? WHERE id=?").run(finished, workItemId);
-        eventFor(workItemId, "agent_returned", title);
+        eventFor(workItemId, "technical_result_available", `${title} returned evidence. Durable business status was preserved.`);
       }
       if (mailMessageId && scope === "mail_draft") {
         const draft = db.prepare("SELECT * FROM mail_drafts WHERE mail_message_id=?").get(mailMessageId);
@@ -2903,8 +3001,7 @@ async function launchAgentRun({ workItemId = null, mailMessageId = null, company
       const error = stderrBuffer.trim() || `Codex exited without a reviewable result (code ${code}).`;
       db.prepare("UPDATE agent_runs SET status='error', error=?, updated_at=? WHERE id=?").run(error, finished, id);
       if (workItemId) {
-        db.prepare("UPDATE work_items SET status='back_for_review', updated_at=? WHERE id=?").run(finished, workItemId);
-        eventFor(workItemId, "agent_error", "The assignment stopped without a reviewable result.");
+        eventFor(workItemId, "technical_run_error", "The assignment stopped without a reviewable result. Durable business status was preserved.");
       }
       if (sourceRefresh) db.prepare("UPDATE source_receipts SET status='error', checked_at=?, detail='Refresh failed without affecting other sources.', error=? WHERE source=?").run(finished, error, sourceRefresh);
       if (mailMessageId && scope === "mail_draft") {
@@ -2918,7 +3015,7 @@ async function launchAgentRun({ workItemId = null, mailMessageId = null, company
     activeProcesses.delete(id);
     const finished = nowIso();
     db.prepare("UPDATE agent_runs SET status='error', error=?, updated_at=? WHERE id=?").run(error.message, finished, id);
-    if (workItemId) db.prepare("UPDATE work_items SET status='back_for_review', updated_at=? WHERE id=?").run(finished, workItemId);
+    if (workItemId) eventFor(workItemId, "technical_run_error", "The technical run failed to start. Durable business status was preserved.");
     if (sourceRefresh) db.prepare("UPDATE source_receipts SET status='error', checked_at=?, detail='Refresh failed without affecting other sources.', error=? WHERE source=?").run(finished, error.message, sourceRefresh);
     if (mailMessageId && scope === "mail_draft") db.prepare("UPDATE mail_drafts SET status='error',updated_at=? WHERE mail_message_id=?").run(finished, mailMessageId);
   });
@@ -3003,9 +3100,7 @@ async function finishMeetingProcessing({ workflow, event, sourcePath, parsed, ru
     .run(routed.storedPath, noteId, runId, finished, workflow.id);
   db.prepare("UPDATE agent_runs SET status='review',result=?,updated_at=? WHERE id=?")
     .run(`Saved “${noteTitle}” and proposed ${count} follow-up action${count === 1 ? "" : "s"}.`, finished, runId);
-  db.prepare("UPDATE work_items SET company_slug=?,status='back_for_review',summary=?,suggested_action=?,updated_at=? WHERE id=?")
-    .run(companySlug, String(parsed.summary || "The meeting transcript has been processed.").slice(0, 4000), count ? `Review ${count} proposed follow-up${count === 1 ? "" : "s"}, then finish the meeting review.` : "Review the saved meeting note, then finish the meeting review.", finished, workflow.work_item_id);
-  eventFor(workflow.work_item_id, "meeting_processed", `Saved the meeting note and proposed ${count} reviewable follow-up action${count === 1 ? "" : "s"}.`);
+  eventFor(workflow.work_item_id, "meeting_processed", `Saved the meeting note and proposed ${count} reviewable follow-up action${count === 1 ? "" : "s"}. Durable business status was preserved.`);
 }
 
 async function launchMeetingProcessing(workflow, event, sourcePath) {
@@ -3021,7 +3116,6 @@ async function launchMeetingProcessing(workflow, event, sourcePath) {
     VALUES(?,?,?,?,?,?,?,'working','','',NULL,?,'zoom-transcript-router','codex_readonly',?,?,?)`)
     .run(runId, workflow.work_item_id, meetingCompany(event.subject), "meeting_transcript", intent, `${event.subject} · Meeting follow-through`, JSON.stringify(["transcripts", "calendar", "ai_os", "project_files"]), createHash("sha256").update(`${event.graph_id}:${sourcePath}`).digest("hex").slice(0, 12), JSON.stringify({ meetingWorkflowId: workflow.id, calendarEventId: event.graph_id, transcriptPath: sourcePath }), now, now);
   db.prepare("UPDATE meeting_workflows SET state='processing',candidate_path=?,agent_run_id=?,error='',updated_at=? WHERE id=?").run(sourcePath, runId, now, workflow.id);
-  db.prepare("UPDATE work_items SET status='working',suggested_action='Command Center is processing the transcript and will return the note and proposed actions here.',updated_at=? WHERE id=?").run(now, workflow.work_item_id);
   eventFor(workflow.work_item_id, "meeting_processing", `Processing ${path.basename(sourcePath)} with the Zoom Transcript Router.`);
   const cli = await resolveCodexCli();
   const args = ["exec", "--json", "-c", 'approval_policy="never"', "-C", aiOsRoot, "--skip-git-repo-check", "--ephemeral", "-s", "read-only", "-"];
@@ -3050,7 +3144,6 @@ function failMeetingProcessing(workflow, runId, error) {
   const message = String(error?.message || error || "Meeting processing failed.").slice(0, 4000);
   db.prepare("UPDATE meeting_workflows SET state='error',error=?,updated_at=? WHERE id=?").run(message, now, workflow.id);
   db.prepare("UPDATE agent_runs SET status='error',error=?,updated_at=? WHERE id=?").run(message, now, runId);
-  db.prepare("UPDATE work_items SET status='back_for_review',suggested_action='Review the processing error, then try the transcript again.',updated_at=? WHERE id=?").run(now, workflow.work_item_id);
   eventFor(workflow.work_item_id, "meeting_processing_error", message.slice(0, 1200));
 }
 
@@ -3130,18 +3223,17 @@ async function resumeTranscriptRun(row) {
   const files = await transcriptInboxFiles();
   if (!files.length) return;
   db.prepare("UPDATE agent_runs SET status='working',waiting_reason='',updated_at=? WHERE id=?").run(nowIso(), row.id);
-  if (row.work_item_id) db.prepare("UPDATE work_items SET status='working',updated_at=? WHERE id=?").run(nowIso(), row.work_item_id);
   const promise = runFixedPowerShell(transcriptProcessScript);
   activeProcesses.set(row.id, { kill() {} });
   try {
     const output = await promise;
     const finished = nowIso();
     db.prepare("UPDATE agent_runs SET status='review',result=?,updated_at=? WHERE id=?").run(output || `Processed ${files.length} transcript file${files.length === 1 ? "" : "s"} through the Zoom Transcript Router.`, finished, row.id);
-    if (row.work_item_id) { db.prepare("UPDATE work_items SET status='back_for_review',updated_at=? WHERE id=?").run(finished, row.work_item_id); eventFor(row.work_item_id, "agent_returned", "Zoom Transcript Router completed."); }
+    if (row.work_item_id) eventFor(row.work_item_id, "technical_result_available", "Zoom Transcript Router completed. Durable business status was preserved.");
   } catch (error) {
     const finished = nowIso();
     db.prepare("UPDATE agent_runs SET status='error',error=?,updated_at=? WHERE id=?").run(error.message, finished, row.id);
-    if (row.work_item_id) db.prepare("UPDATE work_items SET status='back_for_review',updated_at=? WHERE id=?").run(finished, row.work_item_id);
+    if (row.work_item_id) eventFor(row.work_item_id, "technical_run_error", "Zoom Transcript Router failed. Durable business status was preserved.");
   } finally {
     activeProcesses.delete(row.id);
   }
@@ -3158,8 +3250,7 @@ async function launchTranscriptRoute({ item, intent, contextManifest }) {
   const waitingReason = "Download the Zoom transcript and leave the .vtt, .srt, or transcript-like .txt file in Downloads. Command Center will resume automatically.";
   db.prepare(`INSERT INTO agent_runs(id,work_item_id,company_slug,scope,intent,title,allowed_sources,status,result,error,revision_of,input_hash,skill_id,executor_type,context_manifest,waiting_reason,created_at,updated_at)
     VALUES(?,?,?,?,?,?,?,'waiting_on_user','','',NULL,?,'zoom-transcript-router','allowlisted_local_workflow',?,?,?,?)`).run(id, item.id, item.company_slug, "item", intent, `${item.title} · Zoom Transcript Router`, JSON.stringify(["transcripts", "ai_os", "project_files"]), createHash("sha256").update(intent).digest("hex").slice(0, 12), JSON.stringify(contextManifest), waitingReason, now, now);
-  db.prepare("UPDATE work_items SET status='waiting_on_user',updated_at=? WHERE id=?").run(now, item.id);
-  eventFor(item.id, "waiting_on_user", waitingReason);
+  eventFor(item.id, "technical_input_needed", waitingReason);
   const row = db.prepare("SELECT * FROM agent_runs WHERE id=?").get(id);
   if (localWorkflowsEnabled) void resumeTranscriptRun(row);
   return mapRun(row);
@@ -3234,6 +3325,201 @@ function applyCardInstruction(id, instruction) {
   return { handled: true, updated: workItemById(id), changes: parsed.changes, remainingIntent: parsed.remainingIntent, clarification: "", message, undoToken: commandId };
 }
 
+const deterministicBusinessFields = ["status", "priority", "owner", "due_at", "waiting_on", "follow_up_at", "suggested_action", "resolution", "resolved_at"];
+const directBusinessStatuses = new Set(["to_review", "waiting_on_user", "waiting_external", "needs_attention", "back_for_review", "done", "dismissed", "error"]);
+
+function deterministicSnapshot(row, fields = deterministicBusinessFields) {
+  return Object.fromEntries(fields.map((field) => [field, row[field] ?? null]));
+}
+
+function normalizedBusinessPatch(current, raw = {}) {
+  const patch = {};
+  if (raw.status !== undefined) {
+    if (!directBusinessStatuses.has(raw.status)) throw requestError("Choose a supported business status.");
+    patch.status = raw.status;
+  }
+  if (raw.priority !== undefined) {
+    if (!["urgent", "high", "normal", "low"].includes(raw.priority)) throw requestError("Choose a supported priority.");
+    patch.priority = raw.priority;
+  }
+  if (raw.owner !== undefined) patch.owner = String(raw.owner || "Jake").trim().slice(0, 160) || "Jake";
+  if (raw.waitingOn !== undefined) patch.waiting_on = String(raw.waitingOn || "").trim().slice(0, 240);
+  if (raw.followUpAt !== undefined) patch.follow_up_at = raw.followUpAt ? new Date(raw.followUpAt).toISOString() : null;
+  if (raw.dueAt !== undefined) patch.due_at = raw.dueAt ? new Date(raw.dueAt).toISOString() : null;
+  if (raw.suggestedAction !== undefined) patch.suggested_action = String(raw.suggestedAction || "").trim().slice(0, 4000);
+  if (raw.resolution !== undefined) patch.resolution = String(raw.resolution || "").trim().slice(0, 4000);
+  const nextStatus = patch.status ?? current.status;
+  const nextWaitingOn = patch.waiting_on ?? current.waiting_on;
+  if (nextStatus === "waiting_external" && !String(nextWaitingOn || "").trim()) throw requestError("Name who or what this item is waiting on.");
+  if (nextStatus !== "waiting_external" && raw.waitingOn === undefined && ["done", "dismissed"].includes(nextStatus)) patch.waiting_on = "";
+  patch.resolved_at = ["done", "dismissed"].includes(nextStatus) ? (current.resolved_at || nowIso()) : null;
+  return patch;
+}
+
+function applyBusinessPatch(workItemId, patch, timestamp = nowIso()) {
+  const entries = Object.entries(patch).filter(([field]) => deterministicBusinessFields.includes(field));
+  if (!entries.length) throw requestError("No deterministic card change was supplied.");
+  db.prepare(`UPDATE work_items SET ${entries.map(([field]) => `${field}=?`).join(",")},updated_at=? WHERE id=?`)
+    .run(...entries.map(([, value]) => value), timestamp, workItemId);
+}
+
+function applyDeterministicMutation(workItemId, body) {
+  const idempotencyKey = String(body.idempotencyKey || "").trim().slice(0, 200);
+  if (!/^[0-9a-z][0-9a-z._:-]{7,199}$/i.test(idempotencyKey)) throw requestError("A stable idempotencyKey is required.");
+  const replay = db.prepare("SELECT * FROM deterministic_mutations WHERE idempotency_key=?").get(idempotencyKey);
+  if (replay) return { mutationId: replay.id, replayed: true, updated: workItemById(replay.work_item_id), undoAvailable: replay.status === "applied" };
+  const mutationType = String(body.type || "update").trim();
+  const evidence = Array.isArray(body.evidence) ? body.evidence.slice(0, 20) : [];
+  return withImmediateTransaction(() => {
+    const current = db.prepare("SELECT * FROM work_items WHERE id=?").get(workItemId);
+    if (!current) throw requestError("Unknown work item.", 404);
+    const mutationId = randomUUID();
+    const now = nowIso();
+    let previous = {};
+    let next = {};
+
+    if (["update", "done", "dismiss", "waiting"].includes(mutationType)) {
+      const requested = { ...(body.changes || {}) };
+      if (mutationType === "done") Object.assign(requested, { status: "done", resolution: requested.resolution || "Completed from Command Center." });
+      if (mutationType === "dismiss") Object.assign(requested, { status: "dismissed", resolution: requested.resolution || "Marked not needed in Command Center." });
+      if (mutationType === "waiting") Object.assign(requested, { status: "waiting_external", waitingOn: body.waitingOn, followUpAt: body.followUpAt });
+      const patch = normalizedBusinessPatch(current, requested);
+      const fields = Object.keys(patch);
+      previous = deterministicSnapshot(current, fields);
+      if (patch.status === "done") previous.projectPlanItems = db.prepare(`SELECT p.id,p.status FROM project_plan_items p JOIN project_action_links l ON l.project_plan_item_id=p.id WHERE l.work_item_id=?`).all(workItemId);
+      applyBusinessPatch(workItemId, patch, now);
+      if (patch.status === "done") db.prepare(`UPDATE project_plan_items SET status='complete',updated_at=? WHERE id IN (SELECT project_plan_item_id FROM project_action_links WHERE work_item_id=?)`).run(now, workItemId);
+      next = { kind: "work_item", ...patch };
+    } else if (mutationType === "add_evidence") {
+      const label = String(body.label || "").trim().slice(0, 240);
+      const sourceUrl = String(body.sourceUrl || "").trim().slice(0, 2000);
+      if (!label || !/^https?:\/\//i.test(sourceUrl)) throw requestError("Add a label and a valid http(s) source link.");
+      const sourceId = randomUUID();
+      db.prepare(`INSERT INTO source_references(id,work_item_id,provider,label,source_id,source_path,source_url,retrieved_at,freshness) VALUES(?,?,?,?,?,'',?,?,?)`)
+        .run(sourceId, workItemId, String(body.provider || "manual").trim().slice(0, 80) || "manual", label, String(body.sourceId || "").trim().slice(0, 240), sourceUrl, now, "live");
+      next = { kind: "source_reference", id: sourceId };
+    } else if (mutationType === "link_duplicate") {
+      const canonicalId = String(body.canonicalWorkItemId || "").trim();
+      if (!canonicalId || canonicalId === workItemId || !db.prepare("SELECT id FROM work_items WHERE id=?").get(canonicalId)) throw requestError("Choose a different existing canonical work item.");
+      const relationshipId = randomUUID();
+      const existing = db.prepare("SELECT * FROM work_item_relationships WHERE from_work_item_id=? AND to_work_item_id=? AND relation_type='duplicates'").get(workItemId, canonicalId);
+      if (existing) throw requestError("This duplicate is already linked to that canonical item.", 409);
+      db.prepare(`INSERT INTO work_item_relationships(id,from_work_item_id,to_work_item_id,relation_type,state,rationale,evidence_json,created_by,created_at,updated_at) VALUES(?,?,?,'duplicates','confirmed',?,?,'Jake',?,?)`)
+        .run(relationshipId, workItemId, canonicalId, String(body.rationale || "Explicitly linked as a duplicate.").slice(0, 1000), JSON.stringify(evidence), now, now);
+      next = { kind: "relationship", id: relationshipId };
+    } else {
+      throw requestError("Choose a supported deterministic mutation.");
+    }
+
+    db.prepare(`INSERT INTO deterministic_mutations(id,idempotency_key,work_item_id,mutation_type,previous_json,next_json,evidence_json,status,created_at) VALUES(?,?,?,?,?,?,?,'applied',?)`)
+      .run(mutationId, idempotencyKey, workItemId, mutationType, JSON.stringify(previous), JSON.stringify(next), JSON.stringify(evidence), now);
+    eventFor(workItemId, "deterministic_mutation", `Applied ${mutationType.replaceAll("_", " ")} with verified local receipt ${mutationId}.`);
+    return { mutationId, replayed: false, updated: workItemById(workItemId), undoAvailable: true };
+  });
+}
+
+function undoDeterministicMutation(mutationId) {
+  return withImmediateTransaction(() => {
+    const mutation = db.prepare("SELECT * FROM deterministic_mutations WHERE id=?").get(mutationId);
+    if (!mutation) throw requestError("Unknown deterministic change.", 404);
+    if (mutation.status !== "applied") throw requestError("This change has already been undone.", 409);
+    const previous = jsonValue(mutation.previous_json, {});
+    const next = jsonValue(mutation.next_json, {});
+    const current = db.prepare("SELECT * FROM work_items WHERE id=?").get(mutation.work_item_id);
+    if (!current) throw requestError("The work item no longer exists.", 404);
+    if (next.kind === "work_item") {
+      for (const [field, expected] of Object.entries(next)) {
+        if (field === "kind") continue;
+        if ((current[field] ?? null) !== expected) throw requestError("The card changed after this action, so automatic Undo is no longer safe.", 409);
+      }
+      const restore = Object.fromEntries(Object.entries(previous).filter(([field]) => deterministicBusinessFields.includes(field)));
+      applyBusinessPatch(mutation.work_item_id, restore);
+      if (Array.isArray(previous.projectPlanItems)) for (const item of previous.projectPlanItems) db.prepare("UPDATE project_plan_items SET status=?,updated_at=? WHERE id=?").run(item.status, nowIso(), item.id);
+    } else if (next.kind === "source_reference") {
+      db.prepare("DELETE FROM source_references WHERE id=? AND work_item_id=?").run(next.id, mutation.work_item_id);
+    } else if (next.kind === "relationship") {
+      db.prepare("DELETE FROM work_item_relationships WHERE id=? AND from_work_item_id=?").run(next.id, mutation.work_item_id);
+    }
+    const now = nowIso();
+    db.prepare("UPDATE deterministic_mutations SET status='undone',undone_at=? WHERE id=?").run(now, mutation.id);
+    eventFor(mutation.work_item_id, "deterministic_mutation_undone", `Undid verified local receipt ${mutation.id}.`);
+    return { mutationId: mutation.id, updated: workItemById(mutation.work_item_id), message: "Restored the exact prior local state." };
+  });
+}
+
+function upsertIntelligenceReview(body) {
+  const workItemId = String(body.workItemId || "").trim();
+  const reviewKey = String(body.reviewKey || "").trim().slice(0, 200);
+  if (!workItemId || !db.prepare("SELECT id FROM work_items WHERE id=?").get(workItemId)) throw requestError("Unknown work item.", 404);
+  if (!/^[0-9a-z][0-9a-z._:-]{7,199}$/i.test(reviewKey)) throw requestError("A stable reviewKey is required.");
+  const existing = db.prepare("SELECT * FROM intelligence_reviews WHERE review_key=?").get(reviewKey);
+  if (existing) return { review: mapIntelligenceReview(existing), replayed: true };
+  const status = ["current", "new_evidence", "needs_reconciliation"].includes(body.status) ? body.status : "current";
+  const now = nowIso();
+  const id = randomUUID();
+  db.prepare(`INSERT INTO intelligence_reviews(id,review_key,work_item_id,mode,status,what_it_means,why_it_matters_now,recommended_next_move,owner_dependency,definition_of_done,evidence_json,evidence_watermark,reviewed_by,last_reconciled_at,created_at,updated_at) VALUES(?,? ,?,'shadow',?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(id, reviewKey, workItemId, status, String(body.whatItMeans || "").slice(0, 4000), String(body.whyItMattersNow || "").slice(0, 4000), String(body.recommendedNextMove || "").slice(0, 4000), String(body.ownerDependency || "").slice(0, 1000), String(body.definitionOfDone || "").slice(0, 4000), JSON.stringify(Array.isArray(body.evidence) ? body.evidence.slice(0, 50) : []), body.evidenceWatermark ? new Date(body.evidenceWatermark).toISOString() : null, String(body.reviewedBy || "Command Center CEO / PM").slice(0, 160), body.lastReconciledAt ? new Date(body.lastReconciledAt).toISOString() : null, now, now);
+  const relationships = Array.isArray(body.relationships) ? body.relationships.slice(0, 30) : [];
+  for (const relationship of relationships) {
+    const toWorkItemId = String(relationship.toWorkItemId || "").trim();
+    const relationType = String(relationship.relationType || "").trim();
+    if (!toWorkItemId || toWorkItemId === workItemId || !["part_of", "depends_on", "informs", "duplicates", "blocked_by", "supports"].includes(relationType)) continue;
+    if (!db.prepare("SELECT id FROM work_items WHERE id=?").get(toWorkItemId)) continue;
+    const state = ["proposed", "confirmed"].includes(relationship.state) ? relationship.state : "proposed";
+    db.prepare(`INSERT INTO work_item_relationships(id,from_work_item_id,to_work_item_id,relation_type,state,rationale,evidence_json,created_by,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(from_work_item_id,to_work_item_id,relation_type) DO UPDATE SET state=excluded.state,rationale=excluded.rationale,evidence_json=excluded.evidence_json,updated_at=excluded.updated_at`)
+      .run(randomUUID(), workItemId, toWorkItemId, relationType, state, String(relationship.rationale || "").slice(0, 1000), JSON.stringify(Array.isArray(relationship.evidence) ? relationship.evidence.slice(0, 20) : []), String(body.reviewedBy || "Command Center CEO / PM").slice(0, 160), now, now);
+  }
+  return { review: mapIntelligenceReview(db.prepare("SELECT * FROM intelligence_reviews WHERE id=?").get(id)), replayed: false };
+}
+
+function intelligenceReconciliationQueue() {
+  return db.prepare(`SELECT r.*,w.title,w.company_slug,w.status AS work_item_status,w.updated_at AS work_item_updated_at,c.display_name AS company_name
+    FROM intelligence_reviews r JOIN work_items w ON w.id=r.work_item_id LEFT JOIN companies c ON c.slug=w.company_slug
+    WHERE r.status IN ('new_evidence','needs_reconciliation') ORDER BY r.updated_at DESC`).all().map((row) => ({
+      ...mapIntelligenceReview(row), title: row.title, companySlug: row.company_slug, companyName: row.company_name || "Personal", businessStatus: row.work_item_status, workItemUpdatedAt: row.work_item_updated_at,
+    }));
+}
+
+function createReconciliationPacket(body) {
+  const idempotencyKey = String(body.idempotencyKey || "").trim().slice(0, 200);
+  const workItemId = String(body.workItemId || "").trim();
+  if (!/^[0-9a-z][0-9a-z._:-]{7,199}$/i.test(idempotencyKey)) throw requestError("A stable idempotencyKey is required.");
+  const existing = db.prepare("SELECT * FROM reconciliation_packets WHERE idempotency_key=?").get(idempotencyKey);
+  if (existing) return { packet: existing, replayed: true };
+  const item = db.prepare("SELECT * FROM work_items WHERE id=?").get(workItemId);
+  if (!item) throw requestError("Unknown work item.", 404);
+  normalizedBusinessPatch(item, body.proposed || {});
+  const id = randomUUID(); const now = nowIso();
+  db.prepare(`INSERT INTO reconciliation_packets(id,idempotency_key,work_item_id,intelligence_review_id,expected_updated_at,proposed_json,before_json,after_json,evidence_json,status,created_by,created_at) VALUES(?,?,?,?,?,?, '{}','{}',?,'proposed',?,?)`)
+    .run(id, idempotencyKey, workItemId, body.intelligenceReviewId || null, String(body.expectedUpdatedAt || item.updated_at), JSON.stringify(body.proposed || {}), JSON.stringify(Array.isArray(body.evidence) ? body.evidence.slice(0, 50) : []), String(body.createdBy || "Command Center CEO / PM").slice(0, 160), now);
+  return { packet: db.prepare("SELECT * FROM reconciliation_packets WHERE id=?").get(id), replayed: false };
+}
+
+function applyReconciliationPacket(packetId) {
+  const outcome = withImmediateTransaction(() => {
+    const packet = db.prepare("SELECT * FROM reconciliation_packets WHERE id=?").get(packetId);
+    if (!packet) throw requestError("Unknown reconciliation packet.", 404);
+    if (packet.status === "applied") return { packet, replayed: true, updated: workItemById(packet.work_item_id) };
+    if (packet.status !== "proposed") throw requestError("This reconciliation packet is no longer applicable.", 409);
+    const current = db.prepare("SELECT * FROM work_items WHERE id=?").get(packet.work_item_id);
+    if (current.updated_at !== packet.expected_updated_at) {
+      db.prepare("UPDATE reconciliation_packets SET status='stale' WHERE id=?").run(packet.id);
+      return { stale: true };
+    }
+    const patch = normalizedBusinessPatch(current, jsonValue(packet.proposed_json, {}));
+    const before = deterministicSnapshot(current, Object.keys(patch));
+    const now = nowIso();
+    applyBusinessPatch(current.id, patch, now);
+    db.prepare("UPDATE reconciliation_packets SET status='applied',before_json=?,after_json=?,applied_at=? WHERE id=?").run(JSON.stringify(before), JSON.stringify(patch), now, packet.id);
+    if (packet.intelligence_review_id) db.prepare("UPDATE intelligence_reviews SET status='current',last_reconciled_at=?,updated_at=? WHERE id=?").run(now, now, packet.intelligence_review_id);
+    eventFor(current.id, "ceo_reconciliation_applied", `Applied traceable CEO reconciliation packet ${packet.id}.`);
+    return { packet: db.prepare("SELECT * FROM reconciliation_packets WHERE id=?").get(packet.id), replayed: false, updated: workItemById(current.id) };
+  });
+  if (outcome.stale) throw requestError("The card changed after this reconciliation was prepared. Review the new evidence before applying it.", 409);
+  return outcome;
+}
+
 reconcileAllProjects();
 setInterval(() => reconcileAllProjects(), 60 * 60 * 1000).unref();
 
@@ -3268,6 +3554,11 @@ const server = createServer(async (request, response) => {
     }
     if (request.method === "GET" && url.pathname === "/api/bootstrap") return responseJson(response, 200, bootstrapPayload(Object.fromEntries(url.searchParams)));
     if (request.method === "GET" && url.pathname === "/api/work-items") return responseJson(response, 200, queryWorkItems(Object.fromEntries(url.searchParams)));
+    if (request.method === "GET" && url.pathname === "/api/intelligence/reconciliation") return responseJson(response, 200, intelligenceReconciliationQueue());
+    if (request.method === "POST" && url.pathname === "/api/intelligence/reviews") return responseJson(response, 201, upsertIntelligenceReview(await readJsonBody(request)));
+    if (request.method === "POST" && url.pathname === "/api/reconciliation-packets") return responseJson(response, 201, createReconciliationPacket(await readJsonBody(request)));
+    const applyReconciliationMatch = url.pathname.match(/^\/api\/reconciliation-packets\/([^/]+)\/apply$/);
+    if (request.method === "POST" && applyReconciliationMatch) return responseJson(response, 200, applyReconciliationPacket(decodeURIComponent(applyReconciliationMatch[1])));
     if (request.method === "GET" && url.pathname === "/api/projects") return responseJson(response, 200, queryProjects());
     if (request.method === "POST" && url.pathname === "/api/projects/ingest") {
       const body = await readJsonBody(request);
@@ -3520,6 +3811,16 @@ const server = createServer(async (request, response) => {
       const id = decodeURIComponent(cardCommandMatch[1]);
       const body = await readJsonBody(request);
       return responseJson(response, 200, applyCardInstruction(id, body.instruction));
+    }
+
+    const deterministicMutationMatch = url.pathname.match(/^\/api\/work-items\/([^/]+)\/mutations$/);
+    if (request.method === "POST" && deterministicMutationMatch) {
+      return responseJson(response, 200, applyDeterministicMutation(decodeURIComponent(deterministicMutationMatch[1]), await readJsonBody(request)));
+    }
+
+    const undoDeterministicMatch = url.pathname.match(/^\/api\/deterministic-mutations\/([^/]+)\/undo$/);
+    if (request.method === "POST" && undoDeterministicMatch) {
+      return responseJson(response, 200, undoDeterministicMutation(decodeURIComponent(undoDeterministicMatch[1])));
     }
 
     const undoCardCommandMatch = url.pathname.match(/^\/api\/card-commands\/([^/]+)\/undo$/);

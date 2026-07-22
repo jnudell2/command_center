@@ -56,7 +56,7 @@ export function verifiedPmName(item: CardViewItem) {
 
 export function cardState(item: CardViewItem) {
   const waitingOn = waitingOnName(item);
-  if (item.status === "back_for_review" || item.assignments?.some((assignment) => assignment.status === "completed") || item.agentRuns?.some((run) => run.status === "review")) {
+  if (item.status === "back_for_review") {
     return { label: "Ready to review", owner: "Jake", detail: "A result or artifact is ready for Jake's decision." };
   }
   if (["error", "needs_attention"].includes(item.status)) return { label: "Needs attention", owner: "Jake", detail: "Review the latest issue in History before deciding the next move." };
@@ -67,8 +67,8 @@ export function cardState(item: CardViewItem) {
     detail: waitingOn ? `${waitingOn} currently owns the next input.` : "An external input currently blocks the next move.",
   };
   const pm = verifiedPmName(item);
-  if (pm && ["queued", "working"].includes(item.status)) return { label: `With ${pm}`, owner: pm, detail: `A verified receipt shows that ${pm} currently owns the work.` };
-  if (["queued", "working"].includes(item.status)) return { label: "In progress", owner: "Current owner", detail: "Work is underway; technical lifecycle details remain in History." };
+  if (pm && ["queued", "working"].includes(item.status)) return { label: `With ${pm}`, owner: pm, detail: `A verified receipt shows that ${pm} owns the work, but the durable card state still needs reconciliation.` };
+  if (["queued", "working"].includes(item.status)) return { label: "Needs reconciliation", owner: item.owner || "Jake", detail: "This legacy technical status must be reconciled before it can be treated as a business state." };
   if (item.status === "done") return { label: "Done", owner: "Resolved", detail: "This commitment is complete." };
   if (item.status === "dismissed") return { label: "Not needed", owner: "Resolved", detail: "Jake decided this item is not needed." };
   if (item.decisionState === "proposed") return { label: "Needs decision", owner: "Jake", detail: "Jake has not yet accepted this proposed commitment." };

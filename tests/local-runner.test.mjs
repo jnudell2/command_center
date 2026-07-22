@@ -27,7 +27,7 @@ test("keeps native Codex task execution outside the Command Center runner", asyn
   assert.match(source, /existing native Codex owner remains assigned/);
 });
 
-test("preserves one assignment owner across restart and marks stale work for attention", async (t) => {
+test("preserves one assignment owner across restart and keeps technical attention off business status", async (t) => {
   const dataDir = await mkdtemp(path.join(tmpdir(), "serent-assignment-restart-"));
   const port = 45200 + Math.floor(Math.random() * 500);
   const startRunner = () => spawn(process.execPath, [fileURLToPath(new URL("../scripts/local-control-server.mjs", import.meta.url))], {
@@ -58,7 +58,7 @@ test("preserves one assignment owner across restart and marks stale work for att
   runner = startRunner();
   await waitFor(`http://127.0.0.1:${port}/api/health`);
   const restored = await (await fetch(`http://127.0.0.1:${port}/api/work-items/${item.id}`)).json();
-  assert.equal(restored.status, "needs_attention");
+  assert.equal(restored.status, "to_review");
   assert.equal(restored.assignments[0].id, prepared.assignment.id);
   assert.equal(restored.assignments[0].ownerId, "restart-owner");
   assert.equal(restored.assignments[0].status, "needs_attention");
@@ -228,15 +228,15 @@ test("migrates a fresh local store and exposes adaptive Mail contracts", async (
   assert.equal(unverifiedStart.status, 403);
   const acceptedReceipt = await (await fetch(`http://127.0.0.1:${port}/api/assignments/${preparedTask.assignment.id}/events`, { method: "POST", headers: callbackHeaders, body: JSON.stringify({ eventId: "event-accepted-1", type: "accepted", ownerId: "native-owner-1" }) })).json();
   assert.equal(acceptedReceipt.assignment.status, "accepted");
-  assert.equal((await (await fetch(`http://127.0.0.1:${port}/api/work-items/${captured.id}`)).json()).status, "queued");
+  assert.equal((await (await fetch(`http://127.0.0.1:${port}/api/work-items/${captured.id}`)).json()).status, "to_review");
   const conflictingOwner = await fetch(`http://127.0.0.1:${port}/api/assignments/${preparedTask.assignment.id}/events`, { method: "POST", headers: callbackHeaders, body: JSON.stringify({ eventId: "event-conflict-1", type: "started", ownerId: "native-owner-2" }) });
   assert.equal(conflictingOwner.status, 409);
   const startedReceipt = await (await fetch(`http://127.0.0.1:${port}/api/assignments/${preparedTask.assignment.id}/events`, { method: "POST", headers: callbackHeaders, body: JSON.stringify({ eventId: "event-started-1", type: "started", ownerId: "native-owner-1" }) })).json();
   assert.equal(startedReceipt.assignment.status, "working");
-  assert.equal((await (await fetch(`http://127.0.0.1:${port}/api/work-items/${captured.id}`)).json()).status, "working");
+  assert.equal((await (await fetch(`http://127.0.0.1:${port}/api/work-items/${captured.id}`)).json()).status, "to_review");
   const needsInput = await (await fetch(`http://127.0.0.1:${port}/api/assignments/${preparedTask.assignment.id}/events`, { method: "POST", headers: callbackHeaders, body: JSON.stringify({ eventId: "event-needs-input-1", type: "needs_input", ownerId: "native-owner-1", result: "Choose the audience." }) })).json();
   assert.equal(needsInput.assignment.status, "needs_input");
-  assert.equal((await (await fetch(`http://127.0.0.1:${port}/api/work-items/${captured.id}`)).json()).status, "waiting_on_user");
+  assert.equal((await (await fetch(`http://127.0.0.1:${port}/api/work-items/${captured.id}`)).json()).status, "to_review");
   const conflictingPreparation = await fetch(`http://127.0.0.1:${port}/api/work-items/${captured.id}/instructions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ mode: "separate_task", instruction: "Start different work." }) });
   assert.equal(conflictingPreparation.status, 409);
   const completedBody = JSON.stringify({ eventId: "event-completed-1", type: "completed", ownerId: "native-owner-1", result: "Kickoff brief ready for review." });
@@ -245,7 +245,7 @@ test("migrates a fresh local store and exposes adaptive Mail contracts", async (
   const replay = await (await fetch(`http://127.0.0.1:${port}/api/assignments/${preparedTask.assignment.id}/events`, { method: "POST", headers: callbackHeaders, body: completedBody })).json();
   assert.equal(replay.replayed, true);
   const returnedCard = await (await fetch(`http://127.0.0.1:${port}/api/work-items/${captured.id}`)).json();
-  assert.equal(returnedCard.status, "back_for_review");
+  assert.equal(returnedCard.status, "to_review");
   assert.equal(returnedCard.assignments[0].result, "Kickoff brief ready for review.");
   const legacyCallback = await fetch(`http://127.0.0.1:${port}/api/codex-tasks/legacy/callback`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
   assert.equal(legacyCallback.status, 410);
@@ -262,7 +262,7 @@ test("migrates a fresh local store and exposes adaptive Mail contracts", async (
   await fetch(`http://127.0.0.1:${port}/api/assignments/${failedPrepared.assignment.id}/events`, { method: "POST", headers: failedPrepared.callbackHeaders, body: JSON.stringify({ eventId: "failure-started", type: "started", ownerId: "failure-owner" }) });
   const failedReceipt = await (await fetch(`http://127.0.0.1:${port}/api/assignments/${failedPrepared.assignment.id}/events`, { method: "POST", headers: failedPrepared.callbackHeaders, body: JSON.stringify({ eventId: "failure-terminal", type: "failed", ownerId: "failure-owner", error: "Deterministic QA failure." }) })).json();
   assert.equal(failedReceipt.assignment.status, "failed");
-  assert.equal((await (await fetch(`http://127.0.0.1:${port}/api/work-items/${failedItem.id}`)).json()).status, "error");
+  assert.equal((await (await fetch(`http://127.0.0.1:${port}/api/work-items/${failedItem.id}`)).json()).status, "to_review");
 
   const cancelledItem = await createScenarioItem("assignment-cancel-scenario", "Assignment cancellation scenario");
   const cancelledPrepared = await prepareScenario(cancelledItem.id, "Prepare but do not start.", "separate_task");
