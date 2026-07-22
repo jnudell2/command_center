@@ -60,23 +60,16 @@ function relationLabel(relationship: RelationshipView) {
 }
 
 export function CEORead({ review, relationships, onOpenWorkItem }: { review: IntelligenceReviewView | null; relationships: RelationshipView[]; onOpenWorkItem: (id: string) => void }) {
-  if (!review) {
-    return (
-      <section className="ceo-read ceo-read-empty" aria-labelledby="ceo-read-heading">
-        <header><div><span className="eyebrow">CEO READ</span><h3 id="ceo-read-heading">No shadow review yet</h3></div><span className="semantic-chip chip-neutral">Read only</span></header>
-        <p>The durable card remains the source of truth. The CEO / PM can add a cited shadow read during reconciliation.</p>
-      </section>
-    );
-  }
+  if (!review) return null;
   const needsAttention = review.status !== "current";
   return (
     <section className={`ceo-read ceo-read-${review.status}`} aria-labelledby="ceo-read-heading">
       <header>
-        <div><span className="eyebrow">CEO READ · SHADOW</span><h3 id="ceo-read-heading">{review.whatItMeans || "Review the connected evidence"}</h3></div>
+        <div><span className="eyebrow">CURRENT READ</span><h3 id="ceo-read-heading">{review.whatItMeans || "Review the connected evidence"}</h3><small>{review.reviewedBy || "CEO / PM"} read · read-only</small></div>
         <span className={`semantic-chip ${needsAttention ? "chip-reconciliation" : "chip-fresh"}`}>{review.status === "new_evidence" ? "New evidence" : review.status === "needs_reconciliation" ? "Needs reconciliation" : "Current"}</span>
       </header>
       <div className="ceo-read-grid">
-        <div className="ceo-read-lead"><span>Recommended next move</span><strong>{review.recommendedNextMove || "No recommendation recorded."}</strong></div>
+        <div className="ceo-read-lead"><span>Your next move</span><strong>{review.recommendedNextMove || "No recommendation recorded."}</strong></div>
         <dl>
           <div><dt>Why now</dt><dd>{review.whyItMattersNow || "No timing judgment recorded."}</dd></div>
           <div><dt>Owner / dependency</dt><dd>{review.ownerDependency || "Not reconciled"}</dd></div>

@@ -41,15 +41,15 @@ test("defines the connective-tissue navigation and simplified card contract", as
     assert.doesNotMatch(page, new RegExp(removed, "i"));
   }
 
-  for (const label of ["What needs to happen", "Why it matters", "Current state", "Relevant context", "Working area", "Audit trail and receipts"]) {
+  for (const label of ["Current read", "Your next move", "Why now", "Evidence &amp; related work", "Working notes", "Card details", "Activity and technical receipts"]) {
     assert.match(page, new RegExp(label, "i"));
   }
-  for (const control of ["Done", "Card due date", "Waiting on…", "Ready to review", "Not needed"]) {
+  for (const control of ["Card due date", "Card business status", "Edit waiting dependency", "Add evidence", "Not needed"]) {
     assert.match(page, new RegExp(control, "i"));
   }
-  assert.match(page, /<details className="card-section card-history">/);
-  assert.doesNotMatch(page, /<details className="card-section card-history" open/);
-  assert.match(page, /selected\.sources\.slice\(0, 3\)/);
+  assert.match(page, /<details className="card-section card-history activity-receipts">/);
+  assert.doesNotMatch(page, /<details className="card-section optional-workspace" open/);
+  assert.match(page, /executiveRead\.evidence\.map/);
   assert.match(page, /selected\.events\.map/);
   assert.match(page, /selected\.assignments\.map/);
   assert.match(page, /nextAction\(item\)/);
@@ -90,11 +90,12 @@ test("defines the connective-tissue navigation and simplified card contract", as
 });
 
 test("defines deterministic autonomy, CEO intelligence shadow, and the UI system", async () => {
-  const [page, styles, runner, cardView, ceoRead, uiLab, capabilityContract, checkpoint] = await Promise.all([
+  const [page, styles, runner, cardView, executiveRead, ceoRead, uiLab, capabilityContract, checkpoint] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
     readFile(new URL("../scripts/local-control-server.mjs", import.meta.url), "utf8"),
     readFile(new URL("../app/card-view-model.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/executive-card-read.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/ceo-read.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/ui-lab.tsx", import.meta.url), "utf8"),
     readFile(new URL("../docs/command-center-capability-contract-v2.md", import.meta.url), "utf8"),
@@ -111,8 +112,12 @@ test("defines deterministic autonomy, CEO intelligence shadow, and the UI system
   assert.doesNotMatch(cardView, /item\.assignments\?\.some\(\(assignment\) => assignment\.status === "completed"\)/);
   assert.match(cardView, /legacy technical status must be reconciled/i);
 
-  for (const label of ["CEO READ · SHADOW", "Recommended next move", "Owner / dependency", "Done when", "Connected work", "Evidence and freshness", "Last reconciled"]) assert.match(ceoRead, new RegExp(label, "i"));
-  assert.match(page, /<CEORead review=\{selected\.intelligenceReview\}/);
+  for (const label of ["CURRENT READ", "Your next move", "Owner / dependency", "Done when", "Connected work", "Evidence and freshness", "Last reconciled"]) assert.match(ceoRead, new RegExp(label, "i"));
+  assert.match(ceoRead, /if \(!review\) return null/);
+  assert.doesNotMatch(page, /<CEORead review=/);
+  assert.match(executiveRead, /buildExecutiveCardRead/);
+  assert.match(executiveRead, /Card says .*newer evidence proposes/);
+  assert.match(page, /className="reconciliation-alert"/);
   assert.match(page, /className="reconciliation-queue"/);
   assert.match(page, /className="insight-indicator"/);
   assert.match(page, /Committed task captured locally\. No agent was involved\./);
@@ -126,7 +131,7 @@ test("defines deterministic autonomy, CEO intelligence shadow, and the UI system
   assert.match(page, /addEvidenceLink/);
   assert.match(page, /linkCanonicalDuplicate/);
 
-  for (const galleryArea of ["Foundations", "Collapsed commitments", "Direct controls", "Semantic states", "CEO Read and connected evidence", "System states", "Workspace navigation", "Expanded-card hierarchy"]) assert.match(uiLab, new RegExp(galleryArea, "i"));
+  for (const galleryArea of ["Foundations", "Collapsed commitments", "Direct controls", "Semantic states", "Current read and connected evidence", "System states", "Workspace navigation", "Expanded-card hierarchy"]) assert.match(uiLab, new RegExp(galleryArea, "i"));
   for (const workspace of ["Mail", "Calendar", "Projects", "Documents", "Transcripts", "Notes", "Companies", "Search", "Learning & sources"]) assert.match(uiLab, new RegExp(workspace, "i"));
   assert.match(styles, /--cc-space-1:/);
   assert.match(styles, /--cc-reconcile:/);
@@ -135,5 +140,7 @@ test("defines deterministic autonomy, CEO intelligence shadow, and the UI system
   assert.match(styles, /\.workspace-switcher > button[\s\S]*min-height: 40px/);
   assert.match(styles, /\.ui-lab\s*\{/);
   assert.match(styles, /\.ceo-read\s*\{/);
+  assert.match(styles, /\.decision-header\s*\{/);
+  assert.match(styles, /\.reconciliation-alert\s*\{/);
   assert.match(styles, /\.reconciliation-queue\s*\{/);
 });

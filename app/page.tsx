@@ -7,10 +7,11 @@ import MarkdownEditor from "./markdown-editor";
 import ProjectWorkspace from "./project-workspace";
 import TranscriptWorkspace from "./transcript-workspace";
 import { type Assignment } from "./card-workbench-model";
-import { cardState as simplifiedCardState, contextKind, definitionOfDone, nextAction, showPriority, workingSurface as simplifiedWorkingSurface } from "./card-view-model";
+import { cardState as simplifiedCardState, nextAction, showPriority, workingSurface as simplifiedWorkingSurface } from "./card-view-model";
 import { dueDateEndOfLocalDayIso, dueDateInputValue } from "./due-date";
 import { workViewFor, workViews, type WorkView } from "./work-view";
-import { CEORead, type IntelligenceReviewView, type RelationshipView } from "./ceo-read";
+import { type IntelligenceReviewView, type RelationshipView } from "./ceo-read";
+import { buildExecutiveCardRead } from "./executive-card-read";
 import { UILab } from "./ui-lab";
 
 type WorkStatus =
@@ -340,6 +341,8 @@ export default function Home() {
   const [typeFilter, setTypeFilter] = useState("all");
   const [priorityFilter, setPriorityFilter] = useState("all");
   const [mobileWorkbenchOpen, setMobileWorkbenchOpen] = useState(false);
+  const [cardEditItemId, setCardEditItemId] = useState("");
+  const [detailAnchor] = useState(() => new Date());
   const [quickCapture, setQuickCapture] = useState("");
   const [draft, setDraft] = useState("");
   const [draftItemId, setDraftItemId] = useState("");
@@ -519,8 +522,9 @@ export default function Home() {
   const selectedPool = view === "inbox" ? filteredItems : items;
   const effectiveSelectedId = selectedPool.some((item) => item.id === selectedId) ? selectedId : selectedPool[0]?.id || "";
   const selected = items.find((item) => item.id === effectiveSelectedId) || null;
+  const executiveRead = selected ? buildExecutiveCardRead(selected, detailAnchor) : null;
+  const cardEditOpen = Boolean(selected && cardEditItemId === selected.id);
   const selectedWorkingSurface = selected ? simplifiedWorkingSurface(selected) : null;
-  const selectedState = selected ? simplifiedCardState(selected) : null;
   const selectedLatestResult = selected?.agentRuns.filter((run) => ["review", "error"].includes(run.status)).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0] || null;
   const selectedLatestAssignment = selected?.assignments.filter((assignment) => ["completed", "failed", "needs_input", "needs_attention"].includes(assignment.status)).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0] || null;
   const selectedMeetingId = selected?.type === "meeting_follow_up" ? selected.id : "";
@@ -1068,58 +1072,49 @@ export default function Home() {
       </section>
 
       <aside className={mobileWorkbenchOpen ? "workbench mobile-open" : "workbench"} data-company={selected?.companySlug || "unassigned"}>
-        {view === "inbox" && selected ? (
+        {view === "inbox" && selected && executiveRead ? (
           <>
             <button className="mobile-close" type="button" onClick={() => setMobileWorkbenchOpen(false)}>← Back to Open Work</button>
-            <header className="workbench-header">
-              <div><span className="company-badge">{selected.companyName || "Personal"}</span><span className={`state-pill state-${workViewFor(selected)}`}>{selectedState?.label}</span>{showPriority(selected.priority) ? <span className={`priority priority-${selected.priority}`}>{selected.priority}</span> : null}</div>
+            <header className="decision-header">
+              <div className="decision-header-meta"><span className="company-badge">{selected.companyName || "Personal"}</span><span className={`state-pill state-${workViewFor(selected)}`}>{executiveRead.stateLabel}</span><span className={`detail-risk due-${dueBucketFor(selected, detailAnchor)}`}>{dueLabel(selected, detailAnchor)}</span></div>
+              <div className="decision-header-actions"><button className="edit-card-trigger" type="button" aria-expanded={cardEditOpen} onClick={() => setCardEditItemId(cardEditOpen ? "" : selected.id)}>{cardEditOpen ? "Close edit" : "Edit"}</button><details className="card-overflow"><summary aria-label="More card actions">…</summary><div>{selected.sources.find((source) => source.sourceUrl) ? <a href={selected.sources.find((source) => source.sourceUrl)!.sourceUrl} target="_blank" rel="noreferrer">Open source</a> : null}<button type="button" onClick={() => void createContextNote()}>Add contextual note</button></div></details></div>
               <h2>{selected.title}</h2>
             </header>
 
-            <section className="card-section card-needs">
-              <div className="card-section-heading"><span>1</span><div><p>What needs to happen</p><h3>The next move</h3></div></div>
-              <dl className="card-definition-list"><div><dt>Next</dt><dd>{nextAction(selected)}</dd></div><div><dt>Done when</dt><dd>{definitionOfDone(selected)}</dd></div></dl>
-              <div className="card-edit-row">
-                <label htmlFor={`card-due-date-${selected.id}`}>Change due date<input id={`card-due-date-${selected.id}`} aria-label="Card due date" type="date" value={dueDateInputValue(selected.dueAt)} disabled={busy} onChange={(event) => { const localDate = event.target.value; void mutateSelected("update", { changes: { dueAt: dueDateEndOfLocalDayIso(localDate) } }, localDate ? `Due date set to ${localDate}.` : "Due date cleared."); }} /></label>
+            {cardEditOpen ? <section className="card-edit-panel" aria-label="Edit card">
+              <header><div><span className="eyebrow">CARD ADMINISTRATION</span><h3>Edit durable fields</h3></div><button type="button" onClick={() => setCardEditItemId("")}>Done editing</button></header>
+              <div className="card-edit-fields">
+                <label htmlFor={`card-due-date-${selected.id}`}>Due date<input id={`card-due-date-${selected.id}`} aria-label="Card due date" type="date" value={dueDateInputValue(selected.dueAt)} disabled={busy} onChange={(event) => { const localDate = event.target.value; void mutateSelected("update", { changes: { dueAt: dueDateEndOfLocalDayIso(localDate) } }, localDate ? `Due date set to ${localDate}.` : "Due date cleared."); }} /></label>
                 <label>Priority<select aria-label="Card priority" value={selected.priority} disabled={busy} onChange={(event) => void mutateSelected("update", { changes: { priority: event.target.value } }, `Priority changed to ${event.target.value}.`)}><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label>
-                {selected.dueAt ? <button className="text-action" type="button" disabled={busy} onClick={() => void mutateSelected("update", { changes: { dueAt: null } }, "Due date cleared.")}>Clear date</button> : null}
-              </div>
-            </section>
-
-            <section className="card-section">
-              <div className="card-section-heading"><span>2</span><div><p>Why it matters</p><h3>{selected.projectContext?.projectTitle || selected.companyName || "Personal commitment"}</h3></div></div>
-              <p className="card-section-copy">{selected.whyNow || selected.summary}</p>
-              {selected.summary && selected.summary !== selected.whyNow ? <p className="card-section-copy secondary-copy">{selected.summary}</p> : null}
-              {selected.projectContext ? <button className="project-context-link" type="button" onClick={() => { setCompanyFilter(selected.companySlug || "all"); setView("projects"); }}><span>PROJECT</span><strong>{selected.projectContext.workstream}</strong><small>{selected.projectContext.phaseTitle}</small></button> : null}
-            </section>
-
-            <section className="card-section card-current-state">
-              <div className="card-section-heading"><span>3</span><div><p>Current state</p><h3>{selectedState?.label}</h3></div></div>
-              <div className="current-owner"><strong>{selectedState?.owner}</strong><p>{selectedState?.detail}</p>{selected.waitingOn ? <small>Dependency: {selected.waitingOn}{selected.followUpAt ? ` · Follow up ${new Date(selected.followUpAt).toLocaleDateString()}` : ""}</small> : null}</div>
-              {selectedLatestAssignment || selectedLatestResult ? <div className="latest-review technical-evidence"><strong>Technical evidence · does not change business state</strong><p>{selectedLatestAssignment?.result || selectedLatestAssignment?.error || selectedLatestResult?.result || selectedLatestResult?.error}</p></div> : null}
-              <div className="direct-edit-grid">
                 <label>Owner<input key={`owner-${selected.id}-${selected.owner}`} aria-label="Card owner" defaultValue={selected.owner || "Jake"} disabled={busy} onBlur={(event) => { const owner = event.currentTarget.value.trim() || "Jake"; if (owner !== selected.owner) void mutateSelected("update", { changes: { owner } }, `Owner changed to ${owner}.`); }} /></label>
-                <label>Business status<select aria-label="Card business status" value={directBusinessStatusValue(selected.status)} disabled={busy} onChange={(event) => { if (event.target.value === "waiting_external") { setWaitingItemId(selected.id); setWaitingFor(selected.waitingOn || ""); setWaitingFollowUp(dueDateInputValue(selected.followUpAt)); } else void mutateSelected("update", { changes: { status: event.target.value } }, "Business status updated."); }}><option value="to_review">Open</option><option value="waiting_on_user">Waiting on Jake</option><option value="waiting_external">Waiting on someone</option><option value="back_for_review">Ready for Jake</option><option value="needs_attention">Needs attention</option><option value="done">Done</option><option value="dismissed">Not needed</option>{["queued", "working"].includes(selected.status) ? <option value={selected.status}>Legacy · needs reconciliation</option> : null}</select></label>
+                <label>Status<select aria-label="Card business status" value={directBusinessStatusValue(selected.status)} disabled={busy} onChange={(event) => { if (event.target.value === "waiting_external") { setWaitingItemId(selected.id); setWaitingFor(selected.waitingOn || ""); setWaitingFollowUp(dueDateInputValue(selected.followUpAt)); } else void mutateSelected("update", { changes: { status: event.target.value } }, "Business status updated."); }}><option value="to_review">Open</option><option value="waiting_on_user">Waiting on Jake</option><option value="waiting_external">Waiting on someone</option><option value="back_for_review">Ready for Jake</option><option value="needs_attention">Needs attention</option><option value="done">Done</option><option value="dismissed">Not needed</option>{["queued", "working"].includes(selected.status) ? <option value={selected.status}>Legacy · needs reconciliation</option> : null}</select></label>
               </div>
-              <div className="card-primary-controls">
-                {!['done','dismissed'].includes(selected.status) ? <button type="button" disabled={busy} onClick={() => void mutateSelected("done", {}, "Marked done.")}>Done</button> : null}
-                <button className="secondary" type="button" disabled={busy} onClick={() => { setWaitingItemId(selected.id); setWaitingFor(selected.waitingOn || ""); setWaitingFollowUp(dueDateInputValue(selected.followUpAt)); }}>Waiting on…</button>
-                <button className="secondary" type="button" disabled={busy} onClick={() => void mutateSelected("update", { changes: { status: "back_for_review" } }, "Marked ready for Jake's review.")}>Ready to review</button>
-                {!['done','dismissed'].includes(selected.status) ? <button className="secondary" type="button" disabled={busy} onClick={() => void mutateSelected("dismiss", {}, "Marked not needed.")}>Not needed</button> : null}
-              </div>
-              {waitingItemId === selected.id ? <form className="waiting-editor" onSubmit={(event) => { event.preventDefault(); void markWaiting(); }}><label htmlFor={`waiting-on-${selected.id}`}>Who or what are you waiting on?</label><div><input id={`waiting-on-${selected.id}`} autoFocus value={waitingFor} onChange={(event) => setWaitingFor(event.target.value)} placeholder="Kyle, customer data, legal review…" /><label htmlFor={`waiting-follow-up-${selected.id}`}>Follow up<input id={`waiting-follow-up-${selected.id}`} type="date" value={waitingFollowUp} onChange={(event) => setWaitingFollowUp(event.target.value)} /></label><button type="submit" disabled={busy || !waitingFor.trim()}>Save</button><button className="secondary" type="button" onClick={() => { setWaitingItemId(""); setWaitingFor(""); setWaitingFollowUp(""); }}>Cancel</button></div></form> : null}
+              <button className="waiting-detail-trigger" type="button" onClick={() => { setWaitingItemId(selected.id); setWaitingFor(selected.waitingOn || ""); setWaitingFollowUp(dueDateInputValue(selected.followUpAt)); }}>Edit waiting dependency and follow-up</button>
+              {waitingItemId === selected.id ? <form className="waiting-editor" onSubmit={(event) => { event.preventDefault(); void markWaiting(); }}><label htmlFor={`waiting-on-${selected.id}`}>Who or what are you waiting on?</label><div><input id={`waiting-on-${selected.id}`} autoFocus value={waitingFor} onChange={(event) => setWaitingFor(event.target.value)} placeholder="Kyle, customer data, legal review…" /><label htmlFor={`waiting-follow-up-${selected.id}`}>Follow up<input id={`waiting-follow-up-${selected.id}`} type="date" value={waitingFollowUp} onChange={(event) => setWaitingFollowUp(event.target.value)} /></label><button type="submit" disabled={busy || !waitingFor.trim()}>Save waiting state</button><button className="secondary" type="button" onClick={() => { setWaitingItemId(""); setWaitingFor(""); setWaitingFollowUp(""); }}>Cancel</button></div></form> : null}
+              <details className="add-evidence-disclosure"><summary>Add evidence</summary><form className="add-evidence-form" onSubmit={(event) => { event.preventDefault(); void addEvidenceLink(); }}><label>Label<input value={evidenceLabel} onChange={(event) => setEvidenceLabel(event.target.value)} placeholder="Kickoff deck commitment" /></label><label>URL<input type="url" value={evidenceUrl} onChange={(event) => setEvidenceUrl(event.target.value)} placeholder="https://…" /></label><button type="submit" disabled={busy || !evidenceLabel.trim() || !evidenceUrl.trim()}>Add locally</button></form></details>
+            </section> : null}
+
+            <section className="decision-section current-read" aria-labelledby="current-read-heading">
+              <header><span className="decision-label">Current read</span>{executiveRead.authorityMeta ? <small>{executiveRead.authorityMeta}</small> : null}</header>
+              <h3 id="current-read-heading">{executiveRead.currentTruth}</h3>
+              {executiveRead.artifactLabel ? <div className="material-result"><span>Reviewable artifact</span><strong>{executiveRead.artifactLabel}</strong>{executiveRead.materialConclusion ? <p>{executiveRead.materialConclusion}</p> : null}</div> : null}
             </section>
 
-            <CEORead review={selected.intelligenceReview} relationships={selected.relationships} onOpenWorkItem={(id) => { setSelectedId(id); setMobileWorkbenchOpen(true); }} />
+            <section className="decision-section next-move" aria-labelledby="next-move-heading">
+              <span className="decision-label">Your next move</span>
+              <h3 id="next-move-heading">{executiveRead.nextMove}</h3>
+              <dl className="next-move-facts"><div><dt>Actor</dt><dd>{executiveRead.actor}</dd></div><div><dt>Dependency</dt><dd>{executiveRead.dependency}</dd></div><div><dt>By when</dt><dd>{executiveRead.timing}</dd></div></dl>
+              <p className="done-condition"><span>Done when</span>{executiveRead.doneWhen}</p>
+            </section>
 
-            <section className="card-section card-context">
-              <div className="card-section-heading"><span>4</span><div><p>Relevant context</p><h3>{contextKind(selected)}</h3></div></div>
-              {activeMeetingWorkflow?.event ? <dl className="context-facts"><div><dt>Date</dt><dd>{fullDate(activeMeetingWorkflow.event.startAt)}</dd></div><div><dt>Attendees</dt><dd>{activeMeetingWorkflow.event.attendees.map((attendee) => attendee.name || attendee.email).filter(Boolean).join(", ") || "Not listed"}</dd></div></dl> : null}
-              {selected.sources[0]?.sourceUrl ? <a className="card-source-primary" href={selected.sources[0].sourceUrl} target="_blank" rel="noreferrer">Open source/context</a> : null}
-              <div className="context-links">{selected.sources.slice(0, 3).map((source) => source.sourceUrl ? <a href={source.sourceUrl} target="_blank" rel="noreferrer" key={source.id}>Open {source.label || source.provider}</a> : <span key={source.id} title={source.sourcePath}>{source.label || source.provider}</span>)}</div>
-              {selected.notes.slice(0, 2).map((note) => <button className="linked-note" key={note.id} type="button" onClick={() => void selectNote(note).then(() => setView("notes"))}><strong>{note.title}</strong><span>{note.body.slice(0, 100) || "Empty note"}</span></button>)}
-              {!selected.sources.length && !selected.notes.length && !selected.projectContext ? <p className="muted-copy">No linked source has been added yet.</p> : null}
-              <form className="add-evidence-form" onSubmit={(event) => { event.preventDefault(); void addEvidenceLink(); }}><strong>Add evidence link</strong><label>Label<input value={evidenceLabel} onChange={(event) => setEvidenceLabel(event.target.value)} placeholder="Kickoff deck commitment" /></label><label>URL<input type="url" value={evidenceUrl} onChange={(event) => setEvidenceUrl(event.target.value)} placeholder="https://…" /></label><button type="submit" disabled={busy || !evidenceLabel.trim() || !evidenceUrl.trim()}>Add locally</button></form>
+            {executiveRead.contradictions.length ? <section className="reconciliation-alert" role="status" aria-labelledby="reconciliation-alert-heading"><header><span>Needs reconciliation</span><strong id="reconciliation-alert-heading">The card and newer evidence do not agree.</strong></header><ul>{executiveRead.contradictions.map((contradiction) => <li key={contradiction}>{contradiction}</li>)}</ul></section> : null}
+
+            <section className="decision-section why-now" aria-labelledby="why-now-heading"><span className="decision-label">Why now</span><h3 id="why-now-heading">{executiveRead.whyNow}</h3></section>
+
+            <section className="decision-section evidence-related" aria-labelledby="evidence-related-heading">
+              <span className="decision-label" id="evidence-related-heading">Evidence &amp; related work</span>
+              <div className="evidence-related-grid"><div><h4>Evidence</h4>{executiveRead.evidence.length ? executiveRead.evidence.map((evidence) => evidence.url ? <a className="evidence-row" href={evidence.url} target="_blank" rel="noreferrer" key={evidence.key}><strong>{evidence.label}</strong><span>{evidence.meta}</span></a> : <div className="evidence-row" key={evidence.key}><strong>{evidence.label}</strong><span>{evidence.meta}</span></div>) : <p>No linked evidence yet.</p>}</div><div><h4>Related work</h4>{executiveRead.relatedWork.length ? executiveRead.relatedWork.map((related) => related.workItemId ? <button className="related-work-row" type="button" key={related.key} onClick={() => { setSelectedId(related.workItemId); setMobileWorkbenchOpen(true); }}><strong>{related.label}</strong><span>{related.relation}</span></button> : <button className="related-work-row" type="button" key={related.key} onClick={() => { setCompanyFilter(selected.companySlug || "all"); setView("projects"); }}><strong>{related.label}</strong><span>{related.relation}</span></button>) : <p>No related work linked.</p>}</div></div>
+              {activeMeetingWorkflow?.event ? <dl className="meeting-evidence-facts"><div><dt>Meeting</dt><dd>{fullDate(activeMeetingWorkflow.event.startAt)}</dd></div><div><dt>Attendees</dt><dd>{activeMeetingWorkflow.event.attendees.map((attendee) => attendee.name || attendee.email).filter(Boolean).join(", ") || "Not listed"}</dd></div></dl> : null}
             </section>
 
             {selected.type === "meeting_follow_up" ? <section className="meeting-followthrough" aria-live="polite">
@@ -1145,23 +1140,29 @@ export default function Home() {
               </> : null}
             </section> : null}
 
-            <details className="card-section optional-workspace" open={Boolean(visibleDraft)}>
-              <summary><span className="section-number">5</span><span><small>Working area</small>{selectedWorkingSurface?.label || "Working notes"}</span></summary>
+            <details className="card-section optional-workspace">
+              <summary><span><small>Working notes</small>{selectedWorkingSurface?.label || "Working notes"}</span></summary>
               <textarea className="draft-editor" value={visibleDraft} onChange={(event) => { setDraftItemId(selected.id); setDraft(event.target.value); }} placeholder={selectedWorkingSurface?.placeholder || "Capture optional working notes..."} aria-label={selectedWorkingSurface?.label || "Working notes"} />
               <div className="inline-actions"><button type="button" disabled={busy || !visibleDraft.trim()} onClick={() => void patchItem({ draft: visibleDraft, eventDetail: `${selectedWorkingSurface?.label || "Working notes"} updated.` })}>Save to card</button></div>
               <small className="approval-copy">This stays on the card and is not sent anywhere.</small>
             </details>
 
-            <details className="card-section card-history">
-              <summary><span className="section-number">6</span><span><small>History</small>Audit trail and receipts</span></summary>
-              <div className="source-chips">{selected.sources.map((source) => source.sourceUrl ? <a href={source.sourceUrl} target="_blank" rel="noreferrer" key={source.id}>{source.provider} · {source.freshness}</a> : <span key={source.id} title={source.sourcePath}>{source.provider} · {source.freshness}</span>)}</div>
+            <details className="card-section card-details">
+              <summary><span><small>Administration</small>Card details</span></summary>
+              <dl className="card-detail-facts"><div><dt>Status</dt><dd>{executiveRead.stateLabel}</dd></div><div><dt>Owner</dt><dd>{selected.owner || "Jake"}</dd></div><div><dt>Priority</dt><dd>{selected.priority}</dd></div><div><dt>Due</dt><dd>{dueLabel(selected, detailAnchor)}</dd></div><div><dt>Type</dt><dd>{selected.type.replaceAll("_", " ")}</dd></div><div><dt>Sources</dt><dd>{selected.sources.length}</dd></div></dl>
+              <p className="card-detail-summary">{selected.summary}</p>
+              <details className="canonical-link-control"><summary>Link an explicit duplicate</summary><p>This records a canonical relationship only. It does not dismiss or merge either card.</p><form onSubmit={(event) => { event.preventDefault(); void linkCanonicalDuplicate(); }}><label>Canonical work-item ID<input value={canonicalWorkItemId} onChange={(event) => setCanonicalWorkItemId(event.target.value)} placeholder="Existing work-item ID" /></label><button type="submit" disabled={busy || !canonicalWorkItemId.trim()}>Confirm link</button></form></details>
+            </details>
+
+            <details className="card-section card-history activity-receipts">
+              <summary><span><small>Audit</small>Activity and technical receipts</span></summary>
+              {selectedLatestAssignment || selectedLatestResult ? <div className="activity-material"><strong>{selectedLatestAssignment?.status === "completed" || selectedLatestResult?.status === "review" ? "New evidence" : "Activity receipt"}</strong><p>{selectedLatestAssignment?.result || selectedLatestAssignment?.error || selectedLatestResult?.result || selectedLatestResult?.error}</p></div> : null}
+              <div className="source-chips">{selected.sources.map((source) => source.sourceUrl ? <a href={source.sourceUrl} target="_blank" rel="noreferrer" key={source.id}>{source.provider} · {source.freshness}</a> : <span key={source.id}>{source.provider} · {source.freshness}</span>)}</div>
               <ol className="history-list">{selected.events.map((event) => <li key={event.id}><span>{event.type.replaceAll("_", " ")}</span><p>{event.detail}</p><time>{fullDate(event.createdAt)}</time></li>)}</ol>
               {selected.assignments.length ? <div className="audit-group"><h4>Assignment receipts</h4>{selected.assignments.map((assignment) => <article key={assignment.id}><strong>{assignment.status.replaceAll("_", " ")}</strong><span>{assignment.ownerId || "No owner"}</span><p>{assignment.result || assignment.error || assignment.instruction}</p><small>{fullDate(assignment.updatedAt)}</small></article>)}</div> : null}
               {selected.agentRuns.length ? <div className="audit-group"><h4>Native work history</h4>{selected.agentRuns.map((run) => <article key={run.id}><strong>{run.status.replaceAll("_", " ")}</strong><p>{run.result || run.error || run.waitingReason || run.intent}</p><small>{fullDate(run.updatedAt)}</small></article>)}</div> : null}
               {selected.codexTasks.length ? <div className="audit-group"><h4>Legacy task receipts</h4>{selected.codexTasks.map((task) => <article key={task.id}><strong>{task.title}</strong><span>{task.status.replaceAll("_", " ")}</span><p>{task.result || task.error || task.instruction}</p></article>)}</div> : null}
               {selected.externalActions.length ? <div className="audit-group"><h4>System receipts</h4>{selected.externalActions.map((action) => <article key={action.id}><strong>{action.provider} · {action.actionType.replaceAll("_", " ")}</strong><span>{action.status}</span><p>{action.receipt || action.error || action.targetId}</p></article>)}</div> : null}
-              <details className="canonical-link-control"><summary>Link an explicit duplicate</summary><p>This records a canonical relationship only. It does not dismiss or merge either card.</p><form onSubmit={(event) => { event.preventDefault(); void linkCanonicalDuplicate(); }}><label>Canonical work-item ID<input value={canonicalWorkItemId} onChange={(event) => setCanonicalWorkItemId(event.target.value)} placeholder="Existing work-item ID" /></label><button type="submit" disabled={busy || !canonicalWorkItemId.trim()}>Confirm link</button></form></details>
-              <button className="text-action" type="button" onClick={() => void createContextNote()}>+ Add contextual note</button>
             </details>
           </>
         ) : (
