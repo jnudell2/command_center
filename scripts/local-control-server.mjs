@@ -309,6 +309,27 @@ const schemaStatements = [
     updated_at TEXT NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS calendar_start_idx ON calendar_events(start_at ASC)`,
+  `CREATE TABLE IF NOT EXISTS calendar_work_blocks (
+    id TEXT PRIMARY KEY,
+    request_key TEXT UNIQUE,
+    title TEXT NOT NULL,
+    start_at TEXT NOT NULL,
+    end_at TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','cancelled')),
+    source TEXT NOT NULL DEFAULT 'manual' CHECK(source='manual'),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS calendar_work_blocks_time_idx ON calendar_work_blocks(state,start_at,end_at)`,
+  `CREATE TABLE IF NOT EXISTS calendar_work_block_events (
+    id TEXT PRIMARY KEY,
+    work_block_id TEXT NOT NULL REFERENCES calendar_work_blocks(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    before_json TEXT NOT NULL DEFAULT '{}',
+    after_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS calendar_work_block_events_block_idx ON calendar_work_block_events(work_block_id,created_at DESC)`,
   `CREATE TABLE IF NOT EXISTS meeting_workflows (
     id TEXT PRIMARY KEY,
     calendar_event_id TEXT NOT NULL UNIQUE REFERENCES calendar_events(id) ON DELETE CASCADE,
@@ -1306,12 +1327,17 @@ if (!db.prepare("SELECT version FROM schema_migrations WHERE version=15").get())
   db.prepare("UPDATE mail_draft_requests SET status='retired',error=CASE WHEN error='' THEN 'Superseded by draft-first background generation.' ELSE error END,updated_at=? WHERE status IN ('requested','needs_attention')").run(nowIso());
   db.prepare("INSERT INTO schema_migrations(version,applied_at) VALUES(15,?)").run(nowIso());
 }
+ensureColumn("calendar_work_blocks", "request_key", "TEXT");
+db.exec("CREATE UNIQUE INDEX IF NOT EXISTS calendar_work_blocks_request_key_idx ON calendar_work_blocks(request_key)");
+if (!db.prepare("SELECT version FROM schema_migrations WHERE version=16").get()) {
+  db.prepare("INSERT INTO schema_migrations(version,applied_at) VALUES(16,?)").run(nowIso());
+}
 
 function responseJson(response, status, payload) {
   response.writeHead(status, {
     "Access-Control-Allow-Origin": allowedOrigin,
     "Access-Control-Allow-Headers": "authorization,content-type,x-serent-command-center",
-    "Access-Control-Allow-Methods": "GET,POST,PATCH,OPTIONS",
+    "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
     "Cache-Control": "no-store",
     "Content-Type": "application/json; charset=utf-8",
     "Vary": "Origin",
@@ -2076,6 +2102,107 @@ function mapCalendarEvent(row) {
     attendees: JSON.parse(row.attendees_json || "[]"), location: row.location, webLink: row.web_link,
     freshness: row.freshness, lastSyncedAt: row.last_synced_at,
   };
+}
+
+function mapCalendarWorkBlock(row) {
+  return {
+    id: row.id,
+    title: row.title,
+    startAt: row.start_at,
+    endAt: row.end_at,
+    state: row.state,
+    source: row.source,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function calendarWorkBlockValues(body, current = null) {
+  const title = String(body.title === undefined ? current?.title || "" : body.title).trim().slice(0, 180);
+  if (!title) throw requestError("Name the work block.");
+  const startValue = body.startAt === undefined ? current?.start_at : body.startAt;
+  const endValue = body.endAt === undefined ? current?.end_at : body.endAt;
+  const start = new Date(String(startValue || ""));
+  const end = new Date(String(endValue || ""));
+  if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime())) throw requestError("Choose a valid start and end time.");
+  const minutes = Math.round((end.getTime() - start.getTime()) / 60_000);
+  if (minutes < 15 || minutes > 8 * 60) throw requestError("Work blocks must be between 15 minutes and 8 hours.");
+  if (start.getFullYear() !== end.getFullYear() || start.getMonth() !== end.getMonth() || start.getDate() !== end.getDate()) {
+    throw requestError("Keep a work block within one calendar day.");
+  }
+  return { title, startAt: start.toISOString(), endAt: end.toISOString() };
+}
+
+function recordCalendarWorkBlockEvent(workBlockId, eventType, before = null, after = null) {
+  db.prepare(`INSERT INTO calendar_work_block_events(id,work_block_id,event_type,before_json,after_json,created_at)
+    VALUES(?,?,?,?,?,?)`).run(randomUUID(), workBlockId, eventType, JSON.stringify(before || {}), JSON.stringify(after || {}), nowIso());
+}
+
+function queryCalendarWorkBlocks(filters = {}) {
+  const start = calendarIso(filters.start || new Date().toISOString());
+  const end = calendarIso(filters.end || new Date(Date.now() + 7 * 86400000).toISOString());
+  return db.prepare("SELECT * FROM calendar_work_blocks WHERE state='active' AND end_at>? AND start_at<? ORDER BY start_at,id")
+    .all(start, end).map(mapCalendarWorkBlock);
+}
+
+function createCalendarWorkBlock(body) {
+  const requestKey = String(body.requestKey || "").trim().slice(0, 180);
+  if (requestKey) {
+    const existing = db.prepare("SELECT * FROM calendar_work_blocks WHERE request_key=?").get(requestKey);
+    if (existing) return mapCalendarWorkBlock(existing);
+  }
+  const values = calendarWorkBlockValues(body);
+  const id = randomUUID();
+  const now = nowIso();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.prepare(`INSERT INTO calendar_work_blocks(id,request_key,title,start_at,end_at,state,source,created_at,updated_at)
+      VALUES(?,?,?,?,?,'active','manual',?,?)`).run(id, requestKey || id, values.title, values.startAt, values.endAt, now, now);
+    recordCalendarWorkBlockEvent(id, "created", null, values);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+  return mapCalendarWorkBlock(db.prepare("SELECT * FROM calendar_work_blocks WHERE id=?").get(id));
+}
+
+function updateCalendarWorkBlock(id, body) {
+  const current = db.prepare("SELECT * FROM calendar_work_blocks WHERE id=?").get(id);
+  if (!current) throw requestError("This work block no longer exists.", 404);
+  if (current.state !== "active") throw requestError("Restore this work block before editing it.", 409);
+  if (body.expectedUpdatedAt && body.expectedUpdatedAt !== current.updated_at) throw requestError("This work block changed elsewhere. Refresh before saving.", 409);
+  const values = calendarWorkBlockValues(body, current);
+  if (values.title === current.title && values.startAt === current.start_at && values.endAt === current.end_at) return mapCalendarWorkBlock(current);
+  const now = new Date(Math.max(Date.now(), Date.parse(current.updated_at) + 1)).toISOString();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.prepare("UPDATE calendar_work_blocks SET title=?,start_at=?,end_at=?,updated_at=? WHERE id=? AND state='active'")
+      .run(values.title, values.startAt, values.endAt, now, id);
+    recordCalendarWorkBlockEvent(id, "updated", mapCalendarWorkBlock(current), values);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+  return mapCalendarWorkBlock(db.prepare("SELECT * FROM calendar_work_blocks WHERE id=?").get(id));
+}
+
+function changeCalendarWorkBlockState(id, state) {
+  const current = db.prepare("SELECT * FROM calendar_work_blocks WHERE id=?").get(id);
+  if (!current) throw requestError("This work block no longer exists.", 404);
+  if (current.state === state) return mapCalendarWorkBlock(current);
+  const now = new Date(Math.max(Date.now(), Date.parse(current.updated_at) + 1)).toISOString();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.prepare("UPDATE calendar_work_blocks SET state=?,updated_at=? WHERE id=?").run(state, now, id);
+    recordCalendarWorkBlockEvent(id, state === "active" ? "restored" : "removed", mapCalendarWorkBlock(current), { ...mapCalendarWorkBlock(current), state });
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+  return mapCalendarWorkBlock(db.prepare("SELECT * FROM calendar_work_blocks WHERE id=?").get(id));
 }
 
 async function syncCalendar() {
@@ -4167,7 +4294,40 @@ const server = createServer(async (request, response) => {
       const project = reconcileProject(current.project_id);
       return responseJson(response, 200, project);
     }
-    if (request.method === "GET" && url.pathname === "/api/calendar") return responseJson(response, 200, { events: queryCalendar(Object.fromEntries(url.searchParams)), receipt: sourceReceipts().find((item) => item.source === "calendar") || null });
+    if (request.method === "GET" && url.pathname === "/api/calendar") {
+      const filters = Object.fromEntries(url.searchParams);
+      return responseJson(response, 200, {
+        events: queryCalendar(filters),
+        workBlocks: queryCalendarWorkBlocks(filters),
+        receipt: sourceReceipts().find((item) => item.source === "calendar") || null,
+      });
+    }
+    if (request.method === "POST" && url.pathname === "/api/calendar/work-blocks") {
+      return responseJson(response, 201, createCalendarWorkBlock(await readJsonBody(request)));
+    }
+    const calendarWorkBlockRestoreMatch = url.pathname.match(/^\/api\/calendar\/work-blocks\/([^/]+)\/restore$/);
+    if (calendarWorkBlockRestoreMatch && request.method === "POST") {
+      return responseJson(response, 200, changeCalendarWorkBlockState(decodeURIComponent(calendarWorkBlockRestoreMatch[1]), "active"));
+    }
+    const calendarWorkBlockHistoryMatch = url.pathname.match(/^\/api\/calendar\/work-blocks\/([^/]+)\/history$/);
+    if (calendarWorkBlockHistoryMatch && request.method === "GET") {
+      const id = decodeURIComponent(calendarWorkBlockHistoryMatch[1]);
+      if (!db.prepare("SELECT id FROM calendar_work_blocks WHERE id=?").get(id)) throw requestError("This work block no longer exists.", 404);
+      return responseJson(response, 200, db.prepare("SELECT id,event_type,before_json,after_json,created_at FROM calendar_work_block_events WHERE work_block_id=? ORDER BY created_at DESC,id DESC").all(id).map((event) => ({
+        id: event.id,
+        type: event.event_type,
+        before: JSON.parse(event.before_json || "{}"),
+        after: JSON.parse(event.after_json || "{}"),
+        createdAt: event.created_at,
+      })));
+    }
+    const calendarWorkBlockMatch = url.pathname.match(/^\/api\/calendar\/work-blocks\/([^/]+)$/);
+    if (calendarWorkBlockMatch && request.method === "PATCH") {
+      return responseJson(response, 200, updateCalendarWorkBlock(decodeURIComponent(calendarWorkBlockMatch[1]), await readJsonBody(request)));
+    }
+    if (calendarWorkBlockMatch && request.method === "DELETE") {
+      return responseJson(response, 200, changeCalendarWorkBlockState(decodeURIComponent(calendarWorkBlockMatch[1]), "cancelled"));
+    }
     if (request.method === "POST" && url.pathname === "/api/calendar/refresh") {
       if (!calendarRefreshPromise) calendarRefreshPromise = syncCalendar().catch(() => null).finally(() => { calendarRefreshPromise = null; });
       return responseJson(response, 202, { status: "working" });
