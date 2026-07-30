@@ -187,6 +187,7 @@ type Bootstrap = {
   items: WorkItem[];
   counts: Record<string, number>;
   companyCounts: Record<string, number>;
+  companyWorkViewCounts: Record<string, { open: number; done: number }>;
   mailCounts: Record<string, number>;
   sources: SourceReceipt[];
   dailyNote: Note;
@@ -323,6 +324,22 @@ function dueLabel(item: WorkItem, anchor: Date) {
   return calendarDate;
 }
 
+function noteRecoveryKey(id: string) {
+  return `serent-command-center:document-recovery:${id}`;
+}
+
+function readNoteRecovery(note: Note) {
+  if (typeof window === "undefined") return null;
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(noteRecoveryKey(note.id)) || "null");
+    if (!parsed || typeof parsed.title !== "string" || typeof parsed.body !== "string") return null;
+    if (Date.parse(parsed.savedAt || "") <= Date.parse(note.updatedAt)) return null;
+    return parsed as { title: string; body: string; savedAt: string };
+  } catch {
+    return null;
+  }
+}
+
 function directBusinessStatusValue(status: WorkStatus) {
   return ["to_review", "waiting_on_user", "waiting_external", "back_for_review", "needs_attention", "done", "dismissed", "queued", "working"].includes(status) ? status : "to_review";
 }
@@ -364,6 +381,8 @@ export default function Home() {
   const [noteDraft, setNoteDraft] = useState("");
   const [noteEditId, setNoteEditId] = useState("");
   const [noteDirty, setNoteDirty] = useState(false);
+  const [noteSaveState, setNoteSaveState] = useState<"saved" | "saving" | "error">("saved");
+  const [noteSaveError, setNoteSaveError] = useState("");
   const [noteQuery, setNoteQuery] = useState("");
   const [noteRailOpen, setNoteRailOpen] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
@@ -375,12 +394,15 @@ export default function Home() {
   const quickRef = useRef<HTMLInputElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const noteSaveVersion = useRef(0);
+  const noteBaseUpdatedAt = useRef("");
+  const noteSaveQueue = useRef<Promise<unknown>>(Promise.resolve());
+  const workViewRef = useRef<WorkView>("open");
   const completionUndoTimer = useRef<number | null>(null);
   const deterministicUndoTimer = useRef<number | null>(null);
 
   const load = async (quiet = false) => {
     try {
-      const next = await api<Bootstrap>("/api/bootstrap");
+      const next = await api<Bootstrap>(`/api/bootstrap?workView=${workViewRef.current}`);
       setData(next);
       setSelectedId((current) =>
         current && next.items.some((item) => item.id === current)
@@ -391,10 +413,14 @@ export default function Home() {
         const nextNotes = await api<Note[]>("/api/notes");
         setNotes(nextNotes);
         if (!activeNoteId) {
-          setNoteTitle(next.dailyNote.title);
-          setNoteDraft(bodyForEditor(next.dailyNote.title, next.dailyNote.body));
+          const recovery = readNoteRecovery(next.dailyNote);
+          setNoteTitle(recovery?.title || next.dailyNote.title);
+          setNoteDraft(recovery?.body || bodyForEditor(next.dailyNote.title, next.dailyNote.body));
           setNoteEditId(next.dailyNote.id);
           setActiveNoteId(next.dailyNote.id);
+          setNoteDirty(Boolean(recovery));
+          setNoteSaveState(recovery ? "saving" : "saved");
+          noteBaseUpdatedAt.current = next.dailyNote.updatedAt;
         }
       }
     } catch (error) {
@@ -407,30 +433,42 @@ export default function Home() {
     const initialLoad = async () => {
       try {
         const [next, nextNotes] = await Promise.all([
-          api<Bootstrap>("/api/bootstrap"),
+          api<Bootstrap>("/api/bootstrap?workView=open"),
           api<Note[]>("/api/notes"),
         ]);
         if (cancelled) return;
         setData(next);
         setSelectedId(next.items[0]?.id || "");
         setNotes(nextNotes);
+        const recovery = readNoteRecovery(next.dailyNote);
         setActiveNoteId(next.dailyNote.id);
-        setNoteTitle(next.dailyNote.title);
-        setNoteDraft(bodyForEditor(next.dailyNote.title, next.dailyNote.body));
+        setNoteTitle(recovery?.title || next.dailyNote.title);
+        setNoteDraft(recovery?.body || bodyForEditor(next.dailyNote.title, next.dailyNote.body));
         setNoteEditId(next.dailyNote.id);
+        setNoteDirty(Boolean(recovery));
+        setNoteSaveState(recovery ? "saving" : "saved");
+        noteBaseUpdatedAt.current = next.dailyNote.updatedAt;
       } catch (error) {
         if (!cancelled) setNotice(error instanceof Error ? error.message : "The local runner is offline.");
       }
     };
     void initialLoad();
+    let refreshInFlight = false;
     const timer = window.setInterval(async () => {
+      if (refreshInFlight || document.visibilityState === "hidden") return;
+      refreshInFlight = true;
       try {
-        const [next, nextNotes] = await Promise.all([api<Bootstrap>("/api/bootstrap"), api<Note[]>("/api/notes")]);
+        const [next, nextNotes] = await Promise.all([
+          api<Bootstrap>(`/api/bootstrap?workView=${workViewRef.current}`),
+          api<Note[]>("/api/notes"),
+        ]);
         if (!cancelled) { setData(next); setNotes(nextNotes); }
       } catch {
         // Keep the last cached view visible while the runner reconnects.
+      } finally {
+        refreshInFlight = false;
       }
-    }, 10000);
+    }, 30000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
@@ -440,6 +478,16 @@ export default function Home() {
   useEffect(() => {
     window.localStorage.setItem("serent-tend-company", companyFilter);
   }, [companyFilter]);
+
+  useEffect(() => {
+    workViewRef.current = statusFilter;
+  }, [statusFilter]);
+
+  useEffect(() => {
+    window.scrollTo(0, 0);
+    document.querySelector(".center-pane")?.scrollTo(0, 0);
+    document.querySelector(".inbox-view")?.scrollTo(0, 0);
+  }, [view, statusFilter]);
 
   useEffect(() => () => {
     if (completionUndoTimer.current !== null) window.clearTimeout(completionUndoTimer.current);
@@ -471,18 +519,31 @@ export default function Home() {
     { id: "notes", label: "Notes", notes: workspaceNotes.filter((note) => note.type === "scratch") },
   ].filter((group) => group.notes.length), [workspaceNotes]);
 
-  const saveNoteSnapshot = useCallback(async (id: string, title: string, body: string, version: number) => {
-    const saved = await api<Note>(`/api/notes/${encodeURIComponent(id)}`, {
-      method: "PATCH",
-      body: JSON.stringify({ title, body }),
-    });
-    setNotes((current) => current.map((note) => (note.id === saved.id ? saved : note)));
-    if (version === noteSaveVersion.current) setNoteDirty(false);
-    return saved;
+  const saveNoteSnapshot = useCallback((id: string, title: string, body: string, version: number) => {
+    const execute = async () => {
+      setNoteSaveState("saving");
+      const saved = await api<Note>(`/api/notes/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ title, body, expectedUpdatedAt: noteBaseUpdatedAt.current }),
+      });
+      noteBaseUpdatedAt.current = saved.updatedAt;
+      setNotes((current) => current.map((note) => (note.id === saved.id ? saved : note)));
+      if (version === noteSaveVersion.current) {
+        setNoteDirty(false);
+        setNoteSaveState("saved");
+        setNoteSaveError("");
+        window.localStorage.removeItem(noteRecoveryKey(id));
+      }
+      return saved;
+    };
+    const task = noteSaveQueue.current.then(execute, execute);
+    noteSaveQueue.current = task.then(() => undefined, () => undefined);
+    return task;
   }, []);
 
   useEffect(() => {
     if (!noteDirty || !activeNoteId) return;
+    window.localStorage.setItem(noteRecoveryKey(activeNoteId), JSON.stringify({ title: noteTitle, body: noteDraft, savedAt: new Date().toISOString() }));
     const version = ++noteSaveVersion.current;
     const id = activeNoteId;
     const title = noteTitle;
@@ -491,26 +552,64 @@ export default function Home() {
       try {
         await saveNoteSnapshot(id, title, body, version);
       } catch (error) {
-        setNotice(error instanceof Error ? error.message : "The note could not be saved.");
+        const message = error instanceof Error ? error.message : "The document could not be saved.";
+        setNoteSaveState("error");
+        setNoteSaveError(message);
+        setNotice(message);
       }
     }, 650);
     return () => window.clearTimeout(timer);
   }, [noteDirty, noteTitle, noteDraft, activeNoteId, saveNoteSnapshot]);
 
-  const selectNote = async (note: Note) => {
+  const selectNote = useCallback(async (note: Note) => {
     if (noteDirty && activeNoteId) {
       const version = ++noteSaveVersion.current;
       try { await saveNoteSnapshot(activeNoteId, noteTitle, noteDraft, version); }
-      catch (error) { setNotice(error instanceof Error ? error.message : "The current note could not be saved."); return; }
+      catch (error) {
+        const message = error instanceof Error ? error.message : "The current document could not be saved.";
+        setNoteSaveState("error");
+        setNoteSaveError(message);
+        setNotice(message);
+        return false;
+      }
     }
+    const recovery = readNoteRecovery(note);
     setActiveNoteId(note.id);
-    setNoteTitle(note.title);
-    setNoteDraft(bodyForEditor(note.title, note.body));
+    setNoteTitle(recovery?.title || note.title);
+    setNoteDraft(recovery?.body || bodyForEditor(note.title, note.body));
     setNoteEditId(note.id);
-    setNoteDirty(false);
+    setNoteDirty(Boolean(recovery));
+    setNoteSaveState(recovery ? "saving" : "saved");
+    setNoteSaveError("");
+    noteBaseUpdatedAt.current = note.updatedAt;
+    return true;
+  }, [activeNoteId, noteDirty, noteDraft, noteTitle, saveNoteSnapshot]);
+
+  const openView = async (nextView: ViewId) => {
+    if (nextView === "documents" || nextView === "notes") {
+      const eligible = notes.filter((note) => nextView === "documents"
+        ? ["meeting", "project", "decision"].includes(note.type)
+        : ["daily", "scratch"].includes(note.type));
+      const target = eligible.find((note) => note.id === activeNoteId) || eligible[0];
+      if (target && target.id !== activeNoteId && !await selectNote(target)) return;
+      if (window.innerWidth <= 820 && target) setNoteRailOpen(false);
+    }
+    setView(nextView);
   };
 
   const items = useMemo(() => data?.items || [], [data?.items]);
+  const changeWorkView = async (nextView: WorkView) => {
+    workViewRef.current = nextView;
+    setStatusFilter(nextView);
+    setMobileWorkbenchOpen(false);
+    try {
+      const next = await api<Bootstrap>(`/api/bootstrap?workView=${nextView}`);
+      setData(next);
+      setSelectedId((current) => current && next.items.some((item) => item.id === current) ? current : next.items[0]?.id || "");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The work view could not be loaded.");
+    }
+  };
   const filteredItems = items.filter((item) => {
     if (companyFilter !== "all" && item.companySlug !== companyFilter) return false;
     if (workViewFor(item) !== statusFilter) return false;
@@ -919,9 +1018,9 @@ export default function Home() {
         </div>
 
         <nav className="primary-nav" aria-label="Serent Command Center">
-          <NavGroup label="Focus" items={focusNavItems} view={view} onSelect={setView} itemCount={items.filter((item) => !["done", "dismissed"].includes(item.status)).length} mailCount={data.mailCounts.needs_reply || 0} />
-          <NavGroup label="Workspace" items={workspaceNavItems} view={view} onSelect={setView} />
-          <NavGroup label="Intelligence" items={intelligenceNavItems} view={view} onSelect={setView} />
+          <NavGroup label="Focus" items={focusNavItems} view={view} onSelect={(nextView) => void openView(nextView)} itemCount={Object.entries(data.counts).filter(([status]) => !["done", "dismissed"].includes(status)).reduce((sum, [, value]) => sum + value, 0)} mailCount={data.mailCounts.needs_reply || 0} />
+          <NavGroup label="Workspace" items={workspaceNavItems} view={view} onSelect={(nextView) => void openView(nextView)} />
+          <NavGroup label="Intelligence" items={intelligenceNavItems} view={view} onSelect={(nextView) => void openView(nextView)} />
         </nav>
 
         <section className="company-rail" aria-labelledby="company-filter-title">
@@ -964,6 +1063,8 @@ export default function Home() {
             setCompanyFilter={setCompanyFilter}
             filteredItems={filteredItems}
             items={items}
+            workViewCounts={data.companyWorkViewCounts}
+            totalStatusCounts={data.counts}
             selectedId={effectiveSelectedId}
             setSelectedId={(id) => {
               setSelectedId(id);
@@ -973,7 +1074,7 @@ export default function Home() {
             onCreateTask={(title, dueDate) => void createCommittedTask(title, dueDate)}
             completingItemId={completingItemId}
             statusFilter={statusFilter}
-            setStatusFilter={setStatusFilter}
+            setStatusFilter={(nextView) => void changeWorkView(nextView)}
             sourceFilter={sourceFilter}
             setSourceFilter={setSourceFilter}
             typeFilter={typeFilter}
@@ -1028,14 +1129,14 @@ export default function Home() {
               <div className="view-heading compact"><p className="kicker">{view === "notes" ? "NOTES" : "DOCUMENTS"}</p><h2>{view === "notes" ? "Your thinking space" : "Your workbench"}</h2><p>{view === "notes" ? "Keep decisions and working thoughts easy to find." : "Find a document and keep writing."}</p></div>
               <div className="note-list-actions"><button className="new-note" type="button" onClick={async () => {
                 const note = await api<Note>("/api/notes", { method: "POST", body: JSON.stringify({ title: "Untitled note", body: "", type: view === "documents" ? "project" : "scratch", companySlug: companyFilter === "all" ? null : companyFilter }) });
-                setNotes((current) => [note, ...current]); setActiveNoteId(note.id); setNoteTitle(note.title); setNoteDraft(bodyForEditor(note.title, note.body)); setNoteEditId(note.id); setNoteDirty(false);
+                setNotes((current) => [note, ...current.filter((candidate) => candidate.id !== note.id)]); setActiveNoteId(note.id); setNoteTitle(note.title); setNoteDraft(bodyForEditor(note.title, note.body)); setNoteEditId(note.id); setNoteDirty(false); setNoteSaveState("saved"); noteBaseUpdatedAt.current = note.updatedAt; if (window.innerWidth <= 820) setNoteRailOpen(false);
               }}>+ New</button><button className="collapse-note-list" type="button" onClick={() => setNoteRailOpen(false)} aria-label="Hide document list">Hide</button></div>
               <input className="note-search" value={noteQuery} onChange={(event) => setNoteQuery(event.target.value)} placeholder={view === "notes" ? "Search notes..." : "Search documents..."} aria-label={view === "notes" ? "Search notes" : "Search documents"} />
               <div className="note-groups">{noteGroups.map((group) => (
                 <section className="note-group" key={group.id}>
                   <h3>{group.label}<span>{group.notes.length}</span></h3>
                   {group.notes.map((note) => (
-                    <button className={activeNoteId === note.id ? "note-row active" : "note-row"} key={note.id} onClick={() => void selectNote(note)} type="button">
+                    <button className={activeNoteId === note.id ? "note-row active" : "note-row"} key={note.id} onClick={() => void selectNote(note).then(() => { if (window.innerWidth <= 820) setNoteRailOpen(false); })} type="button">
                       <strong>{note.title}</strong><small>{note.body.replace(/[#*_`>-]/g, "").slice(0, 92) || "Empty note"}</small>
                     </button>
                   ))}
@@ -1045,11 +1146,24 @@ export default function Home() {
             <article className="note-editor">
               {activeNote ? (
                 <div className="note-page-shell">
-                  <div className="note-editor-topbar"><button type="button" onClick={() => setNoteRailOpen((current) => !current)}>{noteRailOpen ? "Hide documents" : "Show documents"}</button><span className={noteDirty ? "save-state saving" : "save-state"}>{noteDirty ? "Saving..." : "Saved locally"}</span></div>
+                  <div className="note-editor-topbar">
+                    <button type="button" onClick={() => setNoteRailOpen((current) => !current)}>{noteRailOpen ? "Close documents" : "Documents"}</button>
+                    <div className="document-save-status" role="status" aria-live="polite">
+                      <span className={`save-state save-${noteSaveState}`}>{noteSaveState === "saving" ? "Saving…" : noteSaveState === "error" ? "Couldn’t save" : "Saved"}</span>
+                      {noteSaveState === "error" ? <button type="button" title={noteSaveError} onClick={() => {
+                        const version = ++noteSaveVersion.current;
+                        setNoteSaveState("saving");
+                        void saveNoteSnapshot(activeNote.id, noteTitle, noteDraft, version).catch((error) => {
+                          setNoteSaveState("error");
+                          setNoteSaveError(error instanceof Error ? error.message : "The document could not be saved.");
+                        });
+                      }}>Retry</button> : null}
+                    </div>
+                  </div>
                   <div className="note-page">
                     <div className="note-editor-meta"><span>{activeNote.origin === "manual" ? "Jake's note" : "Agent-generated"}</span><span>{activeNote.type}</span></div>
-                    <input className="note-title-input" value={noteEditId === activeNote.id ? noteTitle : activeNote.title} onChange={(event) => { setNoteEditId(activeNote.id); setNoteTitle(event.target.value); setNoteDirty(true); }} aria-label="Note title" placeholder="Untitled" />
-                    <MarkdownEditor value={noteEditId === activeNote.id ? noteDraft : bodyForEditor(activeNote.title, activeNote.body)} onChange={(body) => { setNoteEditId(activeNote.id); setNoteDraft(body); setNoteDirty(true); }} placeholder="Start writing, or type Markdown shortcuts like #, -, and [ ]..." ariaLabel="Note body" />
+                    <input className="note-title-input" value={noteEditId === activeNote.id ? noteTitle : activeNote.title} onChange={(event) => { setNoteEditId(activeNote.id); setNoteTitle(event.target.value); setNoteDirty(true); setNoteSaveState("saving"); }} aria-label="Note title" placeholder="Untitled" />
+                    <MarkdownEditor key={activeNote.id} value={noteEditId === activeNote.id ? noteDraft : bodyForEditor(activeNote.title, activeNote.body)} onChange={(body) => { setNoteEditId(activeNote.id); setNoteDraft(body); setNoteDirty(true); setNoteSaveState("saving"); }} placeholder="Start writing. Type # for headings, - for lists, or [ ] for a checklist." ariaLabel="Note body" />
                     {activeNote.latestProposal ? <section className={`note-proposal proposal-${activeNote.latestProposal.status}`}>
                       <div><strong>Codex edit</strong><span>{activeNote.latestProposal.status.replaceAll("_", " ")}</span></div>
                       <p>{activeNote.latestProposal.summary || activeNote.latestProposal.error || `Working on: ${activeNote.latestProposal.instruction}`}</p>
@@ -1106,7 +1220,10 @@ export default function Home() {
             </section> : null}
 
             <section className="decision-section current-read" aria-labelledby="current-read-heading">
-              <header><span className="decision-label">Current read</span>{executiveRead.authorityMeta ? <small>{executiveRead.authorityMeta}</small> : null}</header>
+              <header>
+                <span className="decision-label">{selected.intelligenceReview ? "CEO / PM read" : "Card summary"}</span>
+                <small>{executiveRead.authorityMeta || "Generated from durable card fields · not a CEO / PM review"}</small>
+              </header>
               <h3 id="current-read-heading">{executiveRead.currentTruth}</h3>
               {executiveRead.artifactLabel ? <div className="material-result"><span>Reviewable artifact</span><strong>{executiveRead.artifactLabel}</strong>{executiveRead.materialConclusion ? <p>{executiveRead.materialConclusion}</p> : null}</div> : null}
             </section>
@@ -1209,7 +1326,7 @@ export default function Home() {
           <header><span>Command Center</span><kbd>Esc</kbd></header>
           <div className="command-menu-search"><span aria-hidden="true">/</span><input autoFocus aria-label="Command search" placeholder="Search or choose a destination..." onKeyDown={(event) => { if (event.key === "Enter") { setView("search"); setCommandOpen(false); window.setTimeout(() => searchRef.current?.focus(), 0); } }} /></div>
           <p>Go to</p>
-          <div className="command-actions">{navItems.map(([id, label]) => <button type="button" key={id} onClick={() => { setView(id); setCommandOpen(false); }}><span className="command-action-mark" aria-hidden="true" />{label}<small>{id === "inbox" ? "J / K to move" : ""}</small></button>)}</div>
+          <div className="command-actions">{navItems.map(([id, label]) => <button type="button" key={id} onClick={() => { void openView(id); setCommandOpen(false); }}><span className="command-action-mark" aria-hidden="true" />{label}<small>{id === "inbox" ? "J / K to move" : ""}</small></button>)}</div>
           <footer><span><kbd>C</kbd> Create</span><span><kbd>/</kbd> Search</span><span><kbd>J</kbd><kbd>K</kbd> Navigate</span></footer>
         </section>
       </div> : null}
@@ -1240,6 +1357,8 @@ function InboxView({
   setCompanyFilter,
   filteredItems,
   items,
+  workViewCounts,
+  totalStatusCounts,
   selectedId,
   setSelectedId,
   onMarkDone,
@@ -1259,6 +1378,8 @@ function InboxView({
   setCompanyFilter: (company: string) => void;
   filteredItems: WorkItem[];
   items: WorkItem[];
+  workViewCounts: Record<string, { open: number; done: number }>;
+  totalStatusCounts: Record<string, number>;
   selectedId: string;
   setSelectedId: (id: string) => void;
   onMarkDone: (item: WorkItem) => void;
@@ -1276,6 +1397,7 @@ function InboxView({
   const [dayAnchor] = useState(() => new Date());
   const [layoutMode, setLayoutMode] = useState<"list" | "board">("list");
   const [newTaskOpen, setNewTaskOpen] = useState(false);
+  const [filtersOpen, setFiltersOpen] = useState(false);
   const [newTaskTitle, setNewTaskTitle] = useState("");
   const [newTaskDue, setNewTaskDue] = useState("");
   const companyName = companyFilter === "all" ? "All companies" : companies.find((company) => company.slug === companyFilter)?.displayName || "Company";
@@ -1292,7 +1414,11 @@ function InboxView({
     return leftDue - rightDue || right.updatedAt.localeCompare(left.updatedAt);
   });
   const groupedItems = dueBuckets.map((bucket) => ({ ...bucket, items: sortedItems.filter((item) => dueBucketFor(item, dayAnchor) === bucket.id) })).filter((bucket) => bucket.items.length);
-  const reconciliationItems = items.filter((item) => (companyFilter === "all" || item.companySlug === companyFilter) && ["new_evidence", "needs_reconciliation"].includes(item.intelligenceReview?.status || ""));
+  const reconciliationItems = items.filter((item) =>
+    (companyFilter === "all" || item.companySlug === companyFilter)
+    && workViewFor(item) === statusFilter
+    && ["new_evidence", "needs_reconciliation"].includes(item.intelligenceReview?.status || ""));
+  const activeFilterCount = [companyFilter, priorityFilter, sourceFilter, typeFilter].filter((value) => value !== "all").length;
   const renderCard = (item: WorkItem, board = false) => {
     const state = simplifiedCardState(item);
     const dueBucket = dueBucketFor(item, dayAnchor);
@@ -1319,15 +1445,19 @@ function InboxView({
 
       <div className="status-tabs work-view-tabs" role="tablist" aria-label="Work view">
         {workViews.map((workView) => {
-          const inCompany = items.filter((item) => companyFilter === "all" || item.companySlug === companyFilter);
-          const count = inCompany.filter((item) => workViewFor(item) === workView.id).length;
+          const count = companyFilter === "all"
+            ? workView.id === "open"
+              ? Object.entries(totalStatusCounts).filter(([status]) => !["done", "dismissed"].includes(status)).reduce((sum, [, value]) => sum + value, 0)
+              : Number(totalStatusCounts.done || 0) + Number(totalStatusCounts.dismissed || 0)
+            : workViewCounts[companyFilter]?.[workView.id] || 0;
           return <button className={statusFilter === workView.id ? "active" : ""} key={workView.id} type="button" onClick={() => setStatusFilter(workView.id)}>{workView.label}<span>{count}</span></button>;
         })}
       </div>
 
-      {statusFilter === "open" && reconciliationItems.length ? <section className="reconciliation-queue" aria-labelledby="reconciliation-queue-heading"><header><div><span className="eyebrow">CEO INTELLIGENCE SHADOW</span><h3 id="reconciliation-queue-heading">Needs reconciliation</h3></div><b>{reconciliationItems.length}</b></header><p>New evidence or a contradiction needs CEO / PM judgment. Durable card status has not been changed.</p><div>{reconciliationItems.slice(0, 4).map((item) => <button type="button" key={item.id} onClick={() => setSelectedId(item.id)}><span>{item.companyName}</span><strong>{item.title}</strong><small>{item.intelligenceReview?.status === "new_evidence" ? "New evidence" : "Needs reconciliation"}</small></button>)}</div></section> : null}
+      {reconciliationItems.length ? <section className="reconciliation-queue" aria-labelledby="reconciliation-queue-heading"><header><div><span className="eyebrow">CEO / PM REVIEW</span><h3 id="reconciliation-queue-heading">Needs reconciliation</h3></div><b>{reconciliationItems.length}</b></header><p>Evidence needs CEO / PM judgment. The card itself has not been changed.</p><div>{reconciliationItems.slice(0, 4).map((item) => <button type="button" key={item.id} onClick={() => setSelectedId(item.id)}><span>{item.companyName}</span><strong>{item.title}</strong><small>{item.intelligenceReview?.status === "new_evidence" ? "New evidence" : "Needs reconciliation"}</small></button>)}</div></section> : null}
 
-      <div className="filter-row" aria-label="View filters">
+      <button className="filter-toggle" type="button" aria-expanded={filtersOpen} onClick={() => setFiltersOpen((current) => !current)}>Filters{activeFilterCount ? ` · ${activeFilterCount}` : ""}</button>
+      <div className={filtersOpen ? "filter-row filters-open" : "filter-row"} aria-label="View filters">
         <select value={companyFilter} onChange={(event) => setCompanyFilter(event.target.value)} aria-label="Filter by company"><option value="all">All companies</option>{companies.map((company) => <option key={company.slug} value={company.slug}>{company.displayName}</option>)}</select>
         <select value={priorityFilter} onChange={(event) => setPriorityFilter(event.target.value)} aria-label="Filter by priority"><option value="all">All urgency</option><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select>
         <select value={sourceFilter} onChange={(event) => setSourceFilter(event.target.value)} aria-label="Filter by source"><option value="all">All sources</option>{sources.map((source) => <option key={source} value={source}>{source}</option>)}</select>

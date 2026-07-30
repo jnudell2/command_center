@@ -1744,6 +1744,8 @@ function hydrateWorkItem(row) {
 function queryWorkItems(filters = {}) {
   const clauses = ["1 = 1"];
   const params = [];
+  if (filters.workView === "open") clauses.push("w.status NOT IN ('done','dismissed')");
+  if (filters.workView === "done") clauses.push("w.status IN ('done','dismissed')");
   if (filters.company && filters.company !== "all") {
     clauses.push("w.company_slug = ?");
     params.push(filters.company);
@@ -2620,7 +2622,6 @@ function sourceReceipts() {
 }
 
 function bootstrapPayload(filters = {}) {
-  ensureCompletedMeetingCards();
   const companies = db.prepare("SELECT * FROM companies WHERE active = 1 ORDER BY display_name").all().map(mapCompany);
   const items = queryWorkItems(filters);
   const counts = Object.fromEntries(
@@ -2629,6 +2630,16 @@ function bootstrapPayload(filters = {}) {
   const companyCounts = Object.fromEntries(
     db.prepare("SELECT company_slug, COUNT(*) AS count FROM work_items WHERE status NOT IN ('done','dismissed') GROUP BY company_slug").all().map((row) => [row.company_slug, row.count]),
   );
+  const companyWorkViewCounts = {};
+  for (const row of db.prepare(`SELECT company_slug,
+      SUM(CASE WHEN status NOT IN ('done','dismissed') THEN 1 ELSE 0 END) AS open_count,
+      SUM(CASE WHEN status IN ('done','dismissed') THEN 1 ELSE 0 END) AS done_count
+    FROM work_items GROUP BY company_slug`).all()) {
+    companyWorkViewCounts[row.company_slug || "personal"] = {
+      open: Number(row.open_count || 0),
+      done: Number(row.done_count || 0),
+    };
+  }
   const mailCounts = {
     all: db.prepare("SELECT COUNT(*) AS count FROM mail_messages").get().count,
     needs_reply: db.prepare("SELECT COUNT(*) AS count FROM mail_messages WHERE freshness='live' AND reply_state='needs_reply' AND review_state='unreviewed' AND (snoozed_until IS NULL OR datetime(snoozed_until) <= datetime('now'))").get().count,
@@ -2645,6 +2656,7 @@ function bootstrapPayload(filters = {}) {
     items,
     counts,
     companyCounts,
+    companyWorkViewCounts,
     mailCounts,
     sources: sourceReceipts(),
     dailyNote: ensureDailyNote(),
@@ -4329,6 +4341,9 @@ const server = createServer(async (request, response) => {
       const current = db.prepare("SELECT * FROM notes WHERE id=?").get(id);
       if (!current) throw new Error("Unknown note.");
       const body = await readJsonBody(request);
+      if (body.expectedUpdatedAt && body.expectedUpdatedAt !== current.updated_at) {
+        throw requestError("This document changed after you opened it. Your recovery copy is safe; reload before replacing the newer version.", 409);
+      }
       if ((typeof body.title === "string" && body.title !== current.title) || (typeof body.body === "string" && body.body !== current.body)) {
         db.prepare("INSERT INTO note_revisions(id,note_id,title,body,origin,summary,created_at) VALUES(?,?,?,?,'manual','Autosaved revision',?)").run(randomUUID(),current.id,current.title,current.body,nowIso());
       }

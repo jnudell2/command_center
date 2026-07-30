@@ -41,7 +41,7 @@ test("defines the connective-tissue navigation and simplified card contract", as
     assert.doesNotMatch(page, new RegExp(removed, "i"));
   }
 
-  for (const label of ["Current read", "Your next move", "Why now", "Evidence &amp; related work", "Working notes", "Card details", "Activity and technical receipts"]) {
+  for (const label of ["Card summary", "CEO / PM read", "Your next move", "Why now", "Evidence &amp; related work", "Working notes", "Card details", "Activity and technical receipts"]) {
     assert.match(page, new RegExp(label, "i"));
   }
   for (const control of ["Card due date", "Card business status", "Edit waiting dependency", "Add evidence", "Not needed"]) {
@@ -86,6 +86,13 @@ test("defines the connective-tissue navigation and simplified card contract", as
   assert.doesNotMatch(runner, /thread\/resume|thread\/start|turn\/start|app-server|thread\/read/);
   assert.match(editor, /contentType:\s*["']markdown["']/);
   assert.match(editor, /TaskList/);
+  assert.match(editor, /!editor\.isFocused/);
+  assert.match(page, /expectedUpdatedAt/);
+  assert.match(page, /document-recovery/);
+  assert.match(page, /Couldn’t save/);
+  assert.match(page, /workView=\$\{workViewRef\.current\}/);
+  assert.match(page, /className="filter-toggle"/);
+  assert.match(page, /not a CEO \/ PM review/);
   assert.match(styles, /html, body \{ max-width: 100%; overflow-x: hidden; \}/);
   assert.match(styles, /@media \(max-width: 1024px\)/);
   assert.match(styles, /@media \(max-width: 720px\)/);

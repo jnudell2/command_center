@@ -45,7 +45,7 @@ export default function MarkdownEditor({
   useEffect(() => {
     if (!editor || rawMode) return;
     const current = editor.getMarkdown();
-    if (current !== value) editor.commands.setContent(value, { contentType: "markdown", emitUpdate: false });
+    if (!editor.isFocused && current !== value) editor.commands.setContent(value, { contentType: "markdown", emitUpdate: false });
   }, [editor, rawMode, value]);
 
   const formatButton = (label: string, active: boolean, action: () => void, shortcut?: string) => (
@@ -65,12 +65,17 @@ export default function MarkdownEditor({
       <div className="editor-toolbar" role="toolbar" aria-label="Document formatting">
         <div>
           {formatButton("Text", Boolean(editor?.isActive("paragraph")), () => editor?.chain().focus().setParagraph().run())}
+          {formatButton("H1", Boolean(editor?.isActive("heading", { level: 1 })), () => editor?.chain().focus().toggleHeading({ level: 1 }).run(), "Ctrl+Alt+1")}
           {formatButton("H2", Boolean(editor?.isActive("heading", { level: 2 })), () => editor?.chain().focus().toggleHeading({ level: 2 }).run(), "Ctrl+Alt+2")}
+          {formatButton("H3", Boolean(editor?.isActive("heading", { level: 3 })), () => editor?.chain().focus().toggleHeading({ level: 3 }).run(), "Ctrl+Alt+3")}
           {formatButton("Bold", Boolean(editor?.isActive("bold")), () => editor?.chain().focus().toggleBold().run(), "Ctrl+B")}
           {formatButton("Italic", Boolean(editor?.isActive("italic")), () => editor?.chain().focus().toggleItalic().run(), "Ctrl+I")}
           {formatButton("Bullets", Boolean(editor?.isActive("bulletList")), () => editor?.chain().focus().toggleBulletList().run())}
+          {formatButton("Numbered", Boolean(editor?.isActive("orderedList")), () => editor?.chain().focus().toggleOrderedList().run())}
           {formatButton("Checklist", Boolean(editor?.isActive("taskList")), () => editor?.chain().focus().toggleTaskList().run())}
           {formatButton("Quote", Boolean(editor?.isActive("blockquote")), () => editor?.chain().focus().toggleBlockquote().run())}
+          {formatButton("Undo", false, () => editor?.chain().focus().undo().run(), "Ctrl+Z")}
+          {formatButton("Redo", false, () => editor?.chain().focus().redo().run(), "Ctrl+Shift+Z")}
         </div>
         <button className="raw-mode-toggle" type="button" onClick={() => setRawMode((current) => !current)} aria-pressed={rawMode}>
           {rawMode ? "Rich text" : "Markdown"}

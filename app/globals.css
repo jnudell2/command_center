@@ -1490,3 +1490,109 @@ html, body { max-width: 100%; overflow-x: hidden; }
   .mail-draft-workspace .mail-actions { display: grid; grid-template-columns: 1fr; }
   .mail-draft-workspace .mail-actions button, .mail-draft-workspace .mail-actions a { width: 100%; }
 }
+
+/* Side-panel-first shell and distraction-free document writing. */
+.filter-toggle { display: none; }
+.document-save-status { align-items: center; display: flex; gap: 8px; }
+.document-save-status button { border: 1px solid var(--line-dark); border-radius: 5px; color: var(--blue); }
+.save-state.save-error { color: var(--red); }
+.save-state.save-saving { color: var(--muted); }
+.note-page { max-width: 780px; }
+.editor-toolbar > div { flex-wrap: nowrap; min-width: 0; overflow-x: auto; scrollbar-width: thin; }
+.editor-toolbar button { min-height: 34px; white-space: nowrap; }
+.document-prose { font-size: 1.02rem; line-height: 1.76; }
+.document-prose:focus-visible { outline: none; }
+
+@media (max-width: 820px) {
+  .notes-layout,
+  .notes-layout.list-collapsed {
+    display: block;
+    height: calc(100dvh - 110px);
+    min-height: 540px;
+    overflow: hidden;
+    position: relative;
+  }
+  .note-list {
+    background: var(--paper);
+    border: 0;
+    box-shadow: 18px 0 45px rgba(35, 31, 25, .16);
+    display: block;
+    inset: 0 auto 0 0;
+    max-height: none;
+    opacity: 1;
+    padding: 20px 16px 40px;
+    pointer-events: auto;
+    position: absolute;
+    width: min(360px, 92%);
+    z-index: 16;
+  }
+  .list-collapsed .note-list { display: none; }
+  .note-editor { height: 100%; min-height: 0; overflow-y: auto; }
+  .note-page-shell { min-height: 100%; }
+  .note-page {
+    box-shadow: none;
+    min-height: 100%;
+    padding: 34px clamp(20px, 6vw, 48px) 88px;
+  }
+  .note-editor-topbar { min-height: 48px; padding-inline: 14px; }
+  .editor-toolbar {
+    align-items: center;
+    background: rgba(255, 255, 255, .97);
+    margin: 0 -4px 20px;
+    overflow: hidden;
+    padding: 5px 4px;
+    position: sticky;
+    top: 48px;
+    z-index: 6;
+  }
+  .editor-toolbar > div { max-width: none; }
+  .markdown-editor { min-height: calc(100dvh - 280px); }
+  .document-prose { min-height: calc(100dvh - 330px); }
+}
+
+@media (max-width: 720px) {
+  .inbox-view { padding-top: 12px; }
+  .inbox-heading { gap: 6px; margin-bottom: 8px; }
+  .inbox-heading > div > p:last-child { display: none; }
+  .inbox-heading h2 { font-size: 1.5rem; margin-block: 2px; }
+  .inbox-heading-actions { align-items: center; }
+  .inbox-heading-actions .layout-toggle { display: none; }
+  .work-view-tabs { margin-bottom: 8px; }
+  .reconciliation-queue { margin: 8px 0; padding: 10px 11px; }
+  .reconciliation-queue header { align-items: center; }
+  .reconciliation-queue .eyebrow,
+  .reconciliation-queue > p { display: none; }
+  .reconciliation-queue h3 { font-size: .78rem; margin: 0; }
+  .reconciliation-queue > div { margin-top: 7px; }
+  .reconciliation-queue > div button { min-height: 40px; padding: 7px 8px; }
+  .filter-toggle {
+    align-items: center;
+    background: transparent;
+    border: 1px solid var(--line-dark);
+    border-radius: 6px;
+    color: var(--muted);
+    cursor: pointer;
+    display: inline-flex;
+    font-size: .64rem;
+    margin: 5px 0 8px;
+    min-height: 36px;
+    padding: 7px 10px;
+  }
+  .filter-row { display: none; margin: 0 0 10px; }
+  .filter-row.filters-open { display: grid; }
+  .due-group-heading { min-height: 32px; padding-block: 5px; }
+  .feed-card.issue-row { min-height: 80px; }
+  .issue-card-open { padding-block: 9px; }
+  .issue-next {
+    display: -webkit-box;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+  }
+}
+
+@media (max-width: 560px) {
+  .note-list { width: 100%; }
+  .note-page { padding: 28px 18px 76px; }
+  .note-title-input { font-size: 2rem; }
+}
