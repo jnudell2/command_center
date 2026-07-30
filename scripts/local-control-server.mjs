@@ -47,14 +47,17 @@ const localWorkflowsEnabled = process.env.SERENT_TEND_DISABLE_LOCAL_WORKFLOWS !=
 const mailDraftsEnabled = process.env.SERENT_TEND_DISABLE_MAIL_DRAFTS !== "1" && (localWorkflowsEnabled || Boolean(process.env.SERENT_TEND_MAIL_DRAFT_EXECUTOR_SCRIPT));
 const mailDraftConcurrency = Math.min(4, Math.max(1, Number(process.env.SERENT_TEND_MAIL_DRAFT_CONCURRENCY || 2)));
 const mailDraftTimeoutMs = Math.min(15 * 60_000, Math.max(1_000, Number(process.env.SERENT_TEND_MAIL_DRAFT_TIMEOUT_MS || 180_000)));
-const transcriptRoot = path.join(homedir(), "Projects", "ai-operating-system-transcripts");
-const transcriptInbox = path.join(transcriptRoot, "inbox");
-const downloadsDir = path.join(homedir(), "Downloads");
+const meetingProcessingTimeoutMs = Math.min(30 * 60_000, Math.max(1_000, Number(process.env.SERENT_TEND_MEETING_PROCESSING_TIMEOUT_MS || 15 * 60_000)));
+const transcriptRoot = process.env.SERENT_TEND_TRANSCRIPT_ROOT || path.join(homedir(), "Projects", "ai-operating-system-transcripts");
+const transcriptInbox = process.env.SERENT_TEND_TRANSCRIPT_INBOX || path.join(transcriptRoot, "inbox");
+const downloadsDir = process.env.SERENT_TEND_DOWNLOADS_DIR || path.join(homedir(), "Downloads");
+const meetingInputDir = path.join(dataDir, "meeting-inputs");
 const transcriptStageScript = path.resolve(appRoot, "../../../06_workflows/scripts/stage_zoom_transcripts_from_downloads.ps1");
 const transcriptProcessScript = path.resolve(appRoot, "../../../06_workflows/scripts/process_zoom_transcript_inbox.ps1");
 
 await mkdir(dataDir, { recursive: true });
 await mkdir(documentsDir, { recursive: true });
+await mkdir(meetingInputDir, { recursive: true });
 const db = new DatabaseSync(databasePath);
 db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
 
@@ -1080,6 +1083,31 @@ function repairPreparedCodexTaskStates() {
   }
 }
 
+function reconcileOrphanedMeetingProcessing(message = "The local transcript processor stopped without a completion receipt. The selected transcript is safe and can be retried.") {
+  const orphaned = db.prepare("SELECT * FROM meeting_workflows WHERE state='processing'").all()
+    .filter((workflow) => !workflow.agent_run_id || !activeProcesses.has(workflow.agent_run_id));
+  for (const workflow of orphaned) {
+    const now = nowIso();
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const changed = db.prepare("UPDATE meeting_workflows SET state='error',error=?,updated_at=? WHERE id=? AND state='processing'").run(message, now, workflow.id);
+      if (changed.changes && workflow.agent_run_id) {
+        db.prepare("UPDATE agent_runs SET status='error',error=?,updated_at=? WHERE id=? AND status IN ('queued','working')")
+          .run(message, now, workflow.agent_run_id);
+      }
+      db.exec("COMMIT");
+      if (changed.changes) {
+        try { eventFor(workflow.work_item_id, "meeting_processing_error", message); }
+        catch (eventError) { console.error("Could not record the orphaned meeting-processing receipt.", eventError); }
+      }
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+  return orphaned.length;
+}
+
 function recoverInterruptedRuns() {
   const interrupted = db.prepare("SELECT * FROM agent_runs WHERE status IN ('queued','working')").all();
   const now = nowIso();
@@ -1100,10 +1128,16 @@ function recoverInterruptedRuns() {
   db.prepare("UPDATE source_receipts SET status='error',detail='The prior refresh was interrupted; cached data was preserved.',error='Runner restarted during refresh.',checked_at=? WHERE status='working'").run(now);
   db.prepare("UPDATE note_edit_proposals SET status='error',error='The runner restarted during this proposed edit.',updated_at=? WHERE status='working'").run(now);
   db.prepare("UPDATE external_actions SET status='error',error='The runner restarted before the external action was verified.',updated_at=? WHERE status IN ('queued','working')").run(now);
+  reconcileOrphanedMeetingProcessing("The local transcript processor was interrupted when the runner restarted. The selected transcript is safe and can be retried.");
 }
 
 repairPreparedCodexTaskStates();
 recoverInterruptedRuns();
+const meetingProcessingWatchdog = setInterval(() => {
+  try { reconcileOrphanedMeetingProcessing(); }
+  catch (error) { console.error("Meeting-processing watchdog failed.", error); }
+}, 5_000);
+meetingProcessingWatchdog.unref();
 
 function repairMisroutedTranscriptRuns() {
   const candidates = db.prepare(`SELECT r.id,r.work_item_id,w.type,w.title,w.source_provider
@@ -2195,16 +2229,23 @@ async function transcriptCandidatesFor(event) {
 }
 
 async function meetingWorkflowDetail(workItemId) {
-  const row = db.prepare(`SELECT mw.*, ce.graph_id,ce.subject,ce.start_at,ce.end_at,ce.organizer_name,ce.organizer_email,ce.attendees_json,ce.location,ce.web_link,
+  let row = db.prepare(`SELECT mw.*, ce.graph_id,ce.subject,ce.start_at,ce.end_at,ce.organizer_name,ce.organizer_email,ce.attendees_json,ce.location,ce.web_link,
       n.title AS note_title,n.file_path AS note_file_path
     FROM meeting_workflows mw JOIN calendar_events ce ON ce.id=mw.calendar_event_id
     LEFT JOIN notes n ON n.id=mw.note_id WHERE mw.work_item_id=?`).get(workItemId);
   if (!row) return null;
+  if (row.state === "processing" && (!row.agent_run_id || !activeProcesses.has(row.agent_run_id))) {
+    reconcileOrphanedMeetingProcessing();
+    row = db.prepare(`SELECT mw.*, ce.graph_id,ce.subject,ce.start_at,ce.end_at,ce.organizer_name,ce.organizer_email,ce.attendees_json,ce.location,ce.web_link,
+        n.title AS note_title,n.file_path AS note_file_path
+      FROM meeting_workflows mw JOIN calendar_events ce ON ce.id=mw.calendar_event_id
+      LEFT JOIN notes n ON n.id=mw.note_id WHERE mw.work_item_id=?`).get(workItemId);
+  }
   const event = { id: row.calendar_event_id, graph_id: row.graph_id, subject: row.subject, start_at: row.start_at, end_at: row.end_at, organizer_name: row.organizer_name, organizer_email: row.organizer_email, attendees_json: row.attendees_json, location: row.location, web_link: row.web_link, freshness: "live", last_synced_at: row.updated_at, is_all_day: 0 };
   return {
     id: row.id, workItemId: row.work_item_id, state: row.state, candidatePath: row.candidate_path,
     transcriptPath: row.transcript_path, noteId: row.note_id, noteTitle: row.note_title || "",
-    noteFilePath: row.note_file_path || "", agentRunId: row.agent_run_id, error: row.error,
+    noteFilePath: row.note_file_path ? path.join(documentsDir, row.note_file_path) : "", agentRunId: row.agent_run_id, error: row.error,
     event: mapCalendarEvent(event), candidates: await transcriptCandidatesFor(event),
     suggestions: db.prepare("SELECT * FROM meeting_action_suggestions WHERE meeting_workflow_id=? ORDER BY created_at,id").all(row.id).map(mapMeetingSuggestion),
     createdAt: row.created_at, updatedAt: row.updated_at,
@@ -3459,7 +3500,7 @@ function csvCell(value) {
   return `"${String(value ?? "").replaceAll('"', '""')}"`;
 }
 
-async function routeMeetingTranscript({ sourcePath, event, companySlug, noteBody }) {
+async function routeMeetingTranscript({ sourcePath, originalSourcePath = sourcePath, event, companySlug, noteBody }) {
   const extension = path.extname(sourcePath).toLowerCase();
   const date = pacificDate(event.start_at);
   const title = safeMeetingName(event.subject);
@@ -3473,7 +3514,7 @@ async function routeMeetingTranscript({ sourcePath, event, companySlug, noteBody
   const sourceHash = createHash("sha256").update(raw).digest("hex").toUpperCase();
   const processedAt = nowIso();
   const metadata = {
-    meeting_date: date, meeting_title: event.subject, source_file: sourcePath,
+    meeting_date: date, meeting_title: event.subject, source_file: originalSourcePath,
     stored_transcript_path: storedPath, summary_path: summaryPath, metadata_path: metadataPath,
     company: companySlug, project: "general", classification_confidence: 100,
     classification_evidence: ["Matched to an Outlook calendar event and confirmed from Command Center."],
@@ -3495,12 +3536,15 @@ async function routeMeetingTranscript({ sourcePath, event, companySlug, noteBody
   return { storedPath, summaryPath, metadataPath, sourceHash };
 }
 
-async function finishMeetingProcessing({ workflow, event, sourcePath, parsed, runId }) {
+async function finishMeetingProcessing({ workflow, event, sourcePath, originalSourcePath, parsed, runId }) {
+  const owner = db.prepare(`SELECT mw.state,mw.agent_run_id,r.status AS run_status
+    FROM meeting_workflows mw LEFT JOIN agent_runs r ON r.id=mw.agent_run_id WHERE mw.id=?`).get(workflow.id);
+  if (!owner || owner.state !== "processing" || owner.agent_run_id !== runId || owner.run_status !== "working") return;
   const finished = nowIso();
   const companySlugs = db.prepare("SELECT slug FROM companies WHERE active=1").all().map((row) => row.slug);
   const companySlug = companySlugs.includes(parsed.companySlug) ? parsed.companySlug : meetingCompany(`${event.subject} ${parsed.summary || ""}`);
   const noteBody = String(parsed.noteBody || parsed.summary || "No meeting note was returned.").slice(0, 100000);
-  const routed = await routeMeetingTranscript({ sourcePath, event, companySlug, noteBody });
+  const routed = await routeMeetingTranscript({ sourcePath, originalSourcePath, event, companySlug, noteBody });
   const existingNote = workflow.note_id ? db.prepare("SELECT * FROM notes WHERE id=?").get(workflow.note_id) : existingMeetingNoteFor(event);
   const noteId = existingNote?.id || randomUUID();
   const noteTitle = existingNote?.title || String(parsed.noteTitle || `${event.subject} - Meeting notes`).slice(0, 240);
@@ -3511,9 +3555,10 @@ async function finishMeetingProcessing({ workflow, event, sourcePath, parsed, ru
   }
   db.prepare("INSERT OR IGNORE INTO note_links(note_id,work_item_id) VALUES(?,?)").run(noteId, workflow.work_item_id);
   await persistNoteFile(db.prepare("SELECT * FROM notes WHERE id=?").get(noteId));
-  db.prepare(`INSERT INTO source_references(id,work_item_id,provider,label,source_id,source_path,retrieved_at,freshness)
+  const sourceReferenceId = `meeting-${createHash("sha256").update(`${workflow.id}:${routed.sourceHash}`).digest("hex").slice(0, 32)}`;
+  db.prepare(`INSERT OR IGNORE INTO source_references(id,work_item_id,provider,label,source_id,source_path,retrieved_at,freshness)
     VALUES(?,?, 'transcripts', ?, ?, ?, ?, 'live')`)
-    .run(randomUUID(), workflow.work_item_id, path.basename(sourcePath), routed.sourceHash, routed.storedPath, finished);
+    .run(sourceReferenceId, workflow.work_item_id, path.basename(originalSourcePath || sourcePath), routed.sourceHash, routed.storedPath, finished);
   db.prepare("DELETE FROM meeting_action_suggestions WHERE meeting_workflow_id=? AND decision='proposed'").run(workflow.id);
   const actions = Array.isArray(parsed.actions) ? parsed.actions.slice(0, 20) : [];
   for (const raw of actions) {
@@ -3526,18 +3571,73 @@ async function finishMeetingProcessing({ workflow, event, sourcePath, parsed, ru
       .run(randomUUID(), workflow.id, action.title, action.summary, action.companySlug || companySlug, action.type, action.priority, action.owner, action.suggestedAction, action.evidenceTimestamp, dueAt, existing?.id || null, finished, finished);
   }
   const count = db.prepare("SELECT COUNT(*) AS count FROM meeting_action_suggestions WHERE meeting_workflow_id=? AND decision='proposed'").get(workflow.id).count;
-  db.prepare("UPDATE meeting_workflows SET state='review',transcript_path=?,note_id=?,agent_run_id=?,error='',updated_at=? WHERE id=?")
-    .run(routed.storedPath, noteId, runId, finished, workflow.id);
-  db.prepare("UPDATE agent_runs SET status='review',result=?,updated_at=? WHERE id=?")
+  const completed = db.prepare("UPDATE meeting_workflows SET state='review',transcript_path=?,note_id=?,agent_run_id=?,error='',updated_at=? WHERE id=? AND state='processing' AND agent_run_id=?")
+    .run(routed.storedPath, noteId, runId, finished, workflow.id, runId);
+  if (!completed.changes) return;
+  db.prepare("UPDATE agent_runs SET status='review',result=?,error='',updated_at=? WHERE id=? AND status='working'")
     .run(`Saved “${noteTitle}” and proposed ${count} follow-up action${count === 1 ? "" : "s"}.`, finished, runId);
   eventFor(workflow.work_item_id, "meeting_processed", `Saved the meeting note and proposed ${count} reviewable follow-up action${count === 1 ? "" : "s"}. Durable business status was preserved.`);
 }
 
+function meetingRunContext(workflow) {
+  if (!workflow?.agent_run_id) return {};
+  const run = db.prepare("SELECT context_manifest FROM agent_runs WHERE id=?").get(workflow.agent_run_id);
+  try { return JSON.parse(run?.context_manifest || "{}"); } catch { return {}; }
+}
+
+async function recoverableMeetingTranscriptPath(workflow) {
+  const context = meetingRunContext(workflow);
+  const stagedPath = String(context.stagedTranscriptPath || "");
+  if (stagedPath && isAllowedTranscriptPath(stagedPath, [meetingInputDir])) {
+    const details = await stat(stagedPath).catch(() => null);
+    if (details?.isFile()) return stagedPath;
+  }
+  const candidateName = path.basename(String(workflow?.candidate_path || "")).toLowerCase();
+  if (!candidateName) return "";
+  const extension = path.extname(candidateName);
+  const stem = path.basename(candidateName, extension);
+  let entries = [];
+  try { entries = await readdir(transcriptRoot, { recursive: true, withFileTypes: true }); }
+  catch { return ""; }
+  const matches = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || path.extname(entry.name).toLowerCase() !== extension) continue;
+    const name = entry.name.toLowerCase();
+    const exact = name === candidateName;
+    const numberedCopy = name.startsWith(`${stem}-`) && /^\d+$/.test(name.slice(stem.length + 1, -extension.length));
+    if (!exact && !numberedCopy) continue;
+    const archivedPath = path.join(entry.parentPath || entry.path || transcriptRoot, entry.name);
+    const details = await stat(archivedPath).catch(() => null);
+    if (details?.isFile()) matches.push({ path: archivedPath, exact, mtimeMs: details.mtimeMs });
+  }
+  matches.sort((a, b) => Number(b.exact) - Number(a.exact) || b.mtimeMs - a.mtimeMs);
+  return matches[0]?.path || "";
+}
+
+async function resolveMeetingExecutor() {
+  if (process.env.SERENT_TEND_MEETING_EXECUTOR_SCRIPT) {
+    return { command: process.execPath, args: [process.env.SERENT_TEND_MEETING_EXECUTOR_SCRIPT] };
+  }
+  const cli = await resolveCodexCli();
+  return { command: cli, args: ["exec", "--json", "-c", 'approval_policy="never"', "-C", aiOsRoot, "--skip-git-repo-check", "--ephemeral", "-s", "read-only", "-"] };
+}
+
 async function launchMeetingProcessing(workflow, event, sourcePath) {
-  if (!isAllowedTranscriptPath(sourcePath, [downloadsDir, transcriptInbox, transcriptRoot])) throw new Error("Choose a transcript from Downloads or the transcript inbox.");
+  if (!isAllowedTranscriptPath(sourcePath, [downloadsDir, transcriptInbox, transcriptRoot, meetingInputDir])) throw new Error("Choose a transcript from Downloads or the transcript inbox.");
   if (!/\.(vtt|srt|txt)$/i.test(sourcePath)) throw new Error("Choose a .vtt, .srt, or .txt transcript.");
-  const transcriptText = (await readFile(sourcePath, "utf8")).slice(0, 180000);
+  const priorContext = meetingRunContext(workflow);
+  const originalSourcePath = isAllowedTranscriptPath(sourcePath, [meetingInputDir])
+    ? String(priorContext.originalTranscriptPath || priorContext.transcriptPath || sourcePath)
+    : sourcePath;
+  const transcriptBytes = await readFile(sourcePath);
+  const transcriptText = transcriptBytes.toString("utf8").slice(0, 180000);
   if (!transcriptText.trim()) throw new Error("The selected transcript is empty.");
+  const transcriptFingerprint = createHash("sha256").update(transcriptBytes).digest("hex");
+  const extension = path.extname(sourcePath).toLowerCase();
+  const stagedDir = path.join(meetingInputDir, workflow.id);
+  const stagedTranscriptPath = path.join(stagedDir, `${transcriptFingerprint}${extension}`);
+  await mkdir(stagedDir, { recursive: true });
+  await writeFile(stagedTranscriptPath, transcriptBytes);
   const runId = randomUUID();
   const now = nowIso();
   const activeItems = db.prepare("SELECT id,title,company_slug,status,summary FROM work_items WHERE status NOT IN ('done','dismissed') AND id<>? ORDER BY updated_at DESC LIMIT 80").all(workflow.work_item_id);
@@ -3545,36 +3645,99 @@ async function launchMeetingProcessing(workflow, event, sourcePath) {
   db.prepare(`INSERT INTO agent_runs(id,work_item_id,company_slug,scope,intent,title,allowed_sources,status,result,error,revision_of,input_hash,skill_id,executor_type,context_manifest,created_at,updated_at)
     VALUES(?,?,?,?,?,?,?,'working','','',NULL,?,'zoom-transcript-router','allowlisted_local_workflow',?,?,?)`)
     .run(runId, workflow.work_item_id, meetingCompany(event.subject), "meeting_transcript", intent, `${event.subject} · Meeting follow-through`, JSON.stringify(["transcripts", "calendar", "ai_os", "project_files"]), createHash("sha256").update(`${event.graph_id}:${sourcePath}`).digest("hex").slice(0, 12), JSON.stringify({ meetingWorkflowId: workflow.id, calendarEventId: event.graph_id, transcriptPath: sourcePath }), now, now);
-  db.prepare("UPDATE meeting_workflows SET state='processing',candidate_path=?,agent_run_id=?,error='',updated_at=? WHERE id=?").run(sourcePath, runId, now, workflow.id);
-  eventFor(workflow.work_item_id, "meeting_processing", `Processing ${path.basename(sourcePath)} with the Zoom Transcript Router.`);
-  const cli = await resolveCodexCli();
-  const args = ["exec", "--json", "-c", 'approval_policy="never"', "-C", aiOsRoot, "--skip-git-repo-check", "--ephemeral", "-s", "read-only", "-"];
-  const child = spawn(cli, args, { cwd: aiOsRoot, env: process.env, windowsHide: true });
-  activeProcesses.set(runId, child);
-  let buffer = ""; let finalMessage = ""; let stderr = "";
-  const timeout = setTimeout(() => { if (!child.killed) child.kill(); }, 15 * 60 * 1000);
-  child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
-  child.stdout.on("data", (chunk) => { buffer += chunk; const lines = buffer.split(/\r?\n/); buffer = lines.pop() || ""; for (const line of lines) try { const value = JSON.parse(line); if (value.type === "item.completed" && value.item?.type === "agent_message") finalMessage = value.item.text || ""; } catch {} });
-  child.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-8000); });
+  db.prepare("UPDATE agent_runs SET input_hash=?,context_manifest=? WHERE id=?")
+    .run(transcriptFingerprint, JSON.stringify({ meetingWorkflowId: workflow.id, calendarEventId: event.graph_id, transcriptPath: originalSourcePath, originalTranscriptPath: originalSourcePath, stagedTranscriptPath, transcriptFingerprint }), runId);
+  const claimed = db.prepare("UPDATE meeting_workflows SET state='processing',candidate_path=?,agent_run_id=?,error='',updated_at=? WHERE id=? AND state<>'processing'")
+    .run(originalSourcePath, runId, now, workflow.id);
+  if (!claimed.changes) {
+    db.prepare("DELETE FROM agent_runs WHERE id=?").run(runId);
+    return workflow.agent_run_id ? mapRun(db.prepare("SELECT * FROM agent_runs WHERE id=?").get(workflow.agent_run_id)) : null;
+  }
+  activeProcesses.set(runId, { kill() {} });
+  try {
+    eventFor(workflow.work_item_id, "meeting_processing", `Processing ${path.basename(originalSourcePath)} with the Zoom Transcript Router.`);
+  } catch (error) {
+    activeProcesses.delete(runId);
+    failMeetingProcessing(workflow, runId, error);
+    throw error;
+  }
   const prompt = `Use the installed zoom-transcript-router skill's meeting-note standards. Analyze this exact transcript read-only. Do not create or modify files or external systems. Return one JSON object only with this shape:\n{"companySlug":"avionte|stockiq|govworx|firm","noteTitle":"title","noteBody":"complete Markdown meeting note without a title heading","summary":"brief meeting outcome","actions":[{"title":"action","summary":"what is owed and why","companySlug":"avionte|stockiq|govworx|firm","type":"follow_up|decision|task|artifact","priority":"urgent|high|normal|low","owner":"jake|external","suggestedAction":"concrete next step","evidenceTimestamp":"timestamp or short quote locator","dueAt":null,"existingWorkItemId":null}]}\n\nRules: separate Jake-owned actions from items waiting on someone else; include decisions and open questions in the note; do not invent dates; use existingWorkItemId only when the same obligation already appears in the active-card list.\n\nCalendar meeting:\n${JSON.stringify({ subject: event.subject, startAt: event.start_at, endAt: event.end_at, organizer: event.organizer_name, attendees: JSON.parse(event.attendees_json || "[]") })}\n\nActive Command Center cards for deduplication:\n${JSON.stringify(activeItems)}\n\nTranscript:\n${transcriptText}`;
-  child.stdin.end(prompt);
-  child.on("close", (code) => {
-    clearTimeout(timeout); activeProcesses.delete(runId);
-    const parsed = parseAgentJson(finalMessage);
-    if (code === 0 && parsed && typeof parsed.noteBody === "string" && Array.isArray(parsed.actions)) {
-      void finishMeetingProcessing({ workflow, event, sourcePath, parsed, runId }).catch((error) => failMeetingProcessing(workflow, runId, error));
-    } else failMeetingProcessing(workflow, runId, new Error(stderr.trim() || "Codex did not return a valid meeting note and action list."));
-  });
-  child.on("error", (error) => { clearTimeout(timeout); activeProcesses.delete(runId); failMeetingProcessing(workflow, runId, error); });
+  let child;
+  let buffer = "";
+  let finalMessage = "";
+  let stderr = "";
+  let settled = false;
+  let timedOut = false;
+  let timeout;
+  const settle = async (code, startError = null) => {
+    if (settled) return;
+    settled = true;
+    if (timeout) clearTimeout(timeout);
+    if (buffer.trim()) {
+      try {
+        const value = JSON.parse(buffer);
+        if (value.type === "item.completed" && value.item?.type === "agent_message") finalMessage = value.item.text || finalMessage;
+      } catch {}
+    }
+    try {
+      const parsed = parseAgentJson(finalMessage);
+      if (!startError && !timedOut && code === 0 && parsed && typeof parsed.noteBody === "string" && Array.isArray(parsed.actions)) {
+        await finishMeetingProcessing({ workflow, event, sourcePath: stagedTranscriptPath, originalSourcePath, parsed, runId });
+      } else {
+        const message = timedOut
+          ? `Transcript processing exceeded the ${Math.round(meetingProcessingTimeoutMs / 1000)} second limit.`
+          : startError?.message || stderr.trim() || `Codex exited without a valid meeting note and action list (code ${code}).`;
+        failMeetingProcessing(workflow, runId, new Error(message));
+      }
+    } catch (error) {
+      failMeetingProcessing(workflow, runId, error);
+    } finally {
+      activeProcesses.delete(runId);
+    }
+  };
+  try {
+    const executor = await resolveMeetingExecutor();
+    child = spawn(executor.command, executor.args, { cwd: aiOsRoot, env: process.env, windowsHide: true });
+    activeProcesses.set(runId, child);
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      buffer += chunk;
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        try {
+          const value = JSON.parse(line);
+          if (value.type === "item.completed" && value.item?.type === "agent_message") finalMessage = value.item.text || "";
+        } catch {}
+      }
+    });
+    child.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-8000); });
+    child.on("close", (code) => { void settle(code); });
+    child.on("error", (error) => { void settle(-1, error); });
+    child.stdin.on("error", (error) => { void settle(-1, error); });
+    timeout = setTimeout(() => {
+      timedOut = true;
+      if (child && !child.killed) child.kill();
+      void settle(-1, new Error("Transcript processing timed out."));
+    }, meetingProcessingTimeoutMs);
+    child.stdin.end(prompt);
+  } catch (error) {
+    await settle(-1, error);
+  }
   return mapRun(db.prepare("SELECT * FROM agent_runs WHERE id=?").get(runId));
 }
 
 function failMeetingProcessing(workflow, runId, error) {
   const now = nowIso();
   const message = String(error?.message || error || "Meeting processing failed.").slice(0, 4000);
-  db.prepare("UPDATE meeting_workflows SET state='error',error=?,updated_at=? WHERE id=?").run(message, now, workflow.id);
-  db.prepare("UPDATE agent_runs SET status='error',error=?,updated_at=? WHERE id=?").run(message, now, runId);
-  eventFor(workflow.work_item_id, "meeting_processing_error", message.slice(0, 1200));
+  const failed = db.prepare("UPDATE meeting_workflows SET state='error',error=?,updated_at=? WHERE id=? AND state='processing' AND agent_run_id=?")
+    .run(message, now, workflow.id, runId);
+  db.prepare("UPDATE agent_runs SET status='error',error=?,updated_at=? WHERE id=? AND status IN ('queued','working')").run(message, now, runId);
+  if (failed.changes) {
+    try { eventFor(workflow.work_item_id, "meeting_processing_error", message.slice(0, 1200)); }
+    catch (eventError) { console.error("Could not record the meeting-processing error receipt.", eventError); }
+  }
 }
 
 function acceptMeetingSuggestion(id) {
@@ -4138,9 +4301,15 @@ const server = createServer(async (request, response) => {
     const meetingProcessMatch = url.pathname.match(/^\/api\/meeting-workflows\/([^/]+)\/process$/);
     if (request.method === "POST" && meetingProcessMatch) {
       const workItemId = decodeURIComponent(meetingProcessMatch[1]);
-      const workflow = db.prepare("SELECT * FROM meeting_workflows WHERE work_item_id=?").get(workItemId);
+      let workflow = db.prepare("SELECT * FROM meeting_workflows WHERE work_item_id=?").get(workItemId);
       if (!workflow) throw new Error("This card is not a post-meeting workflow.");
-      if (workflow.state === "processing") return responseJson(response, 200, await meetingWorkflowDetail(workItemId));
+      if (workflow.state === "processing" && workflow.agent_run_id && activeProcesses.has(workflow.agent_run_id)) {
+        return responseJson(response, 200, await meetingWorkflowDetail(workItemId));
+      }
+      if (workflow.state === "processing") {
+        reconcileOrphanedMeetingProcessing();
+        workflow = db.prepare("SELECT * FROM meeting_workflows WHERE work_item_id=?").get(workItemId);
+      }
       const event = db.prepare("SELECT * FROM calendar_events WHERE id=?").get(workflow.calendar_event_id);
       const body = await readJsonBody(request);
       const candidates = await transcriptCandidatesFor(event);
@@ -4148,6 +4317,7 @@ const server = createServer(async (request, response) => {
       if (sourcePath && !candidates.some((item) => path.resolve(item.path) === path.resolve(sourcePath))) throw new Error("That transcript is no longer an eligible match for this meeting.");
       if (!sourcePath && candidates.length === 1 && candidates[0].score >= 12) sourcePath = candidates[0].path;
       if (!sourcePath && candidates.length > 1 && candidates[0].score >= 8 && candidates[0].score - candidates[1].score >= 3) sourcePath = candidates[0].path;
+      if (!sourcePath) sourcePath = await recoverableMeetingTranscriptPath(workflow);
       if (!sourcePath) {
         const state = candidates.length ? "candidate_review" : "waiting_for_transcript";
         db.prepare("UPDATE meeting_workflows SET state=?,error='',updated_at=? WHERE id=?").run(state, nowIso(), workflow.id);

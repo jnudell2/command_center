@@ -27,21 +27,36 @@ function Test-AppEndpoint {
 }
 
 function Resolve-NodePath {
-    if ($env:CODEX_NODE_PATH -and (Test-Path -LiteralPath $env:CODEX_NODE_PATH)) {
+    function Test-SupportedNode {
+        param([string]$Path)
+        if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $false }
+        try {
+            $version = & $Path -p "process.versions.node" 2>$null
+            return [version]$version -ge [version]'22.13.0'
+        }
+        catch {
+            return $false
+        }
+    }
+
+    if (Test-SupportedNode $env:CODEX_NODE_PATH) {
         return $env:CODEX_NODE_PATH
     }
-    $command = Get-Command node -ErrorAction SilentlyContinue
-    if ($command) {
-        return $command.Source
-    }
+
     $candidate = Get-ChildItem -Path (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages') -Recurse -Filter node.exe -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -like '*OpenJS.NodeJS.LTS*' } |
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
-    if ($candidate) {
+    if ($candidate -and (Test-SupportedNode $candidate.FullName)) {
         return $candidate.FullName
     }
-    throw 'Node.js could not be located.'
+
+    $command = Get-Command node -ErrorAction SilentlyContinue
+    if ($command -and (Test-SupportedNode $command.Source)) {
+        return $command.Source
+    }
+
+    throw 'Node.js 22.13 or newer could not be located.'
 }
 
 $node = Resolve-NodePath
