@@ -419,6 +419,8 @@ const schemaStatements = [
     WHERE status IN ('queued','working')`,
   `CREATE INDEX IF NOT EXISTS mail_draft_generations_queue_idx
     ON mail_draft_generations(status,requested_at)`,
+  `CREATE INDEX IF NOT EXISTS mail_draft_generations_message_created_idx
+    ON mail_draft_generations(mail_message_id,created_at DESC)`,
   `CREATE TABLE IF NOT EXISTS mail_draft_generation_events (
     id TEXT PRIMARY KEY,
     generation_id TEXT NOT NULL REFERENCES mail_draft_generations(id) ON DELETE CASCADE,
@@ -1645,6 +1647,25 @@ function mapRelationship(row, workItemId) {
   };
 }
 
+function projectContextForWorkItem(workItemId) {
+  const projectContextRow = db.prepare(`SELECT p.id AS project_id,p.title AS project_title,pi.id AS plan_item_id,
+      pi.title AS plan_item_title,pi.workstream,pi.due_date,ph.title AS phase_title
+    FROM project_action_links l
+    JOIN project_plan_items pi ON pi.id=l.project_plan_item_id
+    JOIN projects p ON p.id=pi.project_id
+    LEFT JOIN project_phases ph ON ph.id=pi.phase_id
+    WHERE l.work_item_id=? ORDER BY pi.due_date LIMIT 1`).get(workItemId);
+  return projectContextRow ? {
+    projectId: projectContextRow.project_id,
+    projectTitle: projectContextRow.project_title,
+    planItemId: projectContextRow.plan_item_id,
+    planItemTitle: projectContextRow.plan_item_title,
+    workstream: projectContextRow.workstream,
+    phaseTitle: projectContextRow.phase_title || "",
+    dueDate: projectContextRow.due_date,
+  } : null;
+}
+
 function hydrateWorkItem(row) {
   const sources = db.prepare("SELECT * FROM source_references WHERE work_item_id = ? ORDER BY retrieved_at DESC").all(row.id).map((source) => ({
     id: source.id,
@@ -1683,22 +1704,7 @@ function hydrateWorkItem(row) {
     WHERE (r.from_work_item_id=? OR r.to_work_item_id=?) AND r.state<>'dismissed'
     ORDER BY CASE r.state WHEN 'confirmed' THEN 0 ELSE 1 END,r.updated_at DESC`).all(row.id, row.id).map((relationship) => mapRelationship(relationship, row.id));
   const intelligenceReview = mapIntelligenceReview(db.prepare("SELECT * FROM intelligence_reviews WHERE work_item_id=? ORDER BY updated_at DESC LIMIT 1").get(row.id));
-  const projectContextRow = db.prepare(`SELECT p.id AS project_id,p.title AS project_title,pi.id AS plan_item_id,
-      pi.title AS plan_item_title,pi.workstream,pi.due_date,ph.title AS phase_title
-    FROM project_action_links l
-    JOIN project_plan_items pi ON pi.id=l.project_plan_item_id
-    JOIN projects p ON p.id=pi.project_id
-    LEFT JOIN project_phases ph ON ph.id=pi.phase_id
-    WHERE l.work_item_id=? ORDER BY pi.due_date LIMIT 1`).get(row.id);
-  const projectContext = projectContextRow ? {
-    projectId: projectContextRow.project_id,
-    projectTitle: projectContextRow.project_title,
-    planItemId: projectContextRow.plan_item_id,
-    planItemTitle: projectContextRow.plan_item_title,
-    workstream: projectContextRow.workstream,
-    phaseTitle: projectContextRow.phase_title || "",
-    dueDate: projectContextRow.due_date,
-  } : null;
+  const projectContext = projectContextForWorkItem(row.id);
   const rules = activeRules({ companySlug: row.company_slug, source: row.source_provider, workType: row.type });
   return {
     id: row.id,
@@ -1741,7 +1747,61 @@ function hydrateWorkItem(row) {
   };
 }
 
-function queryWorkItems(filters = {}) {
+function summarizeWorkItem(row) {
+  const sources = db.prepare("SELECT * FROM source_references WHERE work_item_id = ? ORDER BY retrieved_at DESC").all(row.id).map((source) => ({
+    id: source.id,
+    provider: source.provider,
+    label: source.label,
+    sourceId: source.source_id,
+    sourcePath: source.source_path,
+    sourceUrl: source.source_url,
+    retrievedAt: source.retrieved_at,
+    freshness: source.freshness,
+  }));
+  const intelligenceReview = mapIntelligenceReview(db.prepare("SELECT * FROM intelligence_reviews WHERE work_item_id=? ORDER BY updated_at DESC LIMIT 1").get(row.id));
+  return {
+    id: row.id,
+    type: row.type,
+    companySlug: row.company_slug,
+    companyName: row.company_name || "Unassigned",
+    title: row.title,
+    summary: row.summary,
+    whyNow: row.why_now,
+    priority: row.priority,
+    confidence: row.confidence,
+    status: row.status,
+    suggestedAction: row.suggested_action,
+    draft: row.draft,
+    owner: row.owner,
+    waitingOn: row.waiting_on || "",
+    followUpAt: row.follow_up_at || null,
+    dueAt: row.due_at,
+    plannedAt: row.planned_at || null,
+    plannedMinutes: Number(row.planned_minutes || 0),
+    preparationMode: row.preparation_mode || "manual",
+    preparationSkill: row.preparation_skill || "",
+    preparationInstruction: row.preparation_instruction || "",
+    resolution: row.resolution,
+    decisionState: row.decision_state || (row.source_provider === "clickup" ? "committed" : "proposed"),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    resolvedAt: row.resolved_at,
+    sources,
+    events: [],
+    notes: [],
+    agentRuns: [],
+    externalActions: [],
+    codexTasks: [],
+    assignments: [],
+    relationships: [],
+    intelligenceReview,
+    projectContext: projectContextForWorkItem(row.id),
+    activeRules: [],
+    detailLoaded: false,
+  };
+}
+
+function queryWorkItems(filters = {}, { summariesOnly = false } = {}) {
   const clauses = ["1 = 1"];
   const params = [];
   if (filters.workView === "open") clauses.push("w.status NOT IN ('done','dismissed')");
@@ -1778,7 +1838,7 @@ function queryWorkItems(filters = {}) {
     ORDER BY CASE w.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END,
              CASE w.status WHEN 'back_for_review' THEN 0 WHEN 'to_review' THEN 1 WHEN 'working' THEN 2 WHEN 'queued' THEN 3 ELSE 4 END,
              COALESCE(w.due_at, w.updated_at) ASC`).all(...params);
-  return rows.map(hydrateWorkItem);
+  return rows.map(summariesOnly ? summarizeWorkItem : hydrateWorkItem);
 }
 
 function addresses(recipients) {
@@ -2279,6 +2339,10 @@ function scheduleVisibleMailDrafts({ checkExisting = false } = {}) {
       const id = mailDraftSchedulingIds.values().next().value;
       mailDraftSchedulingIds.delete(id);
       await enqueueMailDraftGeneration(id).catch(() => {});
+      // Fingerprinting existing mail is intentionally background work. Yield
+      // between messages so startup reconciliation cannot starve card, health,
+      // or document requests on Node's single event loop.
+      await new Promise((resolve) => setImmediate(resolve));
     }
   })().finally(() => {
     mailDraftSchedulerPromise = null;
@@ -2623,7 +2687,7 @@ function sourceReceipts() {
 
 function bootstrapPayload(filters = {}) {
   const companies = db.prepare("SELECT * FROM companies WHERE active = 1 ORDER BY display_name").all().map(mapCompany);
-  const items = queryWorkItems(filters);
+  const items = queryWorkItems(filters, { summariesOnly: true });
   const counts = Object.fromEntries(
     db.prepare("SELECT status, COUNT(*) AS count FROM work_items GROUP BY status").all().map((row) => [row.status, row.count]),
   );
@@ -2644,10 +2708,11 @@ function bootstrapPayload(filters = {}) {
     all: db.prepare("SELECT COUNT(*) AS count FROM mail_messages").get().count,
     needs_reply: db.prepare("SELECT COUNT(*) AS count FROM mail_messages WHERE freshness='live' AND reply_state='needs_reply' AND review_state='unreviewed' AND (snoozed_until IS NULL OR datetime(snoozed_until) <= datetime('now'))").get().count,
     unread: db.prepare("SELECT COUNT(*) AS count FROM mail_messages WHERE freshness='live' AND is_read=0").get().count,
-    drafts: db.prepare(`SELECT COUNT(*) AS count FROM mail_messages m
-      LEFT JOIN mail_drafts d ON d.mail_message_id=m.id
-      LEFT JOIN mail_draft_generations g ON g.id=(SELECT latest.id FROM mail_draft_generations latest WHERE latest.mail_message_id=m.id ORDER BY latest.created_at DESC LIMIT 1)
-      WHERE d.id IS NOT NULL OR g.id IS NOT NULL`).get().count,
+    drafts: db.prepare(`SELECT COUNT(*) AS count FROM (
+      SELECT mail_message_id FROM mail_drafts
+      UNION
+      SELECT mail_message_id FROM mail_draft_generations
+    )`).get().count,
     snoozed: db.prepare("SELECT COUNT(*) AS count FROM mail_messages WHERE datetime(snoozed_until) > datetime('now')").get().count,
   };
   return {

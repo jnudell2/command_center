@@ -112,6 +112,7 @@ type CodexTaskReceipt = {
 };
 
 type WorkItem = {
+  detailLoaded?: boolean;
   id: string;
   type: string;
   companySlug: string | null;
@@ -348,6 +349,7 @@ export default function Home() {
   const [data, setData] = useState<Bootstrap | null>(null);
   const [view, setView] = useState<ViewId>("inbox");
   const [selectedId, setSelectedId] = useState<string>("");
+  const [selectedDetail, setSelectedDetail] = useState<WorkItem | null>(null);
   const [companyFilter, setCompanyFilter] = useState(() =>
     typeof window === "undefined"
       ? "all"
@@ -620,7 +622,11 @@ export default function Home() {
   });
   const selectedPool = view === "inbox" ? filteredItems : items;
   const effectiveSelectedId = selectedPool.some((item) => item.id === selectedId) ? selectedId : selectedPool[0]?.id || "";
-  const selected = items.find((item) => item.id === effectiveSelectedId) || null;
+  const selectedSummary = items.find((item) => item.id === effectiveSelectedId) || null;
+  const selected = selectedDetail?.id === effectiveSelectedId
+    && selectedDetail.updatedAt === selectedSummary?.updatedAt
+    ? selectedDetail
+    : selectedSummary;
   const executiveRead = selected ? buildExecutiveCardRead(selected, detailAnchor) : null;
   const cardEditOpen = Boolean(selected && cardEditItemId === selected.id);
   const selectedWorkingSurface = selected ? simplifiedWorkingSurface(selected) : null;
@@ -629,6 +635,18 @@ export default function Home() {
   const selectedMeetingId = selected?.type === "meeting_follow_up" ? selected.id : "";
   const activeMeetingWorkflow = meetingWorkflow?.workItemId === selectedMeetingId ? meetingWorkflow : null;
   const visibleDraft = selected && draftItemId === selected.id ? draft : selected?.draft || "";
+
+  useEffect(() => {
+    if (view !== "inbox" || !effectiveSelectedId) return;
+    const controller = new AbortController();
+    void api<WorkItem>(`/api/work-items/${encodeURIComponent(effectiveSelectedId)}`, { signal: controller.signal })
+      .then((detail) => setSelectedDetail(detail))
+      .catch((error) => {
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        setNotice(error instanceof Error ? error.message : "The card details could not be loaded.");
+      });
+    return () => controller.abort();
+  }, [effectiveSelectedId, selectedSummary?.updatedAt, view]);
 
   useEffect(() => {
     if (!selectedMeetingId) return;

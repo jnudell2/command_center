@@ -63,6 +63,17 @@ test("scopes bootstrap work and protects document revisions", async (t) => {
   assert.equal(openBootstrap.status, 200);
   assert.equal(openBootstrap.payload.items.some((item) => item.id === open.id), true);
   assert.equal(openBootstrap.payload.items.some((item) => item.id === resolved.id), false);
+  const openSummary = openBootstrap.payload.items.find((item) => item.id === open.id);
+  assert.equal(openSummary.detailLoaded, false);
+  assert.deepEqual(openSummary.events, []);
+  assert.deepEqual(openSummary.relationships, []);
+
+  const openDetail = await request(`/api/work-items/${open.id}`);
+  assert.equal(openDetail.status, 200);
+  assert.equal(openDetail.payload.id, open.id);
+  assert.equal(openDetail.payload.detailLoaded, undefined);
+  assert.equal(Array.isArray(openDetail.payload.events), true);
+  assert.equal(Array.isArray(openDetail.payload.relationships), true);
 
   const doneBootstrap = await request("/api/bootstrap?workView=done");
   assert.equal(doneBootstrap.status, 200);

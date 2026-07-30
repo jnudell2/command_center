@@ -91,6 +91,12 @@ test("defines the connective-tissue navigation and simplified card contract", as
   assert.match(page, /document-recovery/);
   assert.match(page, /Couldn’t save/);
   assert.match(page, /workView=\$\{workViewRef\.current\}/);
+  assert.match(page, /api\/work-items\/\$\{encodeURIComponent\(effectiveSelectedId\)\}/);
+  assert.match(page, /selectedDetail\.updatedAt === selectedSummary\?\.updatedAt/);
+  assert.match(runner, /queryWorkItems\(filters, \{ summariesOnly: true \}\)/);
+  assert.match(runner, /await new Promise\(\(resolve\) => setImmediate\(resolve\)\)/);
+  assert.match(runner, /mail_draft_generations_message_created_idx/);
+  assert.doesNotMatch(runner, /LEFT JOIN mail_draft_generations g ON g\.id=\(SELECT latest\.id[\s\S]*WHERE d\.id IS NOT NULL OR g\.id IS NOT NULL/);
   assert.match(page, /className="filter-toggle"/);
   assert.match(page, /not a CEO \/ PM review/);
   assert.match(styles, /html, body \{ max-width: 100%; overflow-x: hidden; \}/);
